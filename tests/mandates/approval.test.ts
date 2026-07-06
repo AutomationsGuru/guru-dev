@@ -51,6 +51,16 @@ describe("resolveApproval — the per-call gate (§12 / §2.3)", () => {
     expect(await resolveApproval("bash", decision("escalate", ["exec"]), { sessionApprovals: new Set(), prompt })).toBe(false);
   });
 
+  it("F3 (fail-open fix): an UNEXPECTED prompt result default-DENIES, never the old blanket approve", async () => {
+    for (const bad of ["", "n", "no", "yes", undefined] as unknown as ApprovalChoice[]) {
+      const prompt = async (): Promise<ApprovalChoice> => bad;
+      expect(await resolveApproval("write", decision("escalate", ["write"]), { sessionApprovals: new Set(), prompt })).toBe(false);
+    }
+    // the two EXPLICIT approvals still pass (regression guard)
+    expect(await resolveApproval("write", decision("escalate", ["write"]), { sessionApprovals: new Set(), prompt: stubPrompt("once").prompt })).toBe(true);
+    expect(await resolveApproval("write", decision("escalate", ["write"]), { sessionApprovals: new Set(), prompt: stubPrompt("always").prompt })).toBe(true);
+  });
+
   it("ACCEPTANCE: a HARD EDGE always prompts — even when the verb was session-approved — and 'always' does not persist", async () => {
     const approvals = new Set<MandateVerb>(["destructive"]); // pretend it was granted
     const { prompt, seen } = stubPrompt("always");

@@ -13,19 +13,20 @@ describe("codex-direct lane (Phase B) — second route beside the delegate", () 
     expect(delegate.every((route) => route.routeType === "operator-provider-plan-auth")).toBe(true);
   });
 
-  it("wires the Responses endpoint + ecosystem token + headers, status needs-login (not flipped)", () => {
+  it("wires the Responses endpoint via guru's OWN vaulted OAuth token — no ~/.codex cache", () => {
     const route = catalog.find((candidate) => candidate.routeId === "openai-codex-direct/gpt-5.5");
     expect(route).toBeDefined();
     expect(route?.apiFamily).toBe("openai-responses");
     expect(route?.baseUrl).toBe("https://chatgpt.com/backend-api/codex");
-    expect(route?.credentialSource.filePath).toBe("~/.codex/auth.json");
-    expect(route?.credentialSource.cacheTokenPath).toBe("tokens.access_token");
-    expect(route?.credentialSource.oauthPolicy).toBe("ecosystem-ok");
-    expect(route?.status).toBe("active"); // flipped 2026-07-04 (Finale): chat PASS after stream-backfill fix
-    const headerNames = (route?.wire?.headers ?? []).map((header) => header.header);
-    expect(headerNames).toContain("ChatGPT-Account-Id");
-    expect(headerNames).toContain("OpenAI-Beta");
-    expect(headerNames).toContain("originator");
+    expect(route?.credentialSource.type).toBe("guru-oauth"); // guru's own sign-in, not a cache
+    expect(route?.credentialSource.filePath).toBeUndefined(); // NEVER reads ~/.codex/auth.json
+    expect(route?.status).toBe("active");
+    const headers = route?.wire?.headers ?? [];
+    expect(headers.map((header) => header.header)).toEqual(expect.arrayContaining(["ChatGPT-Account-Id", "OpenAI-Beta", "originator"]));
+    // the account id is sourced from guru's vaulted token, not a cache file
+    const accountHeader = headers.find((header) => header.header === "ChatGPT-Account-Id");
+    expect(accountHeader?.oauthAccount).toBe(true);
+    expect(accountHeader?.filePath).toBeUndefined();
   });
 
   it("grok-cli carries its Phase B wire but stays unflipped (401 auth shape); zai flipped active on probe", () => {

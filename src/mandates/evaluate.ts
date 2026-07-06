@@ -69,7 +69,9 @@ const DESTRUCTIVE_PATTERNS: readonly RegExp[] = [
 ];
 
 /** Secrets-adjacent file targets (.env, keys, npm auth, credentials). */
-const SECRET_PATH_PATTERN = /(^|[\s/\\'"=])(\.env(\.[\w-]+)?|[\w.-]*\.pem|[\w.-]*\.key|id_rsa|id_ed25519|\.npmrc|credentials|\.pgpass|\.htpasswd)(\b|$)/i;
+// The boundary class includes shell redirects `>` and pipe `|` so `echo x>.env`,
+// `echo x>>.env`, and `cmd|tee .env` are detected as secret-edge writes (F5).
+const SECRET_PATH_PATTERN = /(^|[\s/\\'"=>|])(\.env(\.[\w-]+)?|[\w.-]*\.pem|[\w.-]*\.key|id_rsa|id_ed25519|\.npmrc|credentials|\.pgpass|\.htpasswd)(\b|$)/i;
 /** Ecosystem auth files (cloud/provider CLI token + config stores). */
 const AUTH_PATH_PATTERN = /(\.aws[/\\]credentials|\.config[/\\]gh|\.codex|\.config[/\\]gcloud|\.docker[/\\]config|\.kube[/\\]config|\.netrc|\.ssh[/\\])/i;
 /** A shell command that WRITES (as opposed to merely reading) a path. */

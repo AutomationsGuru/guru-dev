@@ -177,6 +177,13 @@ describe("runCompaction — orchestration", () => {
     expect(observed).toEqual(result.state);
   });
 
+  it("F4: the summary lane shape-scrubs an UNREGISTERED token-shaped secret (not just registered values)", () => {
+    clearRegisteredSecretValues(); // NOT registered — relies on the shape/assignment scrub at the boundary
+    const block = renderTranscriptBlock([entry("user", "here is sk-ant-abcdefghijklmnop1234567890 and DB_PASSWORD=hunter2secret")]);
+    expect(block).not.toContain("sk-ant-abcdefghijklmnop1234567890");
+    expect(block).not.toContain("hunter2secret");
+  });
+
   it("SCRUBS registered secrets from the transcript block SENT to the summarizer (input side)", async () => {
     const secret = "sk-live-input-side-secret-55555";
     registerSecretValue(secret);
