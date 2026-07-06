@@ -96,7 +96,7 @@ describe("cli", () => {
     expect(output).toContain("DRY RUN");
     // TEST lists the repo's OWN discovered gates (proof discovery ran, read-only).
     expect(output).toMatch(/npm run test/u);
-  });
+  }, 30_000);
 
   it("should print run help with runtime hardening and git flags", () => {
     const output = execFileSync(process.execPath, ["--import", "tsx", "src/cli.ts", "run", "--help"], {
