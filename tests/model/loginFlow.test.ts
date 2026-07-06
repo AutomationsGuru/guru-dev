@@ -20,13 +20,16 @@ function makeRoute(overrides: Partial<Parameters<typeof ProviderRouteDescriptorS
 }
 
 describe("describeLoginFlow", () => {
-  it("api-key lane: env + secret-manager guidance, presence-only, no values", () => {
+  it("api-key lane: env-var OR encrypted vault guidance — no external store, presence-only", () => {
     const flow = describeLoginFlow(makeRoute({}), {});
     expect(flow.kind).toBe("api-key");
     expect(flow.present).toBe(false);
     const joined = flow.steps.join(" ");
     expect(joined).toContain("TEST_KEY");
-    expect(joined).toContain("op item create");
+    expect(joined).toContain("export TEST_KEY"); // env-var path
+    expect(joined).toContain("vault"); // encrypted-vault path
+    expect(joined.toLowerCase()).not.toContain("op item"); // guru has ZERO op integration
+    expect(joined.toLowerCase()).not.toContain("op://");
     expect(joined).not.toMatch(/=\s*sk-/); // never a value
   });
 
@@ -35,6 +38,21 @@ describe("describeLoginFlow", () => {
     expect(flow.kind).toBe("already-connected");
     expect(flow.present).toBe(true);
     expect(flow.source).toBe("env");
+  });
+
+  it("delegate/native-CLI lane (codex) routes to the CLI login instead of 'unknown'", () => {
+    const flow = describeLoginFlow(
+      makeRoute({
+        providerId: "openai-codex",
+        routeId: "openai-codex/gpt-5.5",
+        credentialSource: { type: "native-cli-token", envVarNames: [] }
+      }),
+      {}
+    );
+    expect(flow.kind).toBe("ecosystem-oauth");
+    const joined = flow.steps.join(" ");
+    expect(joined).toContain("codex login");
+    expect(joined).not.toContain("No known login flow");
   });
 
   it("ecosystem-oauth lane points at the provider's own login, not a guru file", () => {

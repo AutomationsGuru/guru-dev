@@ -47,13 +47,7 @@
   "reviewGate": {
     "provider": "coderabbit",
     "required": true,
-    "command": [
-      "coderabbit",
-      "review",
-      "--agent",
-      "--type",
-      "uncommitted"
-    ]
+    "command": ["coderabbit", "review", "--agent", "--type", "uncommitted"]
   },
   "approvalPolicy": {
     "autoCommitPushPr": true,

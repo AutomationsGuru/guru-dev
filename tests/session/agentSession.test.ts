@@ -18,11 +18,11 @@ const session = (repoRoot?: string) => ({ id: "s1", repo: repoRoot ? { repoRoot 
 const EMPTY_MANDATE = { grants: [], denies: [] } as never;
 
 /** A stub turn runner: echoes a fixed reply, optionally streams tokens + a tool event. */
-function stubRunner(over: { text?: string; tokens?: string[]; toolEvent?: { toolId: string; status: "succeeded" | "failed" }; captureApprove?: (toolId: string, allowed: boolean) => void } = {}): TurnRunner {
+function stubRunner(over: { text?: string; tokens?: string[]; toolEvent?: { toolId: string; status: "succeeded" | "failed" }; approveInput?: unknown; captureApprove?: (toolId: string, allowed: boolean) => void } = {}): TurnRunner {
   return (async (_route, _messages, options) => {
     for (const chunk of over.tokens ?? []) options.onToken?.(chunk);
     if (over.toolEvent) {
-      const allowed = await options.approveTool(over.toolEvent.toolId, { path: "x" });
+      const allowed = await options.approveTool(over.toolEvent.toolId, over.approveInput ?? { path: "x" });
       over.captureApprove?.(over.toolEvent.toolId, allowed);
       options.onToolEvent?.({ toolId: over.toolEvent.toolId, status: over.toolEvent.status });
     }
@@ -84,6 +84,19 @@ describe("AgentSession — the turn engine", () => {
     expect(decisions.write).toBe(false); // escalate → writesAllowed false
     await makeSession({ writesAllowed: true, runTurn: stubRunner({ toolEvent: { toolId: "write", status: "succeeded" }, captureApprove: capture }) }).prompt("c");
     expect(decisions.write).toBe(true); // escalate → writesAllowed true
+  });
+
+  it("F2 (fail-open fix): a HARD-EDGE escalate is DENIED even with writesAllowed:true — never auto-approved by a session grant", async () => {
+    const decisions: Record<string, boolean> = {};
+    const capture = (toolId: string, allowed: boolean) => {
+      decisions[toolId] = allowed;
+    };
+    // a write to a SECRET path (.env) is a hard edge — writesAllowed must NOT approve it (§3).
+    await makeSession({
+      writesAllowed: true,
+      runTurn: stubRunner({ toolEvent: { toolId: "write", status: "failed" }, approveInput: { path: ".env" }, captureApprove: capture })
+    }).prompt("hard");
+    expect(decisions.write).toBe(false);
   });
 });
 

@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 
+import { resolveOAuthTokenFor } from "./oauth/tokenRegistry.js";
 import type { ProviderRouteDescriptor } from "../providers/schemas.js";
 
 /**
@@ -88,6 +89,9 @@ export function resolveProviderWire(
       } catch {
         value = undefined;
       }
+    }
+    if (value === undefined && spec.oauthAccount) {
+      value = resolveOAuthTokenFor(route.providerId)?.accountId; // guru's OWN vaulted token, never a cache
     }
     if (value === undefined) {
       value = spec.fallback;

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { z } from "zod";
 
 import { CompactionStateSchema, type CompactionState } from "../compaction/schemas.js";
-import { scrubRegisteredSecretValues } from "../safety/secretSafety.js";
+import { scrubSecretValues } from "../safety/secretSafety.js";
 import {
   ConversationRecordSchema,
   deriveConversationTitle,
@@ -240,7 +240,7 @@ export function createSessionLogStore(options: SessionLogStoreOptions = {}): Ses
       role: message.role,
       // Secret scrub at the disk boundary — a RESOLVED credential value must never
       // land in the durable log (same rule as the legacy store, per-append).
-      content: scrubRegisteredSecretValues(message.content),
+      content: scrubSecretValues(message.content),
       mode: message.mode,
       ...(message.approver ? { approver: message.approver } : {})
     });
@@ -248,12 +248,12 @@ export function createSessionLogStore(options: SessionLogStoreOptions = {}): Ses
   const appendMeta = (sessionId: string, meta: AppendMetaInput): SessionLogEntry =>
     append(sessionId, {
       kind: "meta",
-      title: scrubRegisteredSecretValues(meta.title),
+      title: scrubSecretValues(meta.title),
       routeId: meta.routeId,
       modelIdOverride: meta.modelIdOverride,
       createdAt: meta.createdAt ?? now().toISOString(),
       ...(meta.lineage ? { lineage: meta.lineage } : {}),
-      ...(meta.branchSummary ? { branchSummary: scrubRegisteredSecretValues(meta.branchSummary) } : {})
+      ...(meta.branchSummary ? { branchSummary: scrubSecretValues(meta.branchSummary) } : {})
     });
 
   const appendCompaction = (sessionId: string, compaction: CompactionState): SessionLogEntry =>
@@ -261,10 +261,10 @@ export function createSessionLogStore(options: SessionLogStoreOptions = {}): Ses
       kind: "compaction",
       compaction: {
         ...compaction,
-        summary: scrubRegisteredSecretValues(compaction.summary),
+        summary: scrubSecretValues(compaction.summary),
         details: {
-          readFiles: compaction.details.readFiles.map((file) => scrubRegisteredSecretValues(file)),
-          modifiedFiles: compaction.details.modifiedFiles.map((file) => scrubRegisteredSecretValues(file))
+          readFiles: compaction.details.readFiles.map((file) => scrubSecretValues(file)),
+          modifiedFiles: compaction.details.modifiedFiles.map((file) => scrubSecretValues(file))
         }
       }
     });

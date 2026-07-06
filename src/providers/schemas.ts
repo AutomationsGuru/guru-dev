@@ -52,6 +52,7 @@ export const CredentialSourceTypeSchema = z.enum([
   "windows-user-env",
   "auth-file",
   "oauth-cache",
+  "guru-oauth",
   "native-cli-token",
   "adc",
   "command-helper",
@@ -127,6 +128,8 @@ export const WireHeaderSchema = z
     envVar: z.string().min(1).optional(),
     filePath: z.string().min(1).optional(),
     jsonPath: z.string().min(1).optional(),
+    /** Resolve this header from guru's own vaulted OAuth token account id (never a cache). */
+    oauthAccount: z.boolean().optional(),
     fallback: z.string().min(1).optional()
   })
   .strict();

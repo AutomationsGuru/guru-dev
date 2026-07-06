@@ -4,8 +4,8 @@ import type { ProviderRouteDescriptor } from "../providers/schemas.js";
 /**
  * Login flow router (Phase B, 2026-07-04) — dispatches on credentialSource +
  * oauthPolicy to describe HOW to authenticate a lane, under the no-at-rest rule:
- * tokens land in env / the op credential store / the provider ecosystem's own cache, never a
- * guru-owned secrets file. Presence-over-value: this NEVER reads or prints a value.
+ * tokens land in an env var, the encrypted guru vault, or the provider ecosystem's own
+ * cache — never a guru-owned plaintext file. Presence-over-value: this NEVER reads or prints a value.
  *
  * v1 describes the flow (safe, non-blocking); guru-native device-code OAuth is
  * the deferred finished state (planning/THERE.md §5 + build plan Phase B).
@@ -19,7 +19,7 @@ export interface LoginFlow {
   readonly kind: LoginKind;
   /** Presence only — never a value. */
   readonly present: boolean;
-  /** The layer a present credential resolves from (env / op-probe / ecosystem-cache). */
+  /** The layer a present credential resolves from (env / vault / ecosystem-cache). */
   readonly source?: string;
   /** Expiry hint (ISO/epoch string) when the ecosystem cache carries one. */
   readonly expiresAt?: string;
@@ -68,22 +68,39 @@ export function describeLoginFlow(route: ProviderRouteDescriptor, env: NodeJS.Pr
       steps: [
         `${route.providerId} authenticates through its own login flow (token lands in ${source.filePath}, owned by the provider — never a guru file).`,
         cli ? `Run the provider's login, then reconnect:  ! ${cli}` : "Complete the provider's own CLI login, then reconnect.",
-        ...(primary ? [`Or set ${primary} in your environment / op credential store as an override.`] : [])
+        ...(primary ? [`Or set ${primary} in your environment or the encrypted guru vault (/login ${route.providerId} <key>) as an override.`] : [])
       ]
     };
   }
 
-  // API-key lane: env or the op credential store, nothing at rest.
+  // API-key lane: an env var OR the encrypted guru vault. Nothing at rest in a guru
+  // file, and guru reads no external credential store.
   if (primary) {
     return {
       ...base,
       kind: "api-key",
       steps: [
-        `Set the key by NAME (value never touches a guru file):`,
-        `  • env:        export ${primary}=<key>   (or add it to the op credential store)`,
-        `  • op store:   op item create --title ${primary} --vault \${GURU_OP_VAULT:-AGENTS-OS} credential=<key>`,
-        `                guru auto-probes op://\${GURU_OP_VAULT:-AGENTS-OS}/${primary}/credential`,
-        `  • wrapper:    op run --env-file=guru.env -- guru`,
+        `Set ${primary} by NAME (the value never touches a guru file):`,
+        `  • env var:  export ${primary}=<key>`,
+        `  • vault:    /login ${route.providerId} <key>   (saved to the encrypted guru vault — or:  guru keys set ${primary})`,
+        `Then reconnect with /model ${route.routeId}.`
+      ]
+    };
+  }
+
+  // Delegate / native-CLI lanes (codex, grok, zai …): authenticate through the
+  // provider's OWN CLI login. guru detects the token by file presence and never
+  // reads or copies it — no guru file, no external credential store.
+  const cli = ECOSYSTEM_LOGIN[route.providerId];
+  if (cli) {
+    return {
+      ...base,
+      kind: "ecosystem-oauth",
+      steps: [
+        source.filePath
+          ? `${route.providerId} authenticates through its own CLI login (token lands in ${source.filePath}, owned by the provider — never a guru file).`
+          : `${route.providerId} authenticates through its own CLI login — the token stays in the provider's cache, never a guru file.`,
+        `Run its login, then reconnect:  ! ${cli}`,
         `Then reconnect with /model ${route.routeId}.`
       ]
     };

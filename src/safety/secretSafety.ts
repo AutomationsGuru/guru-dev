@@ -20,12 +20,19 @@ export const SECRET_VALUE_PATTERNS: readonly RegExp[] = [
   /xox[baprs]-[A-Za-z0-9-]{10,}/i, // Slack
   /gh[pousr]_[A-Za-z0-9]{20,}/, // GitHub tokens
   /github_pat_[A-Za-z0-9_]{20,}/i, // GitHub PAT
-  /AKIA[0-9A-Z]{16}/, // AWS access key id
+  /(?:AKIA|ASIA)[0-9A-Z]{16}/, // AWS access key id (+ temp ASIA)
+  // AWS SECRET access key: a standalone 40-char base64 token. The negative lookahead
+  // skips 40-char lowercase-hex (git SHAs) so ordinary output isn't over-redacted.
+  /(?<![A-Za-z0-9/+])(?![0-9a-f]{40}(?![A-Za-z0-9/+]))[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+])/,
+  /(?:sk|rk)_(?:live|test)_[0-9A-Za-z]{16,}/i, // Stripe secret / restricted key
   /ya29\.[A-Za-z0-9_-]{16,}/, // Google OAuth
-  /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/, // JWT
+  /eyJ[A-Za-z0-9_-]{8,2048}\.[A-Za-z0-9_-]{8,2048}\.[A-Za-z0-9_-]{8,2048}/, // JWT (bounded — no O(n²) on huge blocks)
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/i,
-  /Bearer\s+[A-Za-z0-9._-]{8,}/i,
-  /[a-z][a-z0-9+.-]*:\/\/[^/\s:@]+:[^/\s:@]+@/i, // user:pass@host connection string
+  /Bearer\s+[A-Za-z0-9._-]{8,1024}/i,
+  // user:pass@host connection string. The scheme + userinfo are BOUNDED so a long
+  // lowercase run can't backtrack catastrophically (scrubSecretValues runs on large
+  // compaction/reference blocks — it must stay linear).
+  /[a-z][a-z0-9+.-]{0,15}:\/\/[^/\s:@]{1,256}:[^/\s:@]{1,256}@/i,
   /AIza[0-9A-Za-z_-]{35}/, // Google API key
   /glpat-[A-Za-z0-9_-]{20,}/, // GitLab PAT
   /npm_[A-Za-z0-9]{36}/ // npm token
@@ -39,6 +46,8 @@ export const SECRET_PATTERN_NAMES: readonly string[] = [
   "github-token",
   "github-pat",
   "aws-access-key",
+  "aws-secret-key",
+  "stripe-key",
   "google-oauth",
   "jwt",
   "private-key",
@@ -51,6 +60,44 @@ export const SECRET_PATTERN_NAMES: readonly string[] = [
 
 const REDACTED_VALUE = "[redacted:credential]";
 const REDACTED_SHAPE = "[redacted:secret-shape]";
+
+/**
+ * Assignment shapes (F1, audit 2026-07-06): a `<key-with-a-secret-word>=<value>`
+ * assignment leaks the VALUE through a `cat .env` even when it matches no token
+ * shape. We scan generic `key=value` pairs with BOUNDED, backtracking-safe char
+ * classes (large tool output MUST stay linear — a nested `[...]*(?:alt)[...]*`
+ * catastrophically backtracks), then redact the value ONLY when the key carries a
+ * secret word — catching PREFIXED keys (`DB_PASSWORD`, `AWS_SECRET_ACCESS_KEY`) the
+ * \b-anchored policyGuard pattern missed. The key stays visible.
+ */
+const SECRET_KEY_WORD =
+  /(?:password|passwd|passphrase|secret|api[_-]?key|apikey|access[_-]?key|secret[_-]?key|access[_-]?token|auth[_-]?token|oauth[_-]?token|client[_-]?secret|credential|private[_-]?key|token)/i;
+const ASSIGNMENT_SCAN = /(^|[\s'"(){}[\],;&|>])([A-Za-z0-9_.-]{1,64})(\s*[:=]\s*)(["']?)([^\s"'`]{4,})/;
+
+/** Redact the VALUE of every secret-word assignment, keeping the key + any opening quote. */
+function scrubAssignments(text: string): { readonly text: string; readonly matched: boolean } {
+  let matched = false;
+  const out = text.replace(new RegExp(ASSIGNMENT_SCAN.source, "gm"), (full, lead: string, key: string, sep: string, quote: string) => {
+    if (!SECRET_KEY_WORD.test(key)) {
+      return full;
+    }
+    matched = true;
+    return `${lead}${key}${sep}${quote}${REDACTED_VALUE}`;
+  });
+  return { text: out, matched };
+}
+
+/** True when any secret-word assignment (bounded scan) is present. */
+function hasSecretAssignment(text: string): boolean {
+  const scanner = new RegExp(ASSIGNMENT_SCAN.source, "gm");
+  let match: RegExpExecArray | null;
+  while ((match = scanner.exec(text)) !== null) {
+    if (SECRET_KEY_WORD.test(match[2] ?? "")) {
+      return true;
+    }
+  }
+  return false;
+}
 
 /** Minimum length before a value is worth registering (avoids scrubbing noise). */
 const MIN_REGISTER_LENGTH = 8;
@@ -111,6 +158,7 @@ export function scrubSecretValues(text: string): string {
     const global = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`);
     out = out.replace(global, REDACTED_SHAPE);
   }
+  out = scrubAssignments(out).text;
   return out;
 }
 
@@ -139,6 +187,11 @@ export function scrubSecretValuesReport(text: string): { readonly text: string; 
       matched.add(SECRET_PATTERN_NAMES[index] ?? "secret-shape");
     }
   });
+  const assignment = scrubAssignments(out);
+  out = assignment.text;
+  if (assignment.matched) {
+    matched.add("secret-assignment");
+  }
   return { text: out, matched: [...matched] };
 }
 
@@ -167,7 +220,7 @@ export function containsSecretValue(text: string): boolean {
       return true;
     }
   }
-  return SECRET_VALUE_PATTERNS.some((pattern) => pattern.test(text));
+  return SECRET_VALUE_PATTERNS.some((pattern) => pattern.test(text)) || hasSecretAssignment(text);
 }
 
 /**
@@ -183,6 +236,9 @@ export function assertSecretSafeStrings(haystack: readonly string[], context: st
       if (pattern.test(slice)) {
         throw new Error(`${context} failed secret-safety scan: pattern ${pattern.source} matched.`);
       }
+    }
+    if (hasSecretAssignment(slice)) {
+      throw new Error(`${context} failed secret-safety scan: a secret-word assignment was present.`);
     }
     for (const value of registeredValues) {
       if (slice.includes(value)) {
