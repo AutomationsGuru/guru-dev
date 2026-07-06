@@ -1,4 +1,4 @@
-import { scrubRegisteredSecretValues } from "../safety/secretSafety.js";
+import { scrubSecretValues } from "../safety/secretSafety.js";
 
 import { findCutPoint, type CutPlan } from "./cutPoint.js";
 import { estimateTokens, type TokenEstimator } from "./estimate.js";
@@ -90,7 +90,7 @@ export function renderTranscriptBlock(entries: readonly TranscriptEntry[]): stri
   const lines = entries.map((entry) => `${entry.kind}: ${entry.content}`);
   // A RESOLVED credential value never goes to the summary lane either — scrub the
   // input block, not just the output summary (CodeRabbit 2026-07-04, defense in depth).
-  const block = scrubRegisteredSecretValues(lines.join("\n"));
+  const block = scrubSecretValues(lines.join("\n"));
   if (block.length <= MAX_SUMMARY_BLOCK_CHARS) {
     return block;
   }
@@ -191,7 +191,7 @@ export async function runCompaction(
 
   // A resolved credential value must never survive into a summary (engine-level
   // scrub; the conversation store scrubs again on save — defense in depth).
-  const summary = scrubRegisteredSecretValues(rawSummary);
+  const summary = scrubSecretValues(rawSummary);
 
   // An empty summary would silently DESTROY the folded history (adversarial
   // review 2026-07-04): empty completions are a real HTTP-200 outcome of the

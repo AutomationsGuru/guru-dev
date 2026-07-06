@@ -48,7 +48,7 @@ export type RuntimeToolSummary = z.infer<typeof RuntimeToolSummarySchema>;
 export const RuntimePolicySummarySchema = z
   .object({
     validationCommands: z.array(z.string()),
-    reviewGate: z.object({ provider: z.literal("coderabbit"), required: z.boolean() }).strict(),
+    reviewGate: z.object({ provider: z.enum(["native-critic-panel", "coderabbit", "command"]), required: z.boolean() }).strict(),
     approvalPolicy: z
       .object({
         autoCommitPushPr: z.boolean(),

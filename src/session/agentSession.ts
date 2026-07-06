@@ -6,7 +6,7 @@ import type { HarnessSession } from "../runtime/schemas.js";
 import type { ToolDefinition, ToolObservation } from "../tools/registry.js";
 import type { RetryConfig, RetryHooks } from "../model/retryPolicy.js";
 import { evaluateToolMandate } from "../mandates/evaluate.js";
-import type { MandateState } from "../mandates/schema.js";
+import { HARD_EDGE_VERBS, type MandateState } from "../mandates/schema.js";
 import { expandReferences } from "../tui/references.js";
 import type { FileMemoryStore } from "../memory/store.js";
 import { loadManifest, parkManifest } from "../garage/store.js";
@@ -234,7 +234,20 @@ export class AgentSession {
         state: this.deps.mandate,
         yolo: this.deps.yolo ?? false
       });
-      return decision.outcome === "allow" ? true : decision.outcome === "deny" ? false : (this.deps.writesAllowed ?? false);
+      if (decision.outcome === "allow") {
+        return true;
+      }
+      if (decision.outcome === "deny") {
+        return false;
+      }
+      // escalate: a HARD edge (destructive/spend/secret-edge/auth-edge) is NEVER
+      // auto-approved by a session grant (Constitution §3, "in every mode incl YOLO").
+      // The raw SDK default has no interactive prompt, so hard edges default-DENY here;
+      // a caller wanting to approve them must supply an explicit approveTool.
+      if (decision.verbs.some((verb) => HARD_EDGE_VERBS.has(verb))) {
+        return false;
+      }
+      return this.deps.writesAllowed ?? false;
     };
   }
 

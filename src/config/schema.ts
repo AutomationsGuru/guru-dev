@@ -17,13 +17,39 @@ export const ValidationCommandSchema = z
   .strict();
 export type ValidationCommand = z.infer<typeof ValidationCommandSchema>;
 
-export const ReviewGateSchema = z
+/** Native critic-panel tuning (P1) — a model-powered adversarial review that needs no external tool. */
+export const CriticPanelConfigSchema = z
   .object({
-    provider: z.enum(["coderabbit"]),
-    required: z.boolean().default(true),
-    command: z.array(z.string().trim().min(1)).min(1)
+    /** Review lenses; each is one read-only critic persona. */
+    personas: z.array(z.string().trim().min(1)).min(1).default(["security", "correctness", "contract", "simplicity"]),
+    /** Run the adversarial VERIFY pass (confirm-with-repro / refute) before a finding counts. */
+    verifyPass: z.boolean().default(true),
+    /** Which surviving CONFIRMED severity is RED vs YELLOW. */
+    redSeverities: z.array(z.enum(["low", "medium", "high"])).default(["high"]),
+    /** Hard cap on critic+verifier model calls per review (bounds cost). */
+    maxWorkers: z.number().int().positive().default(12)
   })
   .strict();
+export type CriticPanelConfig = z.infer<typeof CriticPanelConfigSchema>;
+
+/**
+ * The review gate. `native-critic-panel` (default) is guru's OWN model-powered
+ * review — it assumes only guru + a model connection (Foundational Law 1). `coderabbit`
+ * / `command` run an external CLI and need a `command`; a refine enforces that. Legacy
+ * `{provider:"coderabbit", command:[...]}` configs still parse unchanged.
+ */
+export const ReviewGateSchema = z
+  .object({
+    provider: z.enum(["native-critic-panel", "coderabbit", "command"]).default("native-critic-panel"),
+    required: z.boolean().default(true),
+    command: z.array(z.string().trim().min(1)).min(1).optional(),
+    panel: CriticPanelConfigSchema.optional()
+  })
+  .strict()
+  .refine((gate) => gate.provider === "native-critic-panel" || (gate.command !== undefined && gate.command.length > 0), {
+    message: "reviewGate.command is required for the coderabbit/command providers.",
+    path: ["command"]
+  });
 export type ReviewGate = z.infer<typeof ReviewGateSchema>;
 
 export const ApprovalPolicySchema = z
@@ -94,10 +120,11 @@ export const HarnessConfigSchema = z
     referenceRuntime: z.string().trim().min(1).default("a reference agent runtime"),
     skillDirectories: z.array(z.string().trim().min(1)).default([]),
     validationCommands: z.array(ValidationCommandSchema).default([]),
+    // Default review = guru's OWN native critic panel (no external tool assumed). A
+    // config that still declares {provider:"coderabbit", command:[...]} keeps working.
     reviewGate: ReviewGateSchema.default({
-      provider: "coderabbit",
-      required: true,
-      command: ["coderabbit", "review", "--agent", "--type", "uncommitted"]
+      provider: "native-critic-panel",
+      required: true
     }),
     approvalPolicy: ApprovalPolicySchema.default({
       autoCommitPushPr: true,
@@ -145,9 +172,8 @@ export const DEFAULT_HARNESS_CONFIG: HarnessConfig = HarnessConfigSchema.parse({
     { name: "build", command: ["npm", "run", "build"], required: true }
   ],
   reviewGate: {
-    provider: "coderabbit",
-    required: true,
-    command: ["coderabbit", "review", "--agent", "--type", "uncommitted"]
+    provider: "native-critic-panel",
+    required: true
   },
   approvalPolicy: {
     autoCommitPushPr: true,

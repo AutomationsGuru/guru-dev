@@ -111,7 +111,8 @@ function checkValidationCommands(config: HarnessConfig): MaintenanceCheck {
 }
 
 function checkReviewGate(config: HarnessConfig): MaintenanceCheck {
-  const passed = config.reviewGate.provider === "coderabbit" && config.reviewGate.required;
+  // A required review gate is configured — guru's own native panel or an external CLI.
+  const passed = config.reviewGate.required;
 
   return {
     id: "review-gate",

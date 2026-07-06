@@ -79,6 +79,7 @@ const CRED_TYPE_TO_TUI: Record<CredentialSourceType, TuiCredentialSourceType> = 
   "windows-user-env": "user-env",
   "auth-file": "auth-file",
   "oauth-cache": "oauth-cache",
+  "guru-oauth": "oauth-cache",
   "native-cli-token": "auth-file",
   adc: "adc",
   "command-helper": "none",

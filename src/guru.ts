@@ -44,6 +44,9 @@ import { createScopedMemory, MEMORY_SCOPES, type MemoryScope } from "./memory/sc
 import { citeLearning, decaySweep, extractLearnings, gateLearning, promoteSweep, type Learning } from "./garage/flywheel.js";
 import { loadLearnings, migrateRoleLearnings, pruneLearning, storeLearning } from "./garage/flywheelStore.js";
 import { describeLoginFlow, formatExpiry } from "./model/loginFlow.js";
+import { isTokenNearExpiry, loginViaLoopback, OAuthRefreshError, refreshOAuthToken, resolveOAuthConfig } from "./model/oauth/openaiCodexLogin.js";
+import { registerOAuthTokenAccessor } from "./model/oauth/tokenRegistry.js";
+import { readVaultOAuthToken, writeVaultOAuthToken } from "./model/oauth/vaultTokens.js";
 import { slugifyRole, type RoleProfile } from "./roles/schema.js";
 import { listRoles, roleAgeDays, recordPathOutcome, ROLE_STALE_AFTER_DAYS } from "./roles/store.js";
 import { assembleSuit, verifyModelForRole } from "./roles/assemble.js";
@@ -1672,9 +1675,9 @@ function cmdSettings(): void {
   print(dim(theme, "  Edit guruharness.config.json to change settings."));
 }
 
-function cmdLogin(state: GuruState, args: readonly string[] = []): void {
+async function cmdLogin(state: GuruState, args: readonly string[] = []): Promise<void> {
   if (args.length > 0) {
-    cmdLoginProvider(state, args[0] ?? "");
+    await cmdLoginProvider(state, args[0] ?? "", args[1]);
     return;
   }
   print(paint.bold(paint.fg("fgBright", "Credential status")) + paint.fg("muted", "  (env NAMES / file PRESENCE only — values never shown)"));
@@ -1737,16 +1740,90 @@ function routesForSelector(state: GuruState, selector: string): readonly Provide
   return state.routes.filter((route) => route.providerId.startsWith(selector));
 }
 
-function cmdLoginProvider(state: GuruState, selector: string): void {
+/**
+ * guru-native OAuth sign-in (e.g. `/login codex`): open the operator's browser, run
+ * the loopback PKCE flow, and store guru's OWN token in the encrypted vault. No Codex
+ * CLI, no env var, no cache — passes the fresh-machine acceptance test.
+ */
+async function runNativeOAuthLogin(state: GuruState, route: ProviderRouteDescriptor): Promise<void> {
+  print(bold(theme, `login: ${route.providerId}`) + dim(theme, "  (guru-native OAuth sign-in)"));
+  print("  Opening your browser to sign in to OpenAI (ChatGPT plan)…");
+  try {
+    const token = await loginViaLoopback({
+      onUrl: (url) => print(dim(theme, `  if the browser didn't open, paste this into it:\n    ${url}`))
+    });
+    writeVaultOAuthToken(state.vault, route.providerId, token);
+    registerSecretValue(token.accessToken);
+    if (token.refreshToken) {
+      registerSecretValue(token.refreshToken);
+    }
+    registerOAuthTokenAccessor((providerId) => {
+      const stored = readVaultOAuthToken(state.vault, providerId);
+      if (!stored?.accessToken) {
+        return null;
+      }
+      registerSecretValue(stored.accessToken);
+      if (stored.refreshToken) {
+        registerSecretValue(stored.refreshToken);
+      }
+      return { accessToken: stored.accessToken, ...(stored.accountId ? { accountId: stored.accountId } : {}) };
+    });
+    refreshVaultAvailability(state);
+    print(colorize(theme, "green", `  ✓ signed in to ${route.providerId}${token.planType ? ` (${token.planType} plan)` : ""} — token saved to the encrypted vault.`));
+    print(dim(theme, `  reconnect with /model ${route.routeId}  ·  /logout ${route.providerId} to sign out`));
+  } catch (error) {
+    print(colorize(theme, "yellow", `  sign-in failed: ${error instanceof Error ? error.message : String(error)}`));
+    print(dim(theme, "  (a device-code fallback for SSH/WSL sessions is planned.)"));
+  }
+}
+
+async function cmdLoginProvider(state: GuruState, selector: string, inlineKey?: string): Promise<void> {
   const routes = routesForSelector(state, selector);
   if (routes.length === 0) {
     print(colorize(theme, "yellow", `No provider matches '${selector}'. /login for the full list.`));
     return;
   }
+
+  const key = inlineKey?.trim();
+
+  // Native OAuth sign-in (e.g. `/login codex`): guru's OWN browser login through its own
+  // loopback callback — no ~/.codex cache, no Codex CLI, one sign-in, guru's own token.
+  if (!key) {
+    const oauthRoute = routes.find((candidate) => candidate.credentialSource.type === "guru-oauth");
+    if (oauthRoute) {
+      await runNativeOAuthLogin(state, oauthRoute);
+      return;
+    }
+  }
+
   const route = routes[0];
   if (!route) {
     return;
   }
+
+  // Inline key: `/login <provider> <key>` saves it to the ENCRYPTED vault under the
+  // lane's primary env NAME, then lights up the provider. The value is never printed
+  // or written to a plaintext guru file — and no external credential store is touched.
+  if (key) {
+    const name = route.credentialSource.envVarName ?? route.credentialSource.envVarNames[0];
+    if (!name) {
+      print(colorize(theme, "yellow", `${route.providerId} has no API-key env name to store a key under.`));
+      return;
+    }
+    try {
+      state.vault.set(name, key);
+      state.vault.save();
+      registerCredentialVault((lookup) => state.vault.get(lookup));
+      registerSecretValue(key);
+      refreshVaultAvailability(state);
+      print(colorize(theme, "green", `saved ${name} to the encrypted vault — ${route.providerId} is ready.`));
+      print(dim(theme, `  reconnect with /model ${route.routeId}  ·  /keys to view · /keys rm ${name} to remove`));
+    } catch (error) {
+      print(colorize(theme, "yellow", `could not save to the vault: ${error instanceof Error ? error.message : String(error)}`));
+    }
+    return;
+  }
+
   const flow = describeLoginFlow(route);
   const badge = flow.present ? colorize(theme, "green", "connected") : colorize(theme, "yellow", flow.kind);
   print(bold(theme, `login: ${route.providerId}`) + `  ${badge}` + dim(theme, `  (${flow.kind})`));
@@ -2547,6 +2624,7 @@ export function attachComposer(deps: ComposerDeps): {
       }
       deps.input.removeListener("data", onData);
       decoder.dispose();
+      deps.output.write("\x1b[?2004l"); // stop bracketed-paste mode
       deps.input.setRawMode?.(false);
       // A resumed TTY stdin keeps the event loop referenced even with no
       // listeners — without pause() the process hangs after "bye."
@@ -2559,6 +2637,7 @@ export function attachComposer(deps: ComposerDeps): {
 
   if (deps.interactive) {
     deps.input.setRawMode?.(true);
+    deps.output.write("\x1b[?2004h"); // bracketed paste: pastes arrive as ESC[200~…ESC[201~
     deps.input.on("data", onData);
     (deps.input as { resume?: () => void }).resume?.();
   }
@@ -2871,11 +2950,39 @@ async function promptApproval(request: ApprovalRequest, stopSpinner: () => void)
   return "deny";
 }
 
+/** Refresh a guru-native OAuth token that's near expiry, persisting the rotated token. */
+async function refreshCodexTokenIfNeeded(state: GuruState, route: ProviderRouteDescriptor): Promise<void> {
+  if (route.credentialSource.type !== "guru-oauth") {
+    return;
+  }
+  const token = readVaultOAuthToken(state.vault, route.providerId);
+  if (!token || !isTokenNearExpiry(token)) {
+    return;
+  }
+  try {
+    const refreshed = await refreshOAuthToken(resolveOAuthConfig(), token);
+    writeVaultOAuthToken(state.vault, route.providerId, refreshed);
+    registerSecretValue(refreshed.accessToken);
+    if (refreshed.refreshToken) {
+      registerSecretValue(refreshed.refreshToken);
+    }
+  } catch (error) {
+    if (error instanceof OAuthRefreshError && error.permanent) {
+      print(colorize(theme, "yellow", `  ${route.providerId} session expired — run /login codex to sign in again.`));
+    }
+    // A transient refresh failure lets the turn proceed on the current token (a real
+    // 401 then surfaces to the operator); only a permanent failure warns to re-login.
+  }
+}
+
 async function chatTurn(state: GuruState, text: string): Promise<void> {
   if (!state.connectedRoute) {
     print(colorize(theme, "yellow", "No model connected. Use /model to browse and connect (e.g. /model 1)."));
     return;
   }
+  // Keep a guru-native OAuth token fresh: refresh (rotating token persisted) BEFORE the
+  // turn if it's within the expiry margin, so long sessions don't silently 401.
+  await refreshCodexTokenIfNeeded(state, state.connectedRoute);
   // @-reference content expansion (ADR 2026-07-05-composer-completion): pull
   // referenced file contents inline, guarded (50KB head/tail, 80%-window skip,
   // secret scrub). Notices print so expansion is never silent.
@@ -3215,7 +3322,7 @@ async function handleLine(state: GuruState, line: string, rl: { close(): void })
       cmdSettings();
       break;
     case "/login":
-      cmdLogin(state, slash.args);
+      await cmdLogin(state, slash.args);
       break;
     case "/accounts":
       cmdAccounts(state);
@@ -3309,6 +3416,19 @@ export async function runGuru(): Promise<void> {
   // providers light up on launch exactly like env-backed ones.
   const vault = safeOpenVault();
   registerCredentialVault((name) => vault.get(name));
+  // guru's OWN vaulted OAuth tokens (native ChatGPT/Codex sign-in): the resolver +
+  // wire header both read this — never ~/.codex or any other tool's cache.
+  registerOAuthTokenAccessor((providerId) => {
+    const token = readVaultOAuthToken(vault, providerId);
+    if (!token?.accessToken) {
+      return null;
+    }
+    registerSecretValue(token.accessToken);
+    if (token.refreshToken) {
+      registerSecretValue(token.refreshToken);
+    }
+    return { accessToken: token.accessToken, ...(token.accountId ? { accountId: token.accountId } : {}) };
+  });
   for (const name of vault.names()) {
     const value = vault.get(name);
     if (value) {
