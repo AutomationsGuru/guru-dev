@@ -4,7 +4,7 @@
 ![guru harness](https://img.shields.io/badge/guru%20harness-AI%20agent%20harness-8C11E1?labelColor=1A1130&style=flat-square)
 ![node](https://img.shields.io/badge/node-%E2%89%A522-B56EF1?labelColor=1A1130&style=flat-square)
 ![tests](https://img.shields.io/badge/tests-945%20passing-31C48D?labelColor=1A1130&style=flat-square)
-![version](https://img.shields.io/badge/release-v1.1.0-E958BE?labelColor=1A1130&style=flat-square)
+![version](https://img.shields.io/badge/release-v1.2.0-E958BE?labelColor=1A1130&style=flat-square)
 
 **`guru` is a repo-aware terminal agent harness.** `cd` into any project, launch it, connect the model you want — your own provider API keys or a provider subscription/plan — and it does real coding work: reads your code, edits files, runs your tests, and iterates to green, with every action shown and every mutation behind an approval gate.
 
@@ -49,8 +49,8 @@ And it survives its own turns: near the context window, older history folds into
 
 ```bash
 # Global — from a release tarball (avoids the npm prepare/devDependencies quirk)
-gh release download v1.1.0 --repo AutomationsGuru/guru-dev --pattern "*.tgz"
-npm install -g ./guruharness-1.1.0.tgz
+gh release download v1.2.0 --repo AutomationsGuru/guru-dev --pattern "*.tgz"
+npm install -g ./guruharness-1.2.0.tgz
 
 # As a project dependency (builds via prepare)
 npm install github:AutomationsGuru/guru-dev
@@ -136,6 +136,7 @@ You get the full-width splash, then a **briefing**: connected model + context wi
 | Session tree (`/tree` `/fork` `/clone`) | Append-only JSONL DAG (`id`/`parentId`, `schemaVersion`, audit markers); lossless stream — a fork/clone keeps every line of both branches alive; crash-resume by deterministic replay; branch summaries via the compaction summarizer; legacy flat-JSON sessions still load |
 | Terminal Design System | Operator-owned truecolor theme (`~/.guruharness/theme.json`), 256/16/`NO_COLOR` fallbacks, full-width splash, pinned composer + status bar |
 | Direct-first routing | Plan/OAuth routes never touch a router; an external routing sidecar is optional, not embedded |
+| Self-build developer loop (`guru self-build-run`, v1.2.0) | The 0→7 **unattended** dev cycle SELECT→BUILD→TEST→SMOKE→DEBUG→REVIEW→SHIP→LEARN, spend-gated: the mandate/spend policy is injected into the executor runtime (spend/destructive escalate **even in YOLO**); TEST runs the project's **own discovered gates** (never assumed); DEBUG parses gate output → re-plans, budget-bounded; REVIEW is guru's **live native critic panel** (RED blocks ship); SHIP routes the push through the gate and degrades to a durable on-disk change-record when git is absent; SELECT scoring + LEARN write-back close the loop; an **approval ledger survives restart**. `--dry-run` previews the stage plan (executes nothing); a multi-cycle driver runs it across tasks. Every model loop is bounded by an attempt cap **and** a token budget **and** wall-clock, with a `$0`-denies-all spend ceiling. |
 
 ## The plan (where this is going)
 
@@ -143,7 +144,7 @@ The finished product is written down, present-tense and testable — the pillars
 
 - **P0 — runtime survival: CLOSED** (v0.9.0 compaction, v0.10.0 retry + cancellation). Long and autonomous sessions no longer die.
 - **P1 — daily-driver ergonomics: COMPLETE (v1.0.0).** Composer, typed grep/glob/ls + the bash token optimizer + the render-layer secret sanitizer, @-content expansion + prompt templates + mandate-everywhere (v0.11–v0.13); the **session tree** (v0.14); the **role/capability spine** (typed manifest + verified-only save + re-verify-before-load, v0.15); the **knowledge flywheel** (v0.16); the **enforced 5-phase boot ritual** (v0.17); the **AgentSession engine** + the TUI driving it (v0.18); the **headless RPC surface** (v0.19); **npm publish readiness** (v0.20); the **L0→L3 promotion diagonal** (v0.21); the **per-call approval prompt** (v0.22); **memory scopes** (v0.23); **cross-harness import** (v0.24); **Smart Connections** (v0.25); **bridge skills** (v0.26). Then the hardening pass that closed every acceptance-scenario partial: the **spend hard edge** (v0.27), the **look-ahead governor** (v0.28), the **swarm governor** (v0.29), the **flywheel end-to-end test** (v0.30), the **natural-language role trigger** (v0.31), and **mid-run steer + real abort** (v0.32). **The acceptance board reached 14/14 pass, 0 partial — and v1.0.0 is CUT.** Every core pillar is shipped.
-- **P2/P3 — breadth.** RPC + npm (on the engine), memory scopes, the L0→L3 promotion diagonal, cross-harness import, Smart Connections, and bridge skills — shipped; the dynamic extension loader + hot-reload, themes, and the encrypted credential vault (v1.1.0) — the post-1.0 track.
+- **P2/P3 — breadth.** RPC + npm (on the engine), memory scopes, the L0→L3 promotion diagonal, cross-harness import, Smart Connections, and bridge skills — shipped; the dynamic extension loader + hot-reload, themes, the encrypted credential vault (v1.1.0), and the **spend-gated self-build developer loop** (`guru self-build-run`, v1.2.0 — a governed build cycle, every model loop bounded and spend as the one hard gate) — the post-1.0 track.
 
 Explicitly **out of scope**, by design: an external routing sidecar in the loop (on-tap only), SaaS/web/multi-user/billing, and unattended self-improvement (constitutionally excluded, not deferred).
 
