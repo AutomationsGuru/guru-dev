@@ -161,6 +161,27 @@ function insertNewline(state: EditorState): EditorState {
   return { ...state, lines, row: state.row + 1, col: 0 };
 }
 
+/**
+ * Insert a pasted block at the cursor, LITERALLY — embedded newlines become
+ * real buffer lines instead of each submitting (bracketed paste, ESC[200~…201~).
+ * CR/CRLF are normalized to LF so a Windows-origin paste doesn't leave stray \r.
+ */
+function insertPaste(state: EditorState, text: string): EditorState {
+  const normalized = text.replace(/\r\n?/gu, "\n");
+  if (!normalized.includes("\n")) {
+    return insertText(state, normalized);
+  }
+  const segments = normalized.split("\n");
+  const line = currentLine(state);
+  const before = line.slice(0, state.col);
+  const after = line.slice(state.col);
+  const lastSegment = segments[segments.length - 1] ?? "";
+  const merged = [before + (segments[0] ?? ""), ...segments.slice(1, -1), lastSegment + after];
+  const lines = [...state.lines];
+  lines.splice(state.row, 1, ...merged);
+  return { ...state, lines, row: state.row + segments.length - 1, col: lastSegment.length };
+}
+
 function backspace(state: EditorState): EditorState {
   if (state.col > 0) {
     const line = currentLine(state);
@@ -340,6 +361,11 @@ export function editorReduce(state: EditorState, key: EditorKey): EditorStep {
   }
   if (name === "delete") {
     return render(forwardDelete(state));
+  }
+
+  // --- bracketed paste: one literal insert, newlines and all (never per-line submit) ---
+  if (name === "paste") {
+    return render(insertPaste(state, sequence));
   }
 
   // --- printable ---

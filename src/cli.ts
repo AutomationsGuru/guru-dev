@@ -19,6 +19,10 @@ import {
   createHarnessRuntime
 } from "./index.js";
 import { proposeEvidenceTasks } from "./selfbuild/evidence.js";
+import { runDevCycle } from "./selfbuild/runDevCycle.js";
+import { buildDevCyclePlan, renderDevCyclePlan } from "./selfbuild/devCyclePlan.js";
+import { makeAskModelFromRoute, routeFromPlannerConfig } from "./selfbuild/askModelAdapter.js";
+import { makeSmokeDeps } from "./selfbuild/smokeDeps.js";
 import { createFileMemoryStore } from "./memory/store.js";
 import { normalizeKnownPathFields } from "./runtime/pathNormalization.js";
 import { startHarnessApiServer } from "./surfaces/api.js";
@@ -227,6 +231,56 @@ if (command === "self-build-plan") {
   });
 
   console.log(JSON.stringify(runCommandReport, null, 2));
+} else if (command === "self-build-run") {
+  if (hasFlag(args, "--help") || hasFlag(args, "-h")) {
+    console.log(
+      [
+        "guru self-build-run — drive the 0→7 dev cycle (SELECT→BUILD→TEST→SMOKE→DEBUG→REVIEW→SHIP→LEARN).",
+        "",
+        "  --dry-run                      Discover gates + print the stage plan; execute NOTHING.",
+        "  --task-id <id>                 Task to build.",
+        "  --cwd <path>                   Working directory (default: cwd).",
+        "  --config <path>                Config file.",
+        "  --allow-dirty-workspace        Permit a dirty git tree.",
+        "  --allow-risky-paths            Permit risky path writes.",
+        "",
+        "Spend is the hard gate: the loop injects a fail-closed mandate policy and a bounded budget."
+      ].join("\n")
+    );
+    process.exit(0);
+  }
+
+  const cwd = getFlagValue(args, "--cwd") ?? process.cwd();
+  const taskId = getFlagValue(args, "--task-id");
+  const configPath = getFlagValue(args, "--config");
+
+  if (hasFlag(args, "--dry-run")) {
+    // Preview only — no model call, no gate run, no mutation.
+    const plan = buildDevCyclePlan({ cwd, ...(taskId ? { taskId } : {}) });
+    console.log(renderDevCyclePlan(plan));
+    process.exit(0);
+  }
+
+  // Build a live reviewer askModel from the configured model ONLY when its key is present in
+  // the environment (presence check — the value is never read here). Absent → REVIEW is YELLOW.
+  const devCycleConfig = loadHarnessConfig({ cwd, ...(configPath ? { configPath } : {}) }).config;
+  const plannerModel = devCycleConfig.plannerModel;
+  const keyPresent = plannerModel !== undefined && (process.env[plannerModel.apiKeyEnvVar] ?? "").length > 0;
+  const askModel = plannerModel && keyPresent ? makeAskModelFromRoute(routeFromPlannerConfig(plannerModel), { env: process.env }) : undefined;
+
+  const devCycleReport = await runDevCycle({
+    ...(askModel ? { askModel } : {}),
+    smoke: makeSmokeDeps({ cwd }),
+    executorOptions: {
+      cwd,
+      ...(taskId ? { taskId } : {}),
+      ...(configPath ? { configPath } : {}),
+      ...(hasFlag(args, "--allow-dirty-workspace") ? { allowDirtyWorkspace: true } : {}),
+      ...(hasFlag(args, "--allow-risky-paths") ? { allowRiskyPaths: true } : {})
+    }
+  });
+  console.log(JSON.stringify(devCycleReport, null, 2));
+  process.exitCode = devCycleReport.terminal === "done" ? 0 : 1;
 } else if (command === "api") {
   const host = getFlagValue(args, "--host") ?? "127.0.0.1";
   const port = getOptionalPositiveInt(args, "--port");
@@ -471,6 +525,7 @@ function renderGeneralHelp(runtimeInfo: ReturnType<typeof getRuntimeInfo>): stri
     "",
     "Commands:",
     "  self-build-plan     Print the current parity plan and next task",
+    "  self-build-run      Drive the 0→7 dev cycle (use --dry-run to preview)",
     "  direction-check     Verify HERE/THERE direction alignment",
     "  session-start       Start a harness runtime session",
     "  tool-run            Start a session and execute one registered tool",

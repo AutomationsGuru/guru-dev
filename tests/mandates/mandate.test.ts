@@ -20,6 +20,12 @@ describe("verbsForCall", () => {
     expect(verbsForCall("git.pr.run", {})).toEqual(["net", "exec"]);
   });
 
+  it("F5: a shell redirect WITHOUT whitespace (echo x>.env / >>.env) is a secret-edge", () => {
+    expect(verbsForCall("bash", { command: "echo hunter2>.env" })).toContain("secret-edge");
+    expect(verbsForCall("bash", { command: "echo hunter2>>.env" })).toContain("secret-edge");
+    expect(verbsForCall("bash", { command: "echo hunter2 > .env" })).toContain("secret-edge"); // whitespace form still works
+  });
+
   it("escalates destructive shell input to the destructive verb", () => {
     expect(verbsForCall("bash", { command: "rm -rf build" })).toContain("destructive");
     expect(verbsForCall("bash", { command: "git push --force origin main" })).toContain("destructive");

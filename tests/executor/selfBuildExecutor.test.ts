@@ -678,6 +678,33 @@ describe("runSelfBuildExecutor runtime hardening", () => {
       rmSync(tempRoot, { recursive: true, force: true });
     }
   });
+
+  it("consults the injected mandate policy on the executor path (P7 spend-gate seam)", async () => {
+    const seen: string[] = [];
+    const model = new FixedPlannerModel({
+      objective: "Execute task.",
+      summary: "Resolve repo context.",
+      steps: [{ id: "repo-context", title: "Resolve repository context", toolId: "repo.context.resolve", input: { cwd: repoRoot } }]
+    });
+
+    await runSelfBuildExecutor({
+      cwd: repoRoot,
+      taskId: "mandate-seam",
+      allowDirtyWorkspace: true,
+      allowRiskyPaths: true,
+      plannerModel: model,
+      operationalStore: createInMemoryOperationalStore(),
+      commandExecutor: createCommandExecutor([]),
+      // The gate is now live on the executor runtime: every tool call is routed through it.
+      mandatePolicy: (toolId) => {
+        seen.push(toolId);
+        return { outcome: "allow", reason: "test spy", verbs: [] };
+      }
+    });
+
+    // Proof the policy is threaded into the runtime that actually runs the plan's tools.
+    expect(seen).toContain("repo.context.resolve");
+  });
 });
 
 function createCommandExecutor(executedCommands: string[][], failGateName?: string): CommandExecutor {

@@ -58,6 +58,10 @@ const CSI_TILDE: Readonly<Record<string, string>> = {
   "8": "end"
 };
 
+/** Bracketed-paste bracket sequences (enabled via ESC[?2004h by the controller). */
+const PASTE_START = "\x1b[200~";
+const PASTE_END = "\x1b[201~";
+
 /** Parse one raw chunk into editor keys. Pure — the ESC grace timer lives in the caller. */
 export function parseKeys(chunk: string): ParsedChunk {
   const keys: EditorKey[] = [];
@@ -76,6 +80,21 @@ export function parseKeys(chunk: string): ParsedChunk {
 
     if (char === "\x1b") {
       flushPrintable();
+      // Bracketed paste: ESC[200~ <content> ESC[201~ — capture the WHOLE block as
+      // one literal insert so embedded newlines don't each submit. The mode is
+      // enabled by the controller (guru.ts). A paste can span reads, so if the
+      // 201~ terminator hasn't arrived yet, hold the tail and let the decoder
+      // re-prefix it to the next chunk (with the ESC-grace drop suppressed).
+      if (chunk.startsWith(PASTE_START, at)) {
+        const contentStart = at + PASTE_START.length;
+        const endIndex = chunk.indexOf(PASTE_END, contentStart);
+        if (endIndex === -1) {
+          return { keys, pending: chunk.slice(at) };
+        }
+        keys.push({ name: "paste", sequence: chunk.slice(contentStart, endIndex) });
+        at = endIndex + PASTE_END.length;
+        continue;
+      }
       const next = chunk[at + 1];
       if (next === undefined) {
         return { keys, pending: "\x1b" }; // lone trailing ESC — caller holds it
@@ -211,15 +230,22 @@ export function createKeyDecoder(onKey: (key: EditorKey) => void, escGraceMs = 3
     }
     if (parsed.pending !== undefined) {
       held = parsed.pending;
-      timer = setTimeout(() => {
-        const wasLoneEsc = held === "\x1b";
-        held = "";
-        if (wasLoneEsc) {
-          onKey({ name: "escape", sequence: "\x1b" });
-        }
-        // A truncated CSI that never completed is dropped — there is no honest
-        // key to synthesize from half a sequence.
-      }, escGraceMs);
+      // An unterminated bracketed paste must NOT be dropped by the grace timer —
+      // the 201~ terminator always follows. Hold it indefinitely. We only suppress
+      // the timer once the FULL start marker is seen (a lone ESC is also a prefix
+      // of ESC[200~, so a `startsWith(held)` test would wrongly swallow real Esc).
+      const pendingPaste = held.startsWith(PASTE_START);
+      if (!pendingPaste) {
+        timer = setTimeout(() => {
+          const wasLoneEsc = held === "\x1b";
+          held = "";
+          if (wasLoneEsc) {
+            onKey({ name: "escape", sequence: "\x1b" });
+          }
+          // A truncated CSI that never completed is dropped — there is no honest
+          // key to synthesize from half a sequence.
+        }, escGraceMs);
+      }
     }
   };
 

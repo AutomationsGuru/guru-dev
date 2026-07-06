@@ -361,7 +361,7 @@ function routeFromSheet(row: SheetModel, indexInProvider: number): ProviderRoute
  */
 const CODEX_DIRECT_WIRE: Record<string, unknown> = {
   headers: [
-    { header: "ChatGPT-Account-Id", filePath: "~/.codex/auth.json", jsonPath: "tokens.account_id" },
+    { header: "ChatGPT-Account-Id", oauthAccount: true },
     { header: "OpenAI-Beta", literal: "responses=experimental" },
     { header: "originator", literal: "codex_cli_rs" }
   ],
@@ -381,13 +381,10 @@ function codexDirectRoute(model: string, contextTokens: number, maxOutputTokens:
     apiFamily: "openai-responses",
     baseUrl: "https://chatgpt.com/backend-api/codex",
     credentialSource: {
-      type: "oauth-cache",
-      envVarNames: [],
-      filePath: "~/.codex/auth.json",
-      cacheTokenPath: "tokens.access_token",
-      oauthPolicy: "ecosystem-ok"
+      type: "guru-oauth",
+      envVarNames: []
     },
-    capabilities: { supportsStreaming: true, supportsTools: true, supportsReasoning: true, notes: ["Codex plan direct Responses lane (beside the delegate); OAuth token from ~/.codex/auth.json."] },
+    capabilities: { supportsStreaming: true, supportsTools: true, supportsReasoning: true, notes: ["Codex plan direct Responses lane; token from guru's OWN sign-in (/login codex) in the encrypted vault — no ~/.codex cache."] },
     context: { contextWindowTokens: contextTokens, maxOutputTokens },
     compat: { supportsDeveloperRole: true, supportsReasoningEffort: true, requiresMaxCompletionTokens: true },
     status: "active",
