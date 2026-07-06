@@ -1,0 +1,41 @@
+# Dependencies
+node_modules/
+
+# Build/test output
+dist/
+coverage/
+.vitest/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Runtime/local state
+.env
+.env.*
+!.env.example
+.autogit.json
+.local/
+.cache/
+.tmp/
+.agents/reviews/_working_tree.diff
+/nul
+
+# Space-scope memory (§7): guru's own dev runs write .guru/memory here; downstream
+# projects choose whether to commit theirs. Never stage the harness's local space memory.
+.guru/
+
+# Google Drive sync temp artifacts
+.tmp.driveupload/
+.tmp.drivedownload/
+.tmp.drive*/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.claude/

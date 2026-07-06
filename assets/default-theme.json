@@ -1,0 +1,16 @@
+{
+  "name": "automationsguru",
+  "colors": {
+    "accent":  "#B56EF1",
+    "accent2": "#E958BE",
+    "success": "#31C48D",
+    "warning": "#F2A33C",
+    "error":   "#F73B4A",
+    "info":    "#7E8FFA",
+    "muted":   "#7A6C95",
+    "border":  "#3A2A5C",
+    "badgeFg": "#FFFFFF",
+    "badgeBg": "#8C11E1",
+    "banner":  ["#F73B4A", "#C7288F", "#8C11E1", "#B56EF1"]
+  }
+}

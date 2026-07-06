@@ -1,0 +1,66 @@
+{
+  "name": "guruharness",
+  "version": "1.1.0",
+  "description": "Independent, zero-framework agent harness for repo-aware coding agents — one importable AgentSession engine behind a TUI, an in-process SDK, and a headless JSONL RPC surface.",
+  "private": false,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./session": {
+      "types": "./dist/session/agentSession.d.ts",
+      "import": "./dist/session/agentSession.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "guruharness": "./dist/cli.js",
+    "guru": "./dist/guru.js"
+  },
+  "files": [
+    "dist",
+    "assets",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AutomationsGuru/guru-dev.git"
+  },
+  "homepage": "https://github.com/AutomationsGuru/guru-dev#readme",
+  "bugs": {
+    "url": "https://github.com/AutomationsGuru/guru-dev/issues"
+  },
+  "scripts": {
+    "cli": "tsx src/cli.ts",
+    "guru": "tsx src/guru.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "dogfood:portfolio": "tsx scripts/portfolioDogfoodSmoke.ts",
+    "lint:docs": "node --eval \"console.log('docs lint not configured yet')\"",
+    "prepare": "npm run build"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "keywords": [
+    "agent",
+    "harness",
+    "automation"
+  ],
+  "license": "UNLICENSED",
+  "dependencies": {
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.2",
+    "supabase": "^2.106.0",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.8"
+  }
+}

@@ -1,0 +1,142 @@
+{
+  "runtimeName": "GuruHarness",
+  "referenceRuntime": "a reference agent runtime",
+  "skillDirectories": [
+    "./skills"
+  ],
+  "validationCommands": [
+    {
+      "name": "test",
+      "command": [
+        "npm",
+        "test"
+      ],
+      "required": true
+    },
+    {
+      "name": "typecheck",
+      "command": [
+        "npm",
+        "run",
+        "typecheck"
+      ],
+      "required": true
+    },
+    {
+      "name": "build",
+      "command": [
+        "npm",
+        "run",
+        "build"
+      ],
+      "required": true
+    },
+    {
+      "name": "repo-hygiene",
+      "command": [
+        "pwsh",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "scripts/verify-repo.ps1"
+      ],
+      "required": true
+    }
+  ],
+  "reviewGate": {
+    "provider": "coderabbit",
+    "required": true,
+    "command": [
+      "coderabbit",
+      "review",
+      "--agent",
+      "--type",
+      "uncommitted"
+    ]
+  },
+  "approvalPolicy": {
+    "autoCommitPushPr": true,
+    "allowLocalMerge": false,
+    "allowForcePush": false
+  },
+  "plannerModel": {
+    "provider": "openai-compatible",
+    "baseUrl": "https://api.openai.com/v1",
+    "model": "gpt-5.5",
+    "apiKeyEnvVar": "OPENAI_API_KEY",
+    "timeoutMs": 120000,
+    "temperature": 0
+  },
+  "plannerModelFallbacks": [],
+  "runtimeHardening": {
+    "allowDirtyWorkspace": false,
+    "allowRiskyPaths": false,
+    "plannerMaxRetries": 2,
+    "riskyPathPatterns": [
+      ".git",
+      ".env",
+      ".ssh",
+      ".aws",
+      ".npmrc",
+      ".yarnrc",
+      ".netrc",
+      ".config/gcloud",
+      "secrets",
+      "credentials",
+      "id_rsa",
+      "id_ed25519",
+      "service-account"
+    ],
+    "secretAllowList": [],
+    "shellAllowlist": [
+      "npm",
+      "node",
+      "git",
+      "pwsh",
+      "coderabbit"
+    ]
+  },
+  "selfBuild": {
+    "maxIterations": 5,
+    "completedTaskIds": [
+      "capture-operating-contract",
+      "core-result-contracts",
+      "supabase-operational-store",
+      "self-build-loop",
+      "config-loader",
+      "tool-registry",
+      "repo-context-layer",
+      "review-gates",
+      "git-pr-automation",
+      "maintenance-loop",
+      "supabase-runtime-adapter",
+      "skill-loader",
+      "direction-gate",
+      "harness-runtime-nucleus",
+      "planner-runtime",
+      "self-build-executor",
+      "model-adapter",
+      "session-persistence",
+      "run-command-lifecycle",
+      "api-tui-surfaces",
+      "runtime-hardening",
+      "provider-fallback-playbook",
+      "long-running-observability",
+      "operator-recovery-workflows",
+      "tool-execution-expansion",
+      "github-and-operational-tool-expansion",
+      "end-to-end-harness-dogfood",
+      "operator-ergonomics-polish",
+      "api-resumable-sessions",
+      "api-session-events",
+      "session-inspection-helper",
+      "persisted-session-timeline-inspection",
+      "session-listing-helper",
+      "session-continuation-helper",
+      "session-continuation-dogfood",
+      "operator-continuity-playbook",
+      "api-operator-startup-playbook"
+    ]
+  }
+}
