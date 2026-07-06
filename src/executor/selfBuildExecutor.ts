@@ -9,7 +9,7 @@ import type { OperationalImplementation, RecordedBlocker } from "../operational/
 import { createPlannerModelFromConfig, type PlannerModelFetch } from "../model/openAiCompatiblePlannerModel.js";
 import type { PlannerModel } from "../planner/runtime.js";
 import type { PlannerRunReport } from "../planner/schemas.js";
-import { runReviewGates, type CommandExecutor, type ReviewGatesReport } from "../review/gates.js";
+import { runReviewGates, type CommandExecutor, type NativeReviewer, type ReviewGatesReport } from "../review/gates.js";
 import {
   buildSessionObservabilitySummary,
   createOperationalSessionPersistenceStore,
@@ -18,6 +18,7 @@ import {
   type SessionPersistenceStore
 } from "../runtime/persistence.js";
 import { createHarnessRuntime } from "../runtime/session.js";
+import type { MandateDecision } from "../mandates/evaluate.js";
 import type { HarnessSession, StartHarnessSessionOptions } from "../runtime/schemas.js";
 import { detectPotentialSecrets, isRiskyPath } from "../safety/policyGuard.js";
 
@@ -37,6 +38,9 @@ export interface SelfBuildExecutorGitOptions {
   readonly paths?: readonly string[];
 }
 
+/** The per-tool mandate/spend hard-edge gate applied inside the runtime. */
+export type MandatePolicyFn = (toolId: string, input: unknown, cwd: string) => MandateDecision | null;
+
 export interface RunSelfBuildExecutorOptions {
   readonly cwd?: string;
   readonly configPath?: string;
@@ -50,6 +54,14 @@ export interface RunSelfBuildExecutorOptions {
   readonly operationalStore?: OperationalStore;
   readonly sessionPersistenceStore?: SessionPersistenceStore;
   readonly commandExecutor?: CommandExecutor;
+  /**
+   * The mandate/spend hard-edge gate for BOTH the executor runtime AND the planner
+   * sub-runtime. Absent → no per-tool gate (back-compat for existing callers); the dev
+   * cycle (runDevCycle) always injects one so an autonomous run is spend-gated.
+   */
+  readonly mandatePolicy?: MandatePolicyFn;
+  /** Runs the native critic-panel review gate (P1); wired by the dev cycle with a model. */
+  readonly nativeReviewer?: NativeReviewer;
   readonly includeReviewGate?: boolean;
   readonly maxPlannerSteps?: number;
   readonly maxPlannerRetries?: number;
@@ -123,7 +135,8 @@ export async function runSelfBuildExecutor(options: RunSelfBuildExecutorOptions)
   const runtime = createHarnessRuntime({
     operationalStore,
     sessionPersistenceStore,
-    ...(options.commandExecutor ? { commandExecutor: options.commandExecutor } : {})
+    ...(options.commandExecutor ? { commandExecutor: options.commandExecutor } : {}),
+    ...(options.mandatePolicy ? { mandatePolicy: options.mandatePolicy } : {})
   });
   return runSelfBuildExecutorWithRuntime(runtime, configResult, options, { cwd, projectSlug, operationalStore, sessionPersistenceStore });
 }
@@ -255,7 +268,8 @@ async function runSelfBuildExecutorWithRuntime(
     sameProviderRetries: options.maxPlannerRetries ?? configResult.config.runtimeHardening.plannerMaxRetries,
     operationalStore,
     sessionPersistenceStore,
-    ...(options.commandExecutor ? { commandExecutor: options.commandExecutor } : {})
+    ...(options.commandExecutor ? { commandExecutor: options.commandExecutor } : {}),
+    ...(options.mandatePolicy ? { mandatePolicy: options.mandatePolicy } : {})
   });
 
   if (planner.report.status === "blocked") {
@@ -288,7 +302,8 @@ async function runSelfBuildExecutorWithRuntime(
   const reviewGates = await runReviewGates(configResult.config, {
     cwd,
     includeReviewGate: options.includeReviewGate ?? true,
-    ...(options.commandExecutor ? { executor: options.commandExecutor } : {})
+    ...(options.commandExecutor ? { executor: options.commandExecutor } : {}),
+    ...(options.nativeReviewer ? { nativeReviewer: options.nativeReviewer } : {})
   });
 
   if (reviewGates.verdict === "RED") {
@@ -454,6 +469,7 @@ async function runPlannerWithRetries(options: {
   readonly operationalStore: OperationalStore;
   readonly sessionPersistenceStore: SessionPersistenceStore;
   readonly commandExecutor?: CommandExecutor;
+  readonly mandatePolicy?: MandatePolicyFn;
 }): Promise<{ readonly report: PlannerRunReport; readonly providerLabel: string; readonly attempts: number; readonly playbook: PlannerFallbackPlaybook }> {
   let attempts = 0;
   const attemptRecords: PlannerFallbackAttempt[] = [];
@@ -467,6 +483,7 @@ async function runPlannerWithRetries(options: {
         operationalStore: options.operationalStore,
         sessionPersistenceStore: options.sessionPersistenceStore,
         ...(options.commandExecutor ? { commandExecutor: options.commandExecutor } : {}),
+        ...(options.mandatePolicy ? { mandatePolicy: options.mandatePolicy } : {}),
         plannerModel: plannerCandidate.model
       });
       const resumed = await plannerRuntime.resumeSession(options.session.id);

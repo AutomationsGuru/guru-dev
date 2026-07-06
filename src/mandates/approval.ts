@@ -62,5 +62,9 @@ export async function resolveApproval(toolId: string, decision: MandateDecision,
       ctx.sessionApprovals.add(verb);
     }
   }
-  return true; // "once" or "always"
+  // Default-DENY: only an EXPLICIT approval passes. "once" and "always" both approve
+  // this call (a hard-edge "always" approves once but did NOT persist above); anything
+  // unexpected — empty string, undefined, "n"/"no" — falls through to false rather than
+  // the old blanket `return true`. Fail-safe (Constitution §3).
+  return choice === "once" || choice === "always";
 }

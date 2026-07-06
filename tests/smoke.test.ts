@@ -85,6 +85,19 @@ describe("cli", () => {
     expect(parsed.taskCount).toBe(38);
   });
 
+  it("should print the dev-cycle dry-run plan and execute nothing", () => {
+    const output = execFileSync(process.execPath, ["--import", "tsx", "src/cli.ts", "self-build-run", "--dry-run", "--task-id", "preview-task"], {
+      cwd: repoRoot,
+      encoding: "utf8"
+    });
+    expect(output).toContain("Dev-cycle plan");
+    expect(output).toContain("preview-task");
+    expect(output).toContain("SELECT");
+    expect(output).toContain("DRY RUN");
+    // TEST lists the repo's OWN discovered gates (proof discovery ran, read-only).
+    expect(output).toMatch(/npm run test/u);
+  });
+
   it("should print run help with runtime hardening and git flags", () => {
     const output = execFileSync(process.execPath, ["--import", "tsx", "src/cli.ts", "run", "--help"], {
       cwd: repoRoot,
