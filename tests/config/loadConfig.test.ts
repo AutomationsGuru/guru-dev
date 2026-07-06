@@ -16,6 +16,27 @@ describe("HarnessConfigSchema", () => {
     expect(config.plannerModel).toBeUndefined();
     expect(config.selfBuild.maxIterations).toBe(1);
   });
+
+  it("P0: reviewGate defaults to the native critic panel (no external tool assumed)", () => {
+    const config = HarnessConfigSchema.parse({ runtimeName: "GuruHarness" });
+    expect(config.reviewGate.provider).toBe("native-critic-panel");
+    expect(config.reviewGate.required).toBe(true);
+    expect(config.reviewGate.command).toBeUndefined();
+  });
+
+  it("P0: a legacy {provider:'coderabbit', command:[...]} config still loads unchanged", () => {
+    const config = HarnessConfigSchema.parse({
+      runtimeName: "GuruHarness",
+      reviewGate: { provider: "coderabbit", required: true, command: ["coderabbit", "review", "--agent"] }
+    });
+    expect(config.reviewGate.provider).toBe("coderabbit");
+    expect(config.reviewGate.command).toEqual(["coderabbit", "review", "--agent"]);
+  });
+
+  it("P0: the coderabbit/command providers REQUIRE a command (refine); native does not", () => {
+    expect(() => HarnessConfigSchema.parse({ runtimeName: "G", reviewGate: { provider: "coderabbit", required: true } })).toThrow();
+    expect(() => HarnessConfigSchema.parse({ runtimeName: "G", reviewGate: { provider: "native-critic-panel", required: true } })).not.toThrow();
+  });
 });
 
 describe("loadHarnessConfig", () => {

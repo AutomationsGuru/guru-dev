@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { sanitizeErrorMessage } from "../router/health.js";
 import { registerSecretValue, scrubSecretValues } from "../safety/secretSafety.js";
+import { resolveOAuthTokenFor } from "./oauth/tokenRegistry.js";
 import { resolveProviderWire } from "./providerWire.js";
 import type { ProviderRouteDescriptor } from "../providers/schemas.js";
 
@@ -80,7 +81,7 @@ export interface ResolvedRouteCredential {
   readonly envName?: string;
   readonly reason: string;
   /** Resolution layer that produced the value (absent when unusable/none). */
-  readonly source?: "none" | "env" | "vault" | "template" | "op-probe" | "ecosystem-cache";
+  readonly source?: "none" | "env" | "vault" | "template" | "op-probe" | "ecosystem-cache" | "guru-oauth";
   /**
    * The resolved credential value — in-memory only, registered with the scrubber,
    * and attached as a NON-ENUMERABLE property: `JSON.stringify(credential)` and
@@ -246,6 +247,19 @@ export function resolveRouteCredential(
 
   if (source.type === "none") {
     return { usable: true, source: "none", reason: "No credential required." };
+  }
+
+  // guru's OWN vaulted OAuth token (native ChatGPT/Codex-plan sign-in). This lane is
+  // credentialled ONLY by guru's own login — no env/cache fall-through, no cache read.
+  if (source.type === "guru-oauth") {
+    const token = resolveOAuthTokenFor(route.providerId);
+    if (token?.accessToken) {
+      return withCredentialValue(
+        { usable: true, source: "guru-oauth", reason: `Signed in via guru's own ${route.providerId} login (token in the encrypted vault).` },
+        token.accessToken
+      );
+    }
+    return { usable: false, source: "guru-oauth", reason: `Not signed in. Run /login ${route.providerId.replace(/-direct$/u, "")} to sign in through guru.` };
   }
 
   const attempted: string[] = [];

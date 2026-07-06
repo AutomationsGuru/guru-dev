@@ -1,6 +1,19 @@
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 
 import type { HarnessConfig, ReviewGate, ValidationCommand } from "../config/schema.js";
+
+/**
+ * PATH-probe: is a command present? (P0) — the basis of attach-if-present overlays
+ * (e.g. append CodeRabbit/gh only when installed), never assumed. Presence only.
+ */
+export function commandExists(name: string): boolean {
+  try {
+    execFileSync(process.platform === "win32" ? "where" : "which", [name], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export type ReviewGateVerdict = "GREEN" | "YELLOW" | "RED";
 export type GateKind = "validation" | "review";
@@ -39,11 +52,18 @@ export interface CommandGate {
   readonly name: string;
   readonly command: readonly string[];
   readonly required: boolean;
+  /** The native critic panel (P1): run via an injected model reviewer, NOT a shell command. */
+  readonly native?: boolean;
 }
+
+/** Runs guru's OWN model-powered review for a native gate (no external tool). Injected by the caller. */
+export type NativeReviewer = (gate: CommandGate, cwd?: string) => Promise<CommandGateResult>;
 
 export interface CommandGateResult extends CommandGate, CommandExecutionResult {
   readonly status: GateStatus;
   readonly summary: string;
+  /** Explicit GREEN/YELLOW/RED (the native panel emits YELLOW on medium-only findings). */
+  readonly verdict?: ReviewGateVerdict;
 }
 
 export interface ReviewGatesReport {
@@ -61,6 +81,8 @@ export interface RunReviewGatesOptions {
   readonly cwd?: string;
   readonly includeReviewGate?: boolean;
   readonly executor?: CommandExecutor;
+  /** Runs a native-critic-panel gate (P1). Absent → the native gate degrades to YELLOW, never RED-by-absence. */
+  readonly nativeReviewer?: NativeReviewer;
 }
 
 export async function runReviewGates(
@@ -73,10 +95,30 @@ export async function runReviewGates(
   const results: CommandGateResult[] = [];
 
   for (const gate of gates) {
-    results.push(await runCommandGate(gate, executor, options.cwd));
+    if (gate.native) {
+      // guru's own model-powered review — never a shell command. With no reviewer wired it
+      // degrades to YELLOW (honest "not run"), never a silent pass or a RED-by-absence.
+      results.push(options.nativeReviewer ? await options.nativeReviewer(gate, options.cwd) : nativeGateUnavailable(gate));
+    } else {
+      results.push(await runCommandGate(gate, executor, options.cwd));
+    }
   }
 
   return buildReviewGatesReport(startedAtDate, results);
+}
+
+/** A native gate with no reviewer wired: YELLOW (couldn't run) — honest, not a pass, not RED-by-absence. */
+function nativeGateUnavailable(gate: CommandGate): CommandGateResult {
+  return {
+    ...gate,
+    exitCode: null,
+    stdout: "",
+    stderr: "native critic panel not wired (no model reviewer provided)",
+    durationMs: 0,
+    status: "failed",
+    verdict: "YELLOW",
+    summary: `${gate.name}: not run — native review reviewer not wired (YELLOW).`
+  };
 }
 
 export function createCommandGates(config: HarnessConfig, includeReviewGate: boolean): readonly CommandGate[] {
@@ -241,10 +283,14 @@ function toValidationGate(command: ValidationCommand): CommandGate {
 }
 
 function toReviewGate(reviewGate: ReviewGate): CommandGate {
+  if (reviewGate.provider === "native-critic-panel") {
+    // guru's OWN model-powered review — no shell command; run via the injected NativeReviewer.
+    return { kind: "review", name: reviewGate.provider, command: [], required: reviewGate.required, native: true };
+  }
   return {
     kind: "review",
     name: reviewGate.provider,
-    command: reviewGate.command,
+    command: reviewGate.command ?? [],
     required: reviewGate.required
   };
 }
@@ -284,19 +330,28 @@ function buildReviewGatesReport(startedAtDate: Date, results: readonly CommandGa
   };
 }
 
+/** A gate's effective verdict: its explicit `verdict` (native panel) if set, else from status/required. */
+function gateVerdict(result: CommandGateResult): ReviewGateVerdict {
+  if (result.verdict) {
+    return result.verdict;
+  }
+  if (result.status === "failed") {
+    return result.required ? "RED" : "YELLOW";
+  }
+  return "GREEN";
+}
+
 function deriveVerdict(results: readonly CommandGateResult[]): ReviewGateVerdict {
   if (results.length === 0) {
     return "YELLOW";
   }
-
-  if (results.some((result) => result.required && result.status === "failed")) {
+  const verdicts = results.map(gateVerdict);
+  if (verdicts.includes("RED")) {
     return "RED";
   }
-
-  if (results.some((result) => result.status === "failed")) {
+  if (verdicts.includes("YELLOW")) {
     return "YELLOW";
   }
-
   return "GREEN";
 }
 
