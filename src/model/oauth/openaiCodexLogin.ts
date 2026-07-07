@@ -100,7 +100,7 @@ export function extractAccountFacts(idToken: string): Pick<GuruOAuthToken, "acco
 }
 
 /** Epoch-ms expiry from the access_token `exp` claim (seconds), if present. */
-function expiryFromAccessToken(accessToken: string): number | undefined {
+export function expiryFromAccessToken(accessToken: string): number | undefined {
   const exp = decodeJwtClaims(accessToken).exp;
   return typeof exp === "number" ? exp * 1000 : undefined;
 }
@@ -239,10 +239,16 @@ export function readCodexCacheToken(home: string = homedir(), fileRead: (path: s
     const idToken = (tokens.id_token as string | undefined) ?? "";
     const facts = idToken ? extractAccountFacts(idToken) : {};
     const accountId = (tokens.account_id as string | undefined) ?? facts.accountId;
+    const refreshToken = (tokens.refresh_token as string | undefined) ?? "";
     const expiresAt = expiryFromAccessToken(accessToken);
+    // A dead credential must NOT read as "signed in": if the access token is expired and
+    // there's no refresh token to renew it, fall through to the native login instead.
+    if (expiresAt !== undefined && expiresAt <= Date.now() && !refreshToken) {
+      return null;
+    }
     return {
       accessToken,
-      refreshToken: (tokens.refresh_token as string | undefined) ?? "",
+      refreshToken,
       idToken,
       ...(accountId ? { accountId } : {}),
       ...(facts.planType ? { planType: facts.planType } : {}),
@@ -255,7 +261,7 @@ export function readCodexCacheToken(home: string = homedir(), fileRead: (path: s
   }
 }
 
-function safeReadFile(path: string): string | null {
+export function safeReadFile(path: string): string | null {
   try {
     return existsSync(path) ? readFileSync(path, "utf8") : null;
   } catch {
@@ -263,8 +269,15 @@ function safeReadFile(path: string): string | null {
   }
 }
 
-/** Best-effort system-browser open (never an embedded webview). */
-function defaultOpenBrowser(url: string): void {
+/**
+ * Best-effort system-browser open (never an embedded webview). The URL is validated to be
+ * an http(s) URL before it reaches any command line — a defence against passing an
+ * unexpected value to the shell (the loopback/authorize/verification URLs are always http(s)).
+ */
+export function defaultOpenBrowser(url: string): void {
+  if (!/^https?:\/\//iu.test(url)) {
+    return;
+  }
   const platform = process.platform;
   const [cmd, args] = platform === "win32" ? ["cmd", ["/c", "start", "", url]] : platform === "darwin" ? ["open", [url]] : ["xdg-open", [url]];
   try {

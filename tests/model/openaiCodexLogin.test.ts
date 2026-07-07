@@ -114,6 +114,13 @@ describe("readCodexCacheToken — ~/.codex shortcut (opportunistic reuse, never 
   it("returns null when the cache is absent (falls back to the native browser login)", () => {
     expect(readCodexCacheToken("/home/op", () => null)).toBeNull();
   });
+
+  it("returns null for an expired token with no refresh_token (dead credential must not read as signed in)", () => {
+    const past = Math.floor((Date.now() - 60_000) / 1000);
+    const jwt = `x.${Buffer.from(JSON.stringify({ exp: past })).toString("base64url")}.y`;
+    const expiredNoRefresh = JSON.stringify({ tokens: { access_token: jwt, refresh_token: "" } });
+    expect(readCodexCacheToken("/home/op", (p) => (p.replace(/\\/gu, "/") === "/home/op/.codex/auth.json" ? expiredNoRefresh : null))).toBeNull();
+  });
 });
 
 describe("guru-oauth lane resolves token + account id from the vault registry (never a cache)", () => {

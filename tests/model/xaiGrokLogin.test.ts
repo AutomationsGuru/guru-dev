@@ -12,7 +12,10 @@ import {
 } from "../../src/model/oauth/xaiGrokLogin.js";
 
 const fakeFetch = (body: Record<string, unknown>, ok = true, status = 200): typeof globalThis.fetch =>
-  (async () => ({ ok, status, json: async () => body, text: async () => JSON.stringify(body) })) as unknown as typeof globalThis.fetch;
+  (async () => {
+    const res = { ok, status, json: async () => body, text: async () => JSON.stringify(body), clone: () => res };
+    return res;
+  }) as unknown as typeof globalThis.fetch;
 
 describe("xaiGrokLogin — guru-native SuperGrok OAuth (loopback PKCE, no CLI required)", () => {
   it("resolves the xAI OAuth config with auth.x.ai defaults, env-overridable", () => {
@@ -123,6 +126,23 @@ describe("xaiGrokLogin — guru-native SuperGrok OAuth (loopback PKCE, no CLI re
     const next = await refreshXaiToken(cfg, prev, fakeFetch({ access_token: "new", refresh_token: "R2" }), 2_000);
     expect(next.accessToken).toBe("new");
     expect(next.refreshToken).toBe("R2"); // rotated — the caller MUST persist it
+  });
+
+  it("a permanent refresh failure raises OAuthRefreshError so the re-login prompt shows", async () => {
+    const cfg = resolveXaiOAuthConfig({});
+    const prev = { accessToken: "old", refreshToken: "dead", idToken: "", authMode: "grok" as const, obtainedAt: 0 };
+    await expect(refreshXaiToken(cfg, prev, fakeFetch({ error: "invalid_grant" }, false, 400))).rejects.toMatchObject({
+      name: "OAuthRefreshError",
+      permanent: true
+    });
+  });
+
+  it("readGrokCacheToken returns null for an expired token with no refresh_token (falls through to login)", () => {
+    // exp in the past, no refresh_token → dead credential, must NOT read as signed in.
+    const past = Math.floor((Date.now() - 60_000) / 1000);
+    const jwt = `x.${Buffer.from(JSON.stringify({ exp: past })).toString("base64url")}.y`;
+    const authJson = JSON.stringify({ "https://auth.x.ai::cid": { access_token: jwt } });
+    expect(readGrokCacheToken("/home/op", (p) => (p.replace(/\\/gu, "/") === "/home/op/.grok/auth.json" ? authJson : null))).toBeNull();
   });
 
   it("falls back to an OS-assigned port when the preferred port is reserved (Windows winnat EACCES)", async () => {

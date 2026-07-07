@@ -11,7 +11,7 @@ import type { ProviderRouteDescriptor } from "../providers/schemas.js";
  * the deferred finished state (planning/THERE.md §5 + build plan Phase B).
  */
 
-export type LoginKind = "already-connected" | "ecosystem-oauth" | "api-key" | "none-needed" | "unknown";
+export type LoginKind = "already-connected" | "guru-oauth" | "ecosystem-oauth" | "api-key" | "none-needed" | "unknown";
 
 export interface LoginFlow {
   readonly routeId: string;
@@ -55,6 +55,20 @@ export function describeLoginFlow(route: ProviderRouteDescriptor, env: NodeJS.Pr
       ...base,
       kind: "already-connected",
       steps: [`Connected via ${credential.source ?? "resolved credential"}. /accounts for presence + expiry; /logout ${route.providerId} to disconnect.`]
+    };
+  }
+
+  // guru-native OAuth plan lane (openai-codex, grok): sign in through guru's OWN /login —
+  // a native browser/device-code flow, token vaulted; NOT an ecosystem-CLI login.
+  if (source.type === "guru-oauth") {
+    const loginName = route.providerId.replace(/-direct$/u, "");
+    return {
+      ...base,
+      kind: "guru-oauth",
+      steps: [
+        `${route.providerId} signs in through guru's OWN login — no other CLI required.`,
+        `Run /login ${loginName} (a native browser or device-code flow); the token is saved to the encrypted vault.`
+      ]
     };
   }
 

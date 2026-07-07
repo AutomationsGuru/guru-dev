@@ -1,11 +1,18 @@
-import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { decodeJwtClaims, generatePkce, type GuruOAuthToken, type Pkce } from "./openaiCodexLogin.js";
+import {
+  decodeJwtClaims,
+  defaultOpenBrowser,
+  expiryFromAccessToken,
+  generatePkce,
+  OAuthRefreshError,
+  safeReadFile,
+  type GuruOAuthToken,
+  type Pkce
+} from "./openaiCodexLogin.js";
 
 /**
  * guru-native "Sign in with SuperGrok / xAI" login (2026-07).
@@ -56,11 +63,8 @@ export function resolveXaiOAuthConfig(env: NodeJS.ProcessEnv = process.env): Xai
 
 type FetchImpl = typeof globalThis.fetch;
 
-/** Epoch-ms expiry from the access_token `exp` claim (seconds), if present. */
-function expiryFromAccessToken(accessToken: string): number | undefined {
-  const exp = decodeJwtClaims(accessToken).exp;
-  return typeof exp === "number" ? exp * 1000 : undefined;
-}
+// expiryFromAccessToken, safeReadFile, defaultOpenBrowser are shared with the ChatGPT
+// login and imported from openaiCodexLogin.ts (single source of truth).
 
 function tokenFromResponse(json: Record<string, unknown>, previous: GuruOAuthToken | undefined, now: number): GuruOAuthToken {
   const accessToken = (json.access_token as string | undefined) ?? previous?.accessToken ?? "";
@@ -144,7 +148,16 @@ export async function refreshXaiToken(
     body: body.toString()
   });
   if (!res.ok) {
-    throw new Error(`xAI token refresh failed (HTTP ${res.status})`);
+    // Surface a PERMANENT failure (expired/revoked refresh token) as OAuthRefreshError so
+    // the controller shows the "run /login grok" prompt — matching the ChatGPT refresh path.
+    let code: string | undefined;
+    try {
+      code = ((await res.clone().json()) as Record<string, unknown>).error as string | undefined;
+    } catch {
+      /* body not JSON */
+    }
+    const permanent = res.status === 400 || res.status === 401 || code === "invalid_grant" || code === "expired_token";
+    throw new OAuthRefreshError(`xAI token refresh failed (HTTP ${res.status})${code ? `: ${code}` : ""}`, code, permanent);
   }
   return tokenFromResponse((await res.json()) as Record<string, unknown>, previous, now);
 }
@@ -282,28 +295,13 @@ export function readGrokCacheToken(home: string = homedir(), fileRead: (path: st
     const refreshToken = (record.refresh_token as string | undefined) ?? (raw.refresh_token as string | undefined) ?? "";
     const idToken = (record.id_token as string | undefined) ?? "";
     const expiresAt = expiryFromAccessToken(accessToken);
+    // Don't report a dead credential as signed in: expired with no refresh → fall through.
+    if (expiresAt !== undefined && expiresAt <= Date.now() && !refreshToken) {
+      return null;
+    }
     return { accessToken, refreshToken, idToken, ...(expiresAt ? { expiresAt } : {}), authMode: "grok", obtainedAt: Date.now() };
   } catch {
     return null;
-  }
-}
-
-function safeReadFile(path: string): string | null {
-  try {
-    return existsSync(path) ? readFileSync(path, "utf8") : null;
-  } catch {
-    return null;
-  }
-}
-
-/** Best-effort system-browser open (never an embedded webview). */
-function defaultOpenBrowser(url: string): void {
-  const platform = process.platform;
-  const [cmd, args] = platform === "win32" ? ["cmd", ["/c", "start", "", url]] : platform === "darwin" ? ["open", [url]] : ["xdg-open", [url]];
-  try {
-    spawn(cmd, args, { stdio: "ignore", detached: true }).unref();
-  } catch {
-    /* headless / no opener — the caller prints the URL for manual paste */
   }
 }
 

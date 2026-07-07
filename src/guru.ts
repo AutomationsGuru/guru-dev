@@ -3095,6 +3095,10 @@ async function chatTurn(state: GuruState, text: string): Promise<void> {
       print("");
       const loginName = state.connectedRoute.providerId.replace(/-direct$/u, "");
       print(colorize(theme, "yellow", `  Not signed in to ${state.connectedRoute.providerId}. Run /login ${loginName} to sign in through guru, then send your message again.`));
+      // Drop the just-pushed user turn so it isn't replayed on the next (signed-in) turn.
+      if (state.history.at(-1)?.role === "user") {
+        state.history.pop();
+      }
       state.busy = false;
       return;
     }
@@ -3618,9 +3622,8 @@ export async function runGuru(): Promise<void> {
   // Auto-connect (2026-07 — DIRECT-READY FIRST): the highest-ranked chat-capable route
   // guru can call DIRECTLY — one with a baseUrl AND a credential the resolver resolves
   // (an API key OR a plan/OAuth token in the encrypted vault). This covers API-key lanes
-  // AND native plan lanes (ChatGPT/Grok/Z.AI) identically. A CLI-delegate lane is the LAST
-  // resort — only when nothing direct is usable — never the default (its sandbox can't
-  // even spawn a probe on Windows).
+  // AND native plan lanes (ChatGPT/Grok/Z.AI) identically. There is no CLI delegate; the
+  // only fallback is planRoute's choice, and only when it is directly credential-usable.
   const plan = planRoute({}, routes);
   const directReady = sortedRoutes(routes).filter(
     (route) => route.baseUrl !== undefined && isChatCapableFamily(route.apiFamily) && resolveRouteCredential(route).usable

@@ -34,6 +34,15 @@ describe("provider/model readiness discovery", () => {
 
     expect(rows.find((row) => row.routeId === "openai-codex/gpt-5.5")?.status).toBe("needs-login");
     expect(rows.find((row) => row.routeId === "grok/grok-build")?.status).toBe("needs-login");
+
+    // Positive path: a guru-oauth lane with a signed-in token (vault OR CLI cache) reads
+    // as ready-unverified, not needs-login.
+    const signedIn = scanProviderReadiness(createDirectProviderCatalog(), {
+      env: { has: () => false },
+      oauthPresent: (providerId) => providerId === "grok"
+    });
+    expect(signedIn.find((row) => row.routeId === "grok/grok-build")?.status).toBe("ready-unverified");
+    expect(signedIn.find((row) => row.routeId === "openai-codex/gpt-5.5")?.status).toBe("needs-login");
   });
 
   it("should mark router bridge routes offline when health is not online", () => {
