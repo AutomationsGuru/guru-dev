@@ -50,7 +50,9 @@ export function createPiBashTool(options: PiBashToolOptions = { shellAllowlist: 
     id: "bash",
     title: "Run bash command",
     description:
-      "Bounded command runner (cwd containment, allowlist, timeout, truncation). Pass the full command line in `command` (e.g. \"npm test\") or executable + args separately.",
+      "Bounded command runner (cwd containment, allowlist, timeout, truncation). Pass the full command line in `command` (e.g. \"npm test\") or executable + args separately. " +
+      "Before any destructive/delete command (rm, a truncating `>` redirect, git reset --hard, force-push), ask: does this really need to go? (yes/no) " +
+      "Preserve, rename-aside, or enhance before you delete — destructive commands are double-checked even in YOLO.",
     inputSchema: PiBashToolInputSchema,
     outputSchema: PiBashToolOutputSchema,
     async execute(input, context) {

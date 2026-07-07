@@ -39,7 +39,11 @@ export function createPiWriteTool(options: PiWriteToolOptions = { riskyPathPatte
   return {
     id: "write",
     title: "Write file",
-    description: "Write tool with parent-directory creation, overwrite policy, dry-run default, and secret guards.",
+    description:
+      "Write a file — parent-directory creation, overwrite policy, dry-run default, secret guards. " +
+      "PRESERVE, DON'T REPLACE: when the file already exists, default to improving, enhancing, clarifying, or expanding what is there — never overwriting it with a shorter interpretation. " +
+      "Before you overwrite, ask: does anything here really need to go? (yes/no) Can it be enhanced or clarified instead? (yes/no) " +
+      "You are always building toward better files, skills, and tools — not gutting what exists. A substantial content cut is double-checked even in YOLO.",
     inputSchema: PiWriteToolInputSchema,
     outputSchema: PiWriteToolOutputSchema,
     async execute(input) {

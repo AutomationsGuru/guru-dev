@@ -40,7 +40,11 @@ export function createPiExactEditTool(options: PiExactEditToolOptions = { riskyP
   return {
     id: "edit",
     title: "Exact edit",
-    description: "Exact text replacement with uniqueness validation and dry-run default.",
+    description:
+      "Exact text replacement — unique-match validation, dry-run default. " +
+      "PRESERVE, DON'T REPLACE: prefer edits that improve, enhance, clarify, or expand over ones that cut or summarize away. " +
+      "Before replacing a block, ask: does this really need to be removed? (yes/no) Can it be clarified or enriched instead? (yes/no) " +
+      "Always building toward better, not smaller — gutting a large block is double-checked even in YOLO.",
     inputSchema: PiExactEditToolInputSchema,
     outputSchema: PiExactEditToolOutputSchema,
     async execute(input) {
