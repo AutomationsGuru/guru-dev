@@ -2,19 +2,19 @@ import { describe, expect, it } from "vitest";
 
 import { createDirectProviderCatalog } from "../../src/providers/catalog.js";
 
-describe("codex-direct lane (Phase B) — second route beside the delegate", () => {
+describe("openai-codex — the ChatGPT plan lane (native OAuth, no CLI delegate)", () => {
   const catalog = createDirectProviderCatalog();
 
-  it("adds openai-codex-direct routes WITHOUT touching the delegate lane", () => {
-    const direct = catalog.filter((route) => route.providerId === "openai-codex-direct");
-    const delegate = catalog.filter((route) => route.providerId === "openai-codex");
-    expect(direct.length).toBe(2);
-    expect(delegate.length).toBeGreaterThan(0); // delegate still present
-    expect(delegate.every((route) => route.routeType === "operator-provider-plan-auth")).toBe(true);
+  it("exposes openai-codex routes and NO CLI-delegate lane anywhere", () => {
+    const codex = catalog.filter((route) => route.providerId === "openai-codex");
+    expect(codex.length).toBe(2);
+    expect(codex.every((route) => route.routeType === "operator-provider-plan-auth")).toBe(true);
+    // The old CLI-delegate lane (credentialSource native-cli-token) is gone entirely.
+    expect(catalog.some((route) => route.credentialSource.type === "native-cli-token")).toBe(false);
   });
 
   it("wires the Responses endpoint via guru's OWN vaulted OAuth token — no ~/.codex cache", () => {
-    const route = catalog.find((candidate) => candidate.routeId === "openai-codex-direct/gpt-5.5");
+    const route = catalog.find((candidate) => candidate.routeId === "openai-codex/gpt-5.5");
     expect(route).toBeDefined();
     expect(route?.apiFamily).toBe("openai-responses");
     expect(route?.baseUrl).toBe("https://chatgpt.com/backend-api/codex");
@@ -23,18 +23,21 @@ describe("codex-direct lane (Phase B) — second route beside the delegate", () 
     expect(route?.status).toBe("active");
     const headers = route?.wire?.headers ?? [];
     expect(headers.map((header) => header.header)).toEqual(expect.arrayContaining(["ChatGPT-Account-Id", "OpenAI-Beta", "originator"]));
-    // the account id is sourced from guru's vaulted token, not a cache file
     const accountHeader = headers.find((header) => header.header === "ChatGPT-Account-Id");
     expect(accountHeader?.oauthAccount).toBe(true);
     expect(accountHeader?.filePath).toBeUndefined();
   });
 
-  it("grok-cli carries its Phase B wire but stays unflipped (401 auth shape); zai flipped active on probe", () => {
-    const grok = catalog.find((route) => route.providerId === "grok-cli");
+  it("openai-codex/gpt-5.5 is the #1 auto-connect pick (delegate no longer squats rank 1)", () => {
+    const sorted = [...catalog].sort((a, b) => (a.directFirstRank ?? 999) - (b.directFirstRank ?? 999));
+    expect(sorted[0]?.routeId).toBe("openai-codex/gpt-5.5");
+  });
+
+  it("grok carries its Phase B wire; zai-coding flipped active on probe", () => {
+    const grok = catalog.find((route) => route.providerId === "grok");
     expect(grok?.wire?.headers.some((header) => header.header === "x-grok-client-version")).toBe(true);
-    expect(grok?.status).toBe("delegated"); // not flipped — probe 401
-    const zai = catalog.find((route) => route.providerId === "zai-coding-cn");
+    const zai = catalog.find((route) => route.providerId === "zai-coding");
     expect(zai?.wire?.authHeaderStyle).toBe("bearer");
-    expect(zai?.status).toBe("active"); // flipped on live probe pass
+    expect(zai?.status).toBe("active");
   });
 });

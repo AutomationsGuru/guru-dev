@@ -111,10 +111,9 @@ export function describeLoginFlow(route: ProviderRouteDescriptor, env: NodeJS.Pr
 
 /** Ecosystem login commands (interim attach; presence-detected, never auto-run). */
 const ECOSYSTEM_LOGIN: Readonly<Record<string, string>> = {
-  "openai-codex-direct": "codex login",
-  "openai-codex": "codex login",
-  "grok-cli": "grok auth",
-  "zai-coding-cn": "zai auth login"
+  // openai-codex is a guru-native OAuth lane (guru's own /login loopback), NOT an
+  // ecosystem CLI login. Grok will join it as guru-oauth in the xAI wave.
+  "grok-cli": "grok auth"
 };
 
 /** Human expiry countdown from an ISO/epoch string (presence-safe). */

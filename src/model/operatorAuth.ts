@@ -20,70 +20,27 @@ export interface OperatorAuthSpec {
   readonly cacheRelPaths: readonly string[];
   /** Exact command the operator runs to (re)login. */
   readonly loginCommand: string;
-  /**
-   * CLI delegation for real turns, when supported. The prompt is written to the
-   * child's STDIN (args are fixed → no shell injection, no command-line quoting).
-   */
-  readonly delegate?: {
-    readonly commandName: string;
-    /** Fixed argv (after the command); the prompt arrives on stdin, not here. */
-    readonly args: readonly string[];
-    /**
-     * Sandbox-tier argv mapped from guru's /allow-writes gate. Only two tiers exist
-     * by design — the harness NEVER passes a full-access/bypass tier. Composed
-     * before the trailing stdin marker.
-     */
-    readonly sandboxArgs?: {
-      readonly readOnly: readonly string[];
-      readonly workspaceWrite: readonly string[];
-    };
-    /** Argv to pin the CLI's working directory to the session's repo. */
-    readonly cwdArgs?: (cwd: string) => readonly string[];
-    /** Argv to select the model on the delegate CLI (plan routes carry model ids). */
-    readonly modelArgs?: (modelId: string) => readonly string[];
-  };
 }
 
 export const OPERATOR_AUTH_SPECS: readonly OperatorAuthSpec[] = [
-  {
-    providerId: "openai-codex",
-    cacheRelPaths: [".codex/auth.json"],
-    loginCommand: "codex login",
-    delegate: {
-      commandName: process.platform === "win32" ? "codex.cmd" : "codex",
-      args: ["exec", "--skip-git-repo-check", "-"],
-      // codex-cli 0.142.0: --sandbox read-only|workspace-write|danger-full-access.
-      // The danger tier is deliberately unreachable from the harness.
-      sandboxArgs: {
-        readOnly: ["--sandbox", "read-only"],
-        workspaceWrite: ["--sandbox", "workspace-write"]
-      },
-      cwdArgs: (cwd) => ["--cd", cwd],
-      modelArgs: (modelId) => ["-m", modelId]
-    }
-  },
+  // The openai-codex CLI-DELEGATE spec was removed 2026-07: the ChatGPT plan runs
+  // natively through openai-codex (guru's own loopback OAuth → vaulted token),
+  // so the harness no longer delegates any turn to a provider CLI.
   {
     providerId: "minimax-oauth",
     cacheRelPaths: [".mavis/auth.json", ".minimax/auth.json"],
     loginCommand: "mavis login"
   },
   {
-    // The real credential lives in the zcode config (matches the catalog filePath);
-    // the legacy .z-ai/.zai guesses were never populated → false "login-needed".
-    providerId: "zai-coding-cn",
-    cacheRelPaths: [".zcode/v2/config.json"],
-    loginCommand: "zai auth login"
-  },
-  {
     // The DIRECT ChatGPT-plan lane shares the codex CLI login (same ~/.codex/auth.json
     // as openai-codex). Without this entry, presence-only surfaces reported it
     // logged-out while it was connecting fine. No delegate — it runs direct.
-    providerId: "openai-codex-direct",
+    providerId: "openai-codex",
     cacheRelPaths: [".codex/auth.json"],
     loginCommand: "codex login"
   },
   {
-    providerId: "grok-cli",
+    providerId: "grok",
     cacheRelPaths: [".grok/auth.json"],
     loginCommand: "grok auth"
   },
@@ -103,7 +60,6 @@ export interface OperatorAuthPresence {
   /** The path that was found present (relative), if any. */
   readonly presentPath?: string;
   readonly loginCommand?: string;
-  readonly delegateCommandName?: string;
   readonly summary: string;
 }
 
@@ -146,10 +102,9 @@ export function resolveOperatorAuthPresence(route: ProviderRouteDescriptor, opti
     checkedPaths: spec.cacheRelPaths,
     ...(presentRel !== undefined ? { presentPath: presentRel } : {}),
     loginCommand: spec.loginCommand,
-    ...(spec.delegate ? { delegateCommandName: spec.delegate.commandName } : {}),
     summary:
       presentRel !== undefined
-        ? `Operator credential cache present (~/${presentRel}); value never read.${spec.delegate ? " Turns delegate to the provider CLI." : ""}`
+        ? `Operator credential cache present (~/${presentRel}); value never read.`
         : `Operator credential cache not found (checked: ${spec.cacheRelPaths.map((rel) => `~/${rel}`).join(", ")}). Run: ${spec.loginCommand}`
   };
 }

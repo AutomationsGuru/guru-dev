@@ -1,6 +1,9 @@
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 /**
  * guru-native "Sign in with ChatGPT / Codex plan" login (2026-07-06).
@@ -45,7 +48,7 @@ export interface GuruOAuthToken {
   readonly isFedramp?: boolean;
   /** Absolute expiry in epoch ms (decoded from the access_token `exp`). */
   readonly expiresAt?: number;
-  readonly authMode: "chatgpt";
+  readonly authMode: "chatgpt" | "grok";
   /** When this record was last written (epoch ms). */
   readonly obtainedAt: number;
 }
@@ -212,6 +215,52 @@ export async function refreshOAuthToken(
 /** Is the token within `marginMs` of expiry (or already expired)? Default margin 5 min (codex parity). */
 export function isTokenNearExpiry(token: GuruOAuthToken, now = Date.now(), marginMs = 5 * 60 * 1000): boolean {
   return token.expiresAt !== undefined && now >= token.expiresAt - marginMs;
+}
+
+/**
+ * SHORTCUT (never required): if the codex CLI already signed in, reuse its
+ * ~/.codex/auth.json token so a machine that happens to have the CLI doesn't re-prompt
+ * a browser flow. The standalone rule (guru needs only itself): this is an OPPORTUNISTIC
+ * reuse, and `loginViaLoopback` is always the fallback when the cache is absent.
+ * Shape: { tokens: { access_token, refresh_token, id_token, account_id } }.
+ */
+export function readCodexCacheToken(home: string = homedir(), fileRead: (path: string) => string | null = safeReadFile): GuruOAuthToken | null {
+  const text = fileRead(join(home, ".codex", "auth.json"));
+  if (!text) {
+    return null;
+  }
+  try {
+    const raw = JSON.parse(text) as Record<string, unknown>;
+    const tokens = (raw.tokens ?? raw) as Record<string, unknown>;
+    const accessToken = tokens.access_token as string | undefined;
+    if (!accessToken) {
+      return null;
+    }
+    const idToken = (tokens.id_token as string | undefined) ?? "";
+    const facts = idToken ? extractAccountFacts(idToken) : {};
+    const accountId = (tokens.account_id as string | undefined) ?? facts.accountId;
+    const expiresAt = expiryFromAccessToken(accessToken);
+    return {
+      accessToken,
+      refreshToken: (tokens.refresh_token as string | undefined) ?? "",
+      idToken,
+      ...(accountId ? { accountId } : {}),
+      ...(facts.planType ? { planType: facts.planType } : {}),
+      ...(expiresAt ? { expiresAt } : {}),
+      authMode: "chatgpt",
+      obtainedAt: Date.now()
+    };
+  } catch {
+    return null;
+  }
+}
+
+function safeReadFile(path: string): string | null {
+  try {
+    return existsSync(path) ? readFileSync(path, "utf8") : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Best-effort system-browser open (never an embedded webview). */

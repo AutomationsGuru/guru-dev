@@ -33,7 +33,7 @@ describe("provider/model readiness discovery", () => {
     const rows = scanProviderReadiness(createDirectProviderCatalog(), { env: { has: () => false } });
 
     expect(rows.find((row) => row.routeId === "openai-codex/gpt-5.5")?.status).toBe("needs-login");
-    expect(rows.find((row) => row.routeId === "grok-cli/grok-build")?.status).toBe("delegated");
+    expect(rows.find((row) => row.routeId === "grok/grok-build")?.status).toBe("needs-login");
   });
 
   it("should mark router bridge routes offline when health is not online", () => {

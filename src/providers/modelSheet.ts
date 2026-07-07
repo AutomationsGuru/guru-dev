@@ -44,15 +44,16 @@ export const MODEL_SHEET: readonly SheetModel[] = [
   { provider: "gemini", model: "gemini-3.1-pro-preview", contextTokens: 1 * M, maxOutputTokens: 65_500, thinking: true, images: true },
   { provider: "gemini", model: "gemini-3.1-pro-preview-customtools", contextTokens: 1 * M, maxOutputTokens: 65_500, thinking: true, images: true },
   { provider: "gemini", model: "gemini-3.5-flash", contextTokens: 1 * M, maxOutputTokens: 65_500, thinking: true, images: true },
-  { provider: "grok-cli", model: "grok-composer-2.5-fast", contextTokens: 200 * K, maxOutputTokens: 200 * K, thinking: false, images: false },
-  { provider: "grok-cli", model: "grok-build", contextTokens: 512 * K, maxOutputTokens: 512 * K, thinking: false, images: false },
+  { provider: "grok", model: "grok-composer-2.5-fast", contextTokens: 200 * K, maxOutputTokens: 200 * K, thinking: false, images: false },
+  { provider: "grok", model: "grok-build", contextTokens: 512 * K, maxOutputTokens: 512 * K, thinking: false, images: false },
   { provider: "minimax", model: "minimax-m3", contextTokens: 1 * M, maxOutputTokens: 128 * K, thinking: true, images: true },
   { provider: "minimax", model: "minimax-m2.7", contextTokens: 200 * K, maxOutputTokens: 128 * K, thinking: true, images: false },
   { provider: "minimax", model: "minimax-m2.7-highspeed", contextTokens: 200 * K, maxOutputTokens: 128 * K, thinking: true, images: false },
   { provider: "openai", model: "gpt-5.5", contextTokens: 1_100_000, maxOutputTokens: 128 * K, thinking: true, images: true },
   { provider: "openai", model: "gpt-5.5-pro", contextTokens: 1_100_000, maxOutputTokens: 128 * K, thinking: true, images: true },
-  { provider: "openai-codex", model: "gpt-5.3-codex-spark", contextTokens: 128 * K, maxOutputTokens: 128 * K, thinking: true, images: false },
-  { provider: "openai-codex", model: "gpt-5.5", contextTokens: 272 * K, maxOutputTokens: 128 * K, thinking: true, images: true },
+  // openai-codex (ChatGPT-plan) DELEGATE rows removed 2026-07 — the ChatGPT plan now runs
+  // NATIVELY through the openai-codex token lane (guru's own /login loopback OAuth).
+  // No CLI delegate. See CODEX_DIRECT_ROUTES in catalog.ts.
   { provider: "perplexity-agent", model: "anthropic/claude-haiku-4-5", contextTokens: 128 * K, maxOutputTokens: 32 * K, thinking: false, images: false },
   { provider: "perplexity-agent", model: "anthropic/claude-opus-4-7", contextTokens: 128 * K, maxOutputTokens: 32 * K, thinking: true, images: false },
   { provider: "perplexity-agent", model: "anthropic/claude-sonnet-4-6", contextTokens: 128 * K, maxOutputTokens: 32 * K, thinking: true, images: false },
@@ -63,14 +64,14 @@ export const MODEL_SHEET: readonly SheetModel[] = [
   { provider: "sakana", model: "fugu", contextTokens: 1 * M, maxOutputTokens: 128 * K, thinking: true, images: true },
   { provider: "sakana", model: "fugu-ultra", contextTokens: 1 * M, maxOutputTokens: 128 * K, thinking: true, images: true },
   { provider: "xai", model: "grok-4.3", contextTokens: 1 * M, maxOutputTokens: 512 * K, thinking: true, images: true },
-  { provider: "zai", model: "glm-5.2", contextTokens: 1 * M, maxOutputTokens: 128 * K, thinking: true, images: false },
-  { provider: "zai", model: "glm-4.7", contextTokens: 200 * K, maxOutputTokens: 128 * K, thinking: true, images: false },
-  { provider: "zai", model: "glm-5-turbo", contextTokens: 200 * K, maxOutputTokens: 128 * K, thinking: true, images: false },
-  { provider: "zai", model: "glm-5v-turbo", contextTokens: 200 * K, maxOutputTokens: 128 * K, thinking: true, images: true },
-  { provider: "zai-coding-cn", model: "glm-5.2", contextTokens: 1 * M, maxOutputTokens: 128 * K, thinking: true, images: false },
-  { provider: "zai-coding-cn", model: "glm-4.7", contextTokens: 200 * K, maxOutputTokens: 128 * K, thinking: true, images: false },
-  { provider: "zai-coding-cn", model: "glm-5-turbo", contextTokens: 200 * K, maxOutputTokens: 128 * K, thinking: true, images: false },
-  { provider: "zai-coding-cn", model: "glm-5v-turbo", contextTokens: 200 * K, maxOutputTokens: 128 * K, thinking: true, images: true }
+  { provider: "zai-api", model: "glm-5.2", contextTokens: 1 * M, maxOutputTokens: 128 * K, thinking: true, images: false },
+  { provider: "zai-api", model: "glm-4.7", contextTokens: 200 * K, maxOutputTokens: 128 * K, thinking: true, images: false },
+  { provider: "zai-api", model: "glm-5-turbo", contextTokens: 200 * K, maxOutputTokens: 128 * K, thinking: true, images: false },
+  { provider: "zai-api", model: "glm-5v-turbo", contextTokens: 200 * K, maxOutputTokens: 128 * K, thinking: true, images: true },
+  { provider: "zai-coding", model: "glm-5.2", contextTokens: 1 * M, maxOutputTokens: 128 * K, thinking: true, images: false },
+  { provider: "zai-coding", model: "glm-4.7", contextTokens: 200 * K, maxOutputTokens: 128 * K, thinking: true, images: false },
+  { provider: "zai-coding", model: "glm-5-turbo", contextTokens: 200 * K, maxOutputTokens: 128 * K, thinking: true, images: false },
+  { provider: "zai-coding", model: "glm-5v-turbo", contextTokens: 200 * K, maxOutputTokens: 128 * K, thinking: true, images: true }
 ] as const;
 
 /**

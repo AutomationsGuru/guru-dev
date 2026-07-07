@@ -28,7 +28,6 @@ import { openVault, type Vault } from "./safety/vault.js";
 import { registerSecretValue } from "./safety/secretSafety.js";
 import { directAgentTurn, type AgentToolEvent } from "./model/agentTurn.js";
 import { isOperatorAuthRoute, resolveOperatorAuthPresence, getOperatorAuthSpec } from "./model/operatorAuth.js";
-import { runCliDelegateTurn } from "./model/cliDelegateTurn.js";
 import type { ToolDefinition } from "./tools/registry.js";
 import { DEFAULT_ANSI_THEME, bold, colorize, dim, STATUS_COLOR } from "./tui/ansi.js";
 import { mapRoutesToProviders, renderProviderPicker, renderReadinessSummary, summarizeReadiness } from "./tui/providerPicker.js";
@@ -44,7 +43,8 @@ import { createScopedMemory, MEMORY_SCOPES, type MemoryScope } from "./memory/sc
 import { citeLearning, decaySweep, extractLearnings, gateLearning, promoteSweep, type Learning } from "./garage/flywheel.js";
 import { loadLearnings, migrateRoleLearnings, pruneLearning, storeLearning } from "./garage/flywheelStore.js";
 import { describeLoginFlow, formatExpiry } from "./model/loginFlow.js";
-import { isTokenNearExpiry, loginViaLoopback, OAuthRefreshError, refreshOAuthToken, resolveOAuthConfig } from "./model/oauth/openaiCodexLogin.js";
+import { isTokenNearExpiry, loginViaLoopback, OAuthRefreshError, readCodexCacheToken, refreshOAuthToken, resolveOAuthConfig } from "./model/oauth/openaiCodexLogin.js";
+import { loginViaXaiDeviceCode, readGrokCacheToken, refreshXaiToken, resolveXaiOAuthConfig } from "./model/oauth/xaiGrokLogin.js";
 import { registerOAuthTokenAccessor } from "./model/oauth/tokenRegistry.js";
 import { readVaultOAuthToken, writeVaultOAuthToken } from "./model/oauth/vaultTokens.js";
 import { slugifyRole, type RoleProfile } from "./roles/schema.js";
@@ -572,29 +572,18 @@ function cmdModelConnect(state: GuruState, selector: string, override: string | 
     print(colorize(theme, "red", `No route matches '${selector}'. Try /model to list.`));
     return;
   }
-  // Plan-auth routes with REAL direct wiring (Phase B: baseUrl + a credential the
-  // layered resolver finds) connect DIRECT — the delegate is the fallback, not the
-  // default. Routes without a direct endpoint (e.g. codex delegate) keep the
-  // legacy presence+delegation path below.
+  // Plan/OAuth lanes with REAL direct wiring (baseUrl + a credential the layered
+  // resolver finds — an API key OR a vaulted OAuth token) connect DIRECT and run the
+  // native tool loop. guru no longer delegates any turn to a provider CLI.
   const directReady = route.baseUrl !== undefined && isChatCapableFamily(route.apiFamily) && resolveRouteCredential(route).usable;
-  // Operator plan-auth / native-CLI routes: connect via local credential PRESENCE + CLI delegation.
   if (isOperatorAuthRoute(route) && !directReady) {
+    // A plan/OAuth lane that isn't directly connectable = not signed in with a token
+    // guru can use. Sign in through guru's OWN /login (loopback OAuth → vaulted token),
+    // then the turn runs natively — there is no CLI-delegate fallback anymore.
+    const loginName = route.providerId.replace(/-direct$/u, "");
     const presence = resolveOperatorAuthPresence(route);
-    const spec = getOperatorAuthSpec(route.providerId);
-    if (!presence.present) {
-      print(colorize(theme, "yellow", `${route.routeId}: ${presence.summary}`));
-      return;
-    }
-    if (!spec?.delegate) {
-      print(colorize(theme, "yellow", `${route.routeId}: credential present, but no turn path is wired for this provider yet.`));
-      print(dim(theme, `  hint: ${presence.summary}`));
-      return;
-    }
-    state.connectedRoute = route;
-    state.modelIdOverride = override ?? null;
-    state.history = [{ role: "system", content: systemPrompt() }];
-    print(colorize(theme, "green", `Connected: ${route.routeId} — ${presence.summary}`));
-    print(dim(theme, `  Turns delegate to \`${spec.delegate.commandName}\` (operator auth; never routed through LiteLLM). Type a message.`));
+    print(colorize(theme, "yellow", `${route.routeId}: not signed in. Run /login ${loginName} to sign in through guru.`));
+    print(dim(theme, `  hint: ${presence.summary}`));
     return;
   }
 
@@ -1746,12 +1735,31 @@ function routesForSelector(state: GuruState, selector: string): readonly Provide
  * CLI, no env var, no cache — passes the fresh-machine acceptance test.
  */
 async function runNativeOAuthLogin(state: GuruState, route: ProviderRouteDescriptor): Promise<void> {
+  const isGrok = route.providerId === "grok";
   print(bold(theme, `login: ${route.providerId}`) + dim(theme, "  (guru-native OAuth sign-in)"));
-  print("  Opening your browser to sign in to OpenAI (ChatGPT plan)…");
   try {
-    const token = await loginViaLoopback({
-      onUrl: (url) => print(dim(theme, `  if the browser didn't open, paste this into it:\n    ${url}`))
-    });
+    const onUrl = (url: string): void => print(dim(theme, `  if the browser didn't open, paste this into it:\n    ${url}`));
+    // Standalone rule: reuse the provider CLI's own sign-in if it happens to be present
+    // (shortcut), else run guru's OWN native sign-in. guru never REQUIRES a CLI.
+    let token = isGrok ? readGrokCacheToken() : readCodexCacheToken();
+    if (token) {
+      print(dim(theme, `  reusing an existing ${isGrok ? "xAI (~/.grok)" : "ChatGPT (~/.codex)"} sign-in — no browser needed.`));
+    } else if (isGrok) {
+      // xAI uses the RFC 8628 DEVICE-CODE flow (what the real Grok CLI does): no loopback
+      // port (immune to Windows reserved ranges), works headless. Show the code, open the
+      // browser, poll until approved.
+      print("  Sign in to xAI (SuperGrok plan) — approve in your browser:");
+      token = await loginViaXaiDeviceCode({
+        onPrompt: (grant) => {
+          print(`    ${bold(theme, `code: ${grant.userCode}`)}`);
+          print(dim(theme, `    open: ${grant.verificationUriComplete ?? grant.verificationUri}`));
+          print(dim(theme, "    (opening your browser — approve there, then return here…)"));
+        }
+      });
+    } else {
+      print("  Opening your browser to sign in to OpenAI (ChatGPT plan)…");
+      token = await loginViaLoopback({ onUrl });
+    }
     writeVaultOAuthToken(state.vault, route.providerId, token);
     registerSecretValue(token.accessToken);
     if (token.refreshToken) {
@@ -1993,8 +2001,25 @@ async function runKeysCli(args: readonly string[]): Promise<void> {
 }
 
 /** Re-scan readiness after the vault changed (a mutated vault lights up / dims providers live). */
+/** A guru-oauth lane is "signed in" when a token sits in the vault OR the provider's CLI cache. */
+function oauthProviderPresent(vault: GuruState["vault"], providerId: string): boolean {
+  if (readVaultOAuthToken(vault, providerId)?.accessToken) {
+    return true;
+  }
+  if (providerId === "grok") {
+    return readGrokCacheToken() !== null;
+  }
+  if (providerId === "openai-codex") {
+    return readCodexCacheToken() !== null;
+  }
+  return false;
+}
+
 function refreshVaultAvailability(state: GuruState): void {
-  state.availability = scanProviderReadiness(state.routes, { vaultNames: new Set(state.vault.names()) });
+  state.availability = scanProviderReadiness(state.routes, {
+    vaultNames: new Set(state.vault.names()),
+    oauthPresent: (providerId) => oauthProviderPresent(state.vault, providerId)
+  });
 }
 
 /** `/keys` — the in-session vault view + the env-vs-vault guidance + a live reload. */
@@ -2960,7 +2985,10 @@ async function refreshCodexTokenIfNeeded(state: GuruState, route: ProviderRouteD
     return;
   }
   try {
-    const refreshed = await refreshOAuthToken(resolveOAuthConfig(), token);
+    const refreshed =
+      route.providerId === "grok"
+        ? await refreshXaiToken(resolveXaiOAuthConfig(), token)
+        : await refreshOAuthToken(resolveOAuthConfig(), token);
     writeVaultOAuthToken(state.vault, route.providerId, refreshed);
     registerSecretValue(refreshed.accessToken);
     if (refreshed.refreshToken) {
@@ -2968,7 +2996,7 @@ async function refreshCodexTokenIfNeeded(state: GuruState, route: ProviderRouteD
     }
   } catch (error) {
     if (error instanceof OAuthRefreshError && error.permanent) {
-      print(colorize(theme, "yellow", `  ${route.providerId} session expired — run /login codex to sign in again.`));
+      print(colorize(theme, "yellow", `  ${route.providerId} session expired — run /login ${route.providerId} to sign in again.`));
     }
     // A transient refresh failure lets the turn proceed on the current token (a real
     // 401 then surfaces to the operator); only a permanent failure warns to re-login.
@@ -3059,36 +3087,14 @@ async function chatTurn(state: GuruState, text: string): Promise<void> {
     resolveRouteCredential(state.connectedRoute).usable;
   try {
     if (isOperatorAuthRoute(state.connectedRoute) && !turnDirectReady) {
+      // A plan/OAuth lane with no resolvable token = not signed in. guru NO LONGER
+      // delegates any turn to a provider CLI (removed 2026-07): sign in through guru's
+      // OWN /login (loopback OAuth → vaulted token) and the turn then runs NATIVELY,
+      // exactly like every API-key model.
+      stopSpinner();
       print("");
-      // The CLI-delegate sandbox tier follows the operator's session write approval
-      // (per-call approval replaced the /allow-writes binary).
-      const delegateWrites = state.sessionApprovals.has("write");
-      const sandboxTier = delegateWrites ? "workspace-write" : "read-only";
-      print(`  ${badge(paint, "DELEGATE")} ${paint.fg("fg", `${state.connectedRoute.providerId} CLI`)}${paint.fg("muted", ` — operator auth · sandbox: ${sandboxTier} · streaming`)}`);
-      let delegatedStreamed = false;
-      // Delegate lanes always use the legacy window: the provider CLI can't host
-      // the summary call, and an unbounded history would blow its input limits.
-      const delegated: DirectChatResult = await runCliDelegateTurn(state.connectedRoute, sendableHistory(state.history, false), {
-        cwd: session?.repo?.repoRoot ?? process.cwd(),
-        writesAllowed: delegateWrites,
-        onToken: (chunk) => {
-          stopSpinner();
-          delegatedStreamed = true;
-          process.stdout.write(chunk);
-        }
-      });
-      state.history.push({ role: "assistant", content: delegated.text });
-      logMessage(state, "assistant", delegated.text);
-      state.usage.turns += 1;
-      if (state.lineage) {
-        state.turnsThisBranch += 1;
-      }
-      persistMeta(state);
-      if (!delegatedStreamed) {
-        print(delegated.text.trim().length > 0 ? delegated.text.trim() : dim(theme, "(empty response)"));
-      }
-      print("");
-      print(dim(theme, `${delegated.routeId} · ${Date.now() - startedAt}ms · via provider CLI`));
+      const loginName = state.connectedRoute.providerId.replace(/-direct$/u, "");
+      print(colorize(theme, "yellow", `  Not signed in to ${state.connectedRoute.providerId}. Run /login ${loginName} to sign in through guru, then send your message again.`));
       state.busy = false;
       return;
     }
@@ -3419,7 +3425,11 @@ export async function runGuru(): Promise<void> {
   // guru's OWN vaulted OAuth tokens (native ChatGPT/Codex sign-in): the resolver +
   // wire header both read this — never ~/.codex or any other tool's cache.
   registerOAuthTokenAccessor((providerId) => {
-    const token = readVaultOAuthToken(vault, providerId);
+    // Vault first (guru's own sign-in). SHORTCUT: if the vault is empty but the provider's
+    // CLI already logged in, reuse its cache token (~/.grok, ~/.codex) — never a requirement.
+    const token =
+      readVaultOAuthToken(vault, providerId) ??
+      (providerId === "grok" ? readGrokCacheToken() : providerId === "openai-codex" ? readCodexCacheToken() : null);
     if (!token?.accessToken) {
       return null;
     }
@@ -3435,7 +3445,10 @@ export async function runGuru(): Promise<void> {
       registerSecretValue(value);
     }
   }
-  const availability = scanProviderReadiness(routes, { vaultNames: new Set(vault.names()) });
+  const availability = scanProviderReadiness(routes, {
+    vaultNames: new Set(vault.names()),
+    oauthPresent: (providerId) => oauthProviderPresent(vault, providerId)
+  });
   const mandateStore = createMandateStore();
   const harnessConfig = loadHarnessConfig({}).config;
   const swarmManager = getSharedSwarmManager(harnessConfig.swarm);
@@ -3602,17 +3615,19 @@ export async function runGuru(): Promise<void> {
     print(colorize(theme, "yellow", `Session start degraded: ${error instanceof Error ? error.message : String(error)}`));
   }
 
-  // Auto-connect: highest-ranked chat-capable direct route with a present credential.
+  // Auto-connect (2026-07 — DIRECT-READY FIRST): the highest-ranked chat-capable route
+  // guru can call DIRECTLY — one with a baseUrl AND a credential the resolver resolves
+  // (an API key OR a plan/OAuth token in the encrypted vault). This covers API-key lanes
+  // AND native plan lanes (ChatGPT/Grok/Z.AI) identically. A CLI-delegate lane is the LAST
+  // resort — only when nothing direct is usable — never the default (its sandbox can't
+  // even spawn a probe on Windows).
   const plan = planRoute({}, routes);
-  const autoCandidates = sortedRoutes(routes).filter(
-    (route) => isChatCapableFamily(route.apiFamily) && route.routeType === "direct-api" && resolveRouteCredential(route).usable
+  const directReady = sortedRoutes(routes).filter(
+    (route) => route.baseUrl !== undefined && isChatCapableFamily(route.apiFamily) && resolveRouteCredential(route).usable
   );
-  const operatorAuto = sortedRoutes(routes).find(
-    (route) => isOperatorAuthRoute(route) && getOperatorAuthSpec(route.providerId)?.delegate !== undefined && resolveOperatorAuthPresence(route).present
-  );
-  const auto = operatorAuto ?? (plan.verdict === "selected" && plan.choice && isChatCapableFamily(plan.choice.apiFamily) && resolveRouteCredential(plan.choice).usable
+  const auto = directReady[0] ?? (plan.verdict === "selected" && plan.choice && isChatCapableFamily(plan.choice.apiFamily) && resolveRouteCredential(plan.choice).usable
     ? plan.choice
-    : undefined) ?? autoCandidates[0];
+    : undefined);
   if (auto) {
     state.connectedRoute = auto;
     print(colorize(theme, "green", `auto-connected: ${auto.routeId} (direct-first)`) + dim(theme, " — /model to change"));

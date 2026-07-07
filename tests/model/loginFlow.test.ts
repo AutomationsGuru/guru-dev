@@ -40,21 +40,6 @@ describe("describeLoginFlow", () => {
     expect(flow.source).toBe("env");
   });
 
-  it("delegate/native-CLI lane (codex) routes to the CLI login instead of 'unknown'", () => {
-    const flow = describeLoginFlow(
-      makeRoute({
-        providerId: "openai-codex",
-        routeId: "openai-codex/gpt-5.5",
-        credentialSource: { type: "native-cli-token", envVarNames: [] }
-      }),
-      {}
-    );
-    expect(flow.kind).toBe("ecosystem-oauth");
-    const joined = flow.steps.join(" ");
-    expect(joined).toContain("codex login");
-    expect(joined).not.toContain("No known login flow");
-  });
-
   it("ecosystem-oauth lane points at the provider's own login, not a guru file", () => {
     const route = makeRoute({
       providerId: "grok-cli",

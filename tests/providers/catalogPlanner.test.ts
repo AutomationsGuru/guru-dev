@@ -14,7 +14,7 @@ describe("direct provider catalog", () => {
     const catalog = createDirectProviderCatalog();
     const providers = new Set(catalog.map((route) => route.providerId));
 
-    for (const provider of ["anthropic", "openai-codex", "minimax", "grok-cli", "gemini", "ollama-local", "zai", "zai-coding-cn", "sakana", "azure-foundry", "azure-openai-responses", "bigmodel", "deepseek", "openai", "perplexity-agent", "perplexity-sonar", "xai"]) {
+    for (const provider of ["anthropic", "openai-codex", "minimax", "grok", "gemini", "ollama-local", "zai-api", "zai-coding", "sakana", "azure-foundry", "azure-openai-responses", "bigmodel", "deepseek", "openai", "perplexity-agent", "perplexity-sonar", "xai"]) {
       expect(providers.has(provider), provider).toBe(true);
     }
     expect(providers.has("openrouter")).toBe(false);
