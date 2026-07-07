@@ -32,6 +32,8 @@ export interface ProviderDiscoveryOptions {
   readonly routerHealth?: RouterHealthReport;
   /** Env-var names held in the guru vault — count as PRESENT (the vault is an env alternative). */
   readonly vaultNames?: ReadonlySet<string>;
+  /** For guru-oauth lanes: does a usable token exist (guru vault OR a provider CLI cache)? */
+  readonly oauthPresent?: (providerId: string) => boolean;
 }
 
 export function scanProviderReadiness(routes: readonly ProviderRouteDescriptor[], options: ProviderDiscoveryOptions = {}): readonly ProviderAvailability[] {
@@ -44,7 +46,7 @@ export function scanProviderReadiness(routes: readonly ProviderRouteDescriptor[]
     const requiredEnvVarNames = requiredEnvNamesForRoute(route);
     const presentEnvVarNames = requiredEnvVarNames.filter((name) => env.has(name) || (userEnv?.has(name) ?? false) || (vaultNames?.has(name) ?? false));
     const missingEnvVarNames = requiredEnvVarNames.filter((name) => !presentEnvVarNames.includes(name));
-    const status = availabilityStatusForRoute(route, missingEnvVarNames, files, options.routerHealth);
+    const status = availabilityStatusForRoute(route, missingEnvVarNames, files, options.routerHealth, options.oauthPresent);
 
     return {
       providerId: route.providerId,
@@ -62,7 +64,7 @@ export function scanProviderReadiness(routes: readonly ProviderRouteDescriptor[]
   });
 }
 
-function availabilityStatusForRoute(route: ProviderRouteDescriptor, missingEnvVarNames: readonly string[], files: FilePresenceReader | undefined, routerHealth: RouterHealthReport | undefined): ProviderAvailabilityStatus {
+function availabilityStatusForRoute(route: ProviderRouteDescriptor, missingEnvVarNames: readonly string[], files: FilePresenceReader | undefined, routerHealth: RouterHealthReport | undefined, oauthPresent?: (providerId: string) => boolean): ProviderAvailabilityStatus {
   if (route.status === "excluded-by-policy" || route.routeType === "excluded") return "excluded-by-policy";
   if (route.status === "pending-quota") return "pending-quota";
   if (route.status === "works-with-caveat") return missingEnvVarNames.length > 0 ? "missing-key" : "works-with-caveat";
@@ -84,6 +86,12 @@ function availabilityStatusForRoute(route: ProviderRouteDescriptor, missingEnvVa
     return missingEnvVarNames.length === requiredEnvNamesForRoute(route).length ? "needs-login" : "ready-unverified";
   }
 
+  if (route.credentialSource.type === "guru-oauth") {
+    // A guru-native OAuth plan lane (openai-codex, grok): signed in when a token exists in
+    // the guru vault OR the provider's CLI cache (the standalone hybrid). Present but not
+    // yet live-probed → ready-unverified (like a present API key); otherwise needs-login.
+    return oauthPresent?.(route.providerId) ? "ready-unverified" : "needs-login";
+  }
   if (route.credentialSource.type === "native-cli-token" || route.credentialSource.type === "command-helper") {
     return "needs-login";
   }

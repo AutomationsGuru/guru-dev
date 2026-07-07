@@ -2,6 +2,23 @@
 
 All notable changes to GuruHarness are documented here.
 
+## [1.3.0] - 2026-07-07
+
+Native plan/OAuth provider auth — every model runs through guru's own engine, with exactly two auth mechanisms (API key, or a guru-native OAuth login) and **no CLI delegation**.
+
+### Added
+
+- **Native ChatGPT/Codex plan auth** (`openai-codex`): `/login` runs guru's OWN browser loopback PKCE sign-in against auth.openai.com and vaults the token; the ChatGPT-plan Responses lane runs natively (`chatgpt.com/backend-api/codex`).
+- **Native SuperGrok plan auth** (`grok`): `src/model/oauth/xaiGrokLogin.ts` — the **RFC 8628 device-code flow** (what the real Grok CLI uses): no loopback port (immune to Windows reserved-port ranges), works headless. Correct scopes (`grok-cli:access api:access`); refresh-token rotation.
+- **Opportunistic CLI-cache shortcuts** (never a dependency): if a provider CLI already signed in, guru reuses `~/.codex/auth.json` / `~/.grok/auth.json` instead of re-prompting — honoring the standalone rule (guru needs only itself).
+- Readiness/`/accounts` now report guru-OAuth lanes as connected when a vaulted or cached token is present.
+
+### Changed
+
+- **Removed the CLI-delegate lane entirely** — deleted `src/model/cliDelegateTurn.ts` and the `openai-codex` delegate route; no turn is ever delegated to a provider CLI. The auto-connect picker is direct-first and never selects a delegate.
+- **Provider lanes corrected to authoritative endpoints**: `minimax` → `api.minimax.io/anthropic` (anthropic-messages, the full coding setup, one key); Z.ai split into `zai-coding` (plan, `api.z.ai/api/anthropic`) and `zai-api` (platform, `api.z.ai/api/paas/v4`), disentangled from the separate `bigmodel` (Zhipu mainland) lane; `grok` retargeted to the SuperGrok proxy with the device-code flow.
+- 101 routes across 20 providers (was 103/21 with the delegate lane).
+
 ## [0.1.0] - 2026-06-17
 
 Release-prep status: artifacts prepared only; no tag or release has been cut.

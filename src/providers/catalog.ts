@@ -159,41 +159,36 @@ const LANES: Readonly<Record<string, ProviderLane>> = {
     allowedRouterFallback: true,
     notes: ["Google AI Studio via the OpenAI-compatibility endpoint — chat+agent capable without a bespoke family adapter."]
   },
-  "grok-cli": {
-    routeType: "native-cli",
+  grok: {
+    routeType: "operator-provider-plan-auth",
     apiFamily: "openai-responses",
     baseUrl: "https://cli-chat-proxy.grok.com/v1",
-    credentialSource: {
-      type: "oauth-cache",
-      envVarName: "XAI_API_KEY",
-      envVarNames: [],
-      filePath: "~/.grok/auth.json",
-      cacheTokenPath: "*.access_token",
-      oauthPolicy: "ecosystem-ok"
-    },
+    credentialSource: { type: "guru-oauth", envVarNames: [] },
     supportsTools: true,
-    status: "delegated",
-    rankBase: 80,
+    status: "needs-login",
+    rankBase: 34,
     allowedRouterFallback: false,
     wire: {
       headers: [{ header: "x-grok-client-version", filePath: "~/.grok/version.json", jsonPath: "version", fallback: "0.1.202" }]
     },
     caveats: [
-      "Family+endpoint corrected 2026-07-04 from a reference working config (was native-cli-only): direct openai-responses @ cli-chat-proxy.grok.com/v1, Bearer from ~/.grok/auth.json (OIDC self-refresh) + x-grok-client-version header. Wiring complete; NOT flipped.",
-      "PROBE 2026-07-04 (two rounds): env XAI_API_KEY → 401 'x_xai_token_auth=none, Unauthenticated' (the api.x.ai key is NOT accepted by the cli-chat proxy). The ~/.grok/auth.json access_token is RECOGNIZED (401 shifts to 'PermissionDenied') but still rejected — the cached token is expired/unentitled. Resolution: refresh via `grok auth` (OIDC self-refresh through auth.x.ai) or an account entitlement, NOT a wiring change. Stays delegated until a fresh token passes.",
+      "SuperGrok PLAN lane — guru-native OAuth (auth.x.ai loopback via `/login grok`) OR the ~/.grok/auth.json SHORTCUT if the grok CLI is already signed in; token lives in guru's encrypted vault (never a guru file, never a CLI dependency). Chat @ cli-chat-proxy.grok.com/v1 (openai-responses) + the x-grok-client-version header.",
+      "Standard SuperGrok may SIGN IN but 403 at inference — xAI entitlement-gates the API surface (grok-build = SuperGrok/X-Premium+, higher models need SuperGrok Heavy). Status stays needs-login until a live turn passes; the 'xai' api.x.ai key lane is the sanctioned per-token fallback.",
       "compat.supportsReasoningEffort false per the reference working config."
     ],
     compat: { supportsReasoningEffort: false }
   },
   minimax: {
     routeType: "direct-api",
-    apiFamily: "openai-responses",
-    baseUrl: "https://api.minimax.io/v1",
+    apiFamily: "anthropic-messages",
+    baseUrl: "https://api.minimax.io/anthropic",
     credentialSource: { type: "env-var", envVarName: "MINIMAX_API_KEY", envVarNames: [] },
     supportsTools: true,
     status: "ready-unverified",
     rankBase: 30,
-    allowedRouterFallback: true
+    allowedRouterFallback: true,
+    wire: { authHeaderStyle: "bearer" },
+    notes: ["MiniMax coding lane — Anthropic-compat @ api.minimax.io/anthropic (vendor-recommended FULL setup: M3 1M ctx + M2.7, tools/streaming/thinking). ONE key MINIMAX_API_KEY sent as Bearer (not x-api-key). The api.minimax.io/v1 openai face adds no models/features for coding."]
   },
   openai: {
     routeType: "direct-api",
@@ -206,17 +201,10 @@ const LANES: Readonly<Record<string, ProviderLane>> = {
     allowedRouterFallback: true,
     compat: { supportsDeveloperRole: true, supportsReasoningEffort: true, requiresMaxCompletionTokens: true }
   },
-  "openai-codex": {
-    routeType: "operator-provider-plan-auth",
-    apiFamily: "openai-responses",
-    credentialSource: { type: "native-cli-token", commandName: "codex.cmd", envVarNames: [] },
-    supportsTools: true,
-    status: "needs-login",
-    rankBase: 1,
-    allowedRouterFallback: false,
-    caveats: ["Codex/ChatGPT plan auth via local CLI; never routed through LiteLLM."],
-    compat: { supportsDeveloperRole: true, supportsReasoningEffort: true, requiresMaxCompletionTokens: true }
-  },
+  // "openai-codex" CLI-DELEGATE lane removed 2026-07 (the codex.cmd/sandbox path is
+  // retired). The ChatGPT plan runs NATIVELY via openai-codex — see
+  // CODEX_DIRECT_ROUTES below. OpenAI now has exactly two lanes: this plan lane and the
+  // "openai" API-platform lane.
   "perplexity-agent": {
     routeType: "direct-api",
     apiFamily: "openai-responses",
@@ -263,28 +251,25 @@ const LANES: Readonly<Record<string, ProviderLane>> = {
     rankBase: 35,
     allowedRouterFallback: true
   },
-  zai: {
+  "zai-api": {
     routeType: "direct-api",
     apiFamily: "openai-chat-completions",
-    baseUrl: "https://open.bigmodel.cn/api/paas/v4",
-    credentialSource: { type: "env-var", envVarName: "BIGMODEL_API_KEY", envVarNames: ["ZHIPU_API_KEY"] },
+    baseUrl: "https://api.z.ai/api/paas/v4",
+    credentialSource: { type: "env-var", envVarName: "ZAI_API_KEY", envVarNames: [] },
     supportsTools: true,
     status: "ready-unverified",
     rankBase: 45,
     allowedRouterFallback: true,
-    notes: ["Z.AI GLM via BigModel API-key lane (agentic loop live-verified on glm-5-turbo)."]
+    notes: ["Z.ai INTERNATIONAL API platform (pay-per-token), OpenAI-compat @ api.z.ai/api/paas/v4, Bearer ZAI_API_KEY. Retargeted 2026-07 off open.bigmodel.cn (that Zhipu-mainland lane is the separate 'bigmodel' provider). Distinct from the coding plan ('zai-coding')."]
   },
-  "zai-coding-cn": {
+  "zai-coding": {
     routeType: "operator-provider-plan-auth",
     apiFamily: "anthropic-messages",
     baseUrl: "https://api.z.ai/api/anthropic",
     credentialSource: {
       type: "env-var",
       envVarName: "ZAI_CODING_CN_API_KEY",
-      envVarNames: ["ZAI_API_KEY", "ZCODE_API_KEY"],
-      filePath: "~/.zcode/v2/config.json",
-      cacheTokenPath: "provider.builtin:zai-coding-plan.options.apiKey",
-      oauthPolicy: "ecosystem-ok"
+      envVarNames: ["Z_AI_API_KEY", "ZCODE_API_KEY"]
     },
     supportsTools: true,
     status: "active",
@@ -292,8 +277,8 @@ const LANES: Readonly<Record<string, ProviderLane>> = {
     allowedRouterFallback: false,
     wire: { authHeaderStyle: "bearer" },
     caveats: [
-      "VERIFIED 2026-07-04 (Phase B): anthropic-messages @ api.z.ai/api/anthropic, plain Bearer plan key. Live-probed PASS on glm-5.2/glm-5-turbo/glm-4.7 (chat+tools+thinking); glm-5v-turbo fails on this plan. Status flipped to active on probe evidence.",
-      "Operator-owned coding-plan auth; never route the client-locked token through LiteLLM."
+      "Z.ai GLM Coding Plan (GLM Coding Max subscription) — anthropic-messages @ api.z.ai/api/anthropic, plain Bearer plan key (NOT x-api-key). FULL coding set: glm-5.2 / glm-5.2[1m] (1M) / glm-5-turbo / glm-4.7 (chat+tools+thinking). GLM vision is API-token-only — use 'bigmodel'. One coding key: ZAI_CODING_CN_API_KEY == Z_AI_API_KEY == ZCODE_API_KEY (2026-07: dropped the stale ~/.zcode oauth-cache fields — it's a plain plan key).",
+      "Operator-owned coding-plan auth; tool-locked, never route the client-locked token through LiteLLM."
     ]
   }
 };
@@ -303,8 +288,6 @@ const LANES: Readonly<Record<string, ProviderLane>> = {
  * auto-connect and the planner should prefer these over their provider siblings.
  */
 const RANK_OVERRIDES: Readonly<Record<string, number>> = {
-  "openai-codex/gpt-5.5": 1,
-  "openai-codex/gpt-5.3-codex-spark": 2,
   "sakana/fugu-ultra": 3,
   "sakana/fugu": 4,
   "anthropic/claude-fable-5": 10,
@@ -315,10 +298,10 @@ const RANK_OVERRIDES: Readonly<Record<string, number>> = {
   "gemini/gemini-3.1-flash-lite": 21,
   "gemini/gemini-3.1-pro-preview": 22,
   "gemini/gemini-3.1-pro-preview-customtools": 23,
-  "zai/glm-5.2": 45,
-  "zai/glm-5-turbo": 46,
-  "zai/glm-4.7": 47,
-  "zai/glm-5v-turbo": 48
+  "zai-api/glm-5.2": 45,
+  "zai-api/glm-5-turbo": 46,
+  "zai-api/glm-4.7": 47,
+  "zai-api/glm-5v-turbo": 48
 };
 
 function routeFromSheet(row: SheetModel, indexInProvider: number): ProviderRouteDescriptor {
@@ -374,9 +357,9 @@ const CODEX_DIRECT_WIRE: Record<string, unknown> = {
 
 function codexDirectRoute(model: string, contextTokens: number, maxOutputTokens: number, rank: number): ProviderRouteDescriptor {
   return defineProviderRoute({
-    providerId: "openai-codex-direct",
+    providerId: "openai-codex",
     modelId: model,
-    routeId: `openai-codex-direct/${model}`,
+    routeId: `openai-codex/${model}`,
     routeType: "operator-provider-plan-auth",
     apiFamily: "openai-responses",
     baseUrl: "https://chatgpt.com/backend-api/codex",
@@ -399,8 +382,10 @@ function codexDirectRoute(model: string, contextTokens: number, maxOutputTokens:
 }
 
 const CODEX_DIRECT_ROUTES: readonly ProviderRouteDescriptor[] = [
-  codexDirectRoute("gpt-5.5", 272 * 1024, 128 * 1024, 2),
-  codexDirectRoute("gpt-5.3-codex-spark", 128 * 1024, 128 * 1024, 3)
+  // ChatGPT-plan native lanes ranked #1/#2 (2026-07): with the codex CLI-delegate lane
+  // gone, these are the top auto-connect picks once you /login to your ChatGPT plan.
+  codexDirectRoute("gpt-5.5", 272 * 1024, 128 * 1024, 1),
+  codexDirectRoute("gpt-5.3-codex-spark", 128 * 1024, 128 * 1024, 2)
 ];
 
 /** Local bonus lane — not on the operator sheet, kept because it needs no credentials. */

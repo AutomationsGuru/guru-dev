@@ -9,6 +9,7 @@ import {
   extractAccountFacts,
   generatePkce,
   isTokenNearExpiry,
+  readCodexCacheToken,
   refreshOAuthToken,
   resolveOAuthConfig,
   type GuruOAuthToken
@@ -96,11 +97,37 @@ describe("openai codex native OAuth — flow mechanics", () => {
   });
 });
 
+describe("readCodexCacheToken — ~/.codex shortcut (opportunistic reuse, never required)", () => {
+  const authJson = JSON.stringify({
+    auth_mode: "chatgpt",
+    tokens: { access_token: "AT-codex", refresh_token: "RT-codex", id_token: "", account_id: "acct_codex_1" }
+  });
+
+  it("reuses ~/.codex/auth.json tokens.access_token + account_id when present", () => {
+    const token = readCodexCacheToken("/home/op", (path) => (path.replace(/\\/gu, "/") === "/home/op/.codex/auth.json" ? authJson : null));
+    expect(token?.accessToken).toBe("AT-codex");
+    expect(token?.refreshToken).toBe("RT-codex");
+    expect(token?.accountId).toBe("acct_codex_1");
+    expect(token?.authMode).toBe("chatgpt");
+  });
+
+  it("returns null when the cache is absent (falls back to the native browser login)", () => {
+    expect(readCodexCacheToken("/home/op", () => null)).toBeNull();
+  });
+
+  it("returns null for an expired token with no refresh_token (dead credential must not read as signed in)", () => {
+    const past = Math.floor((Date.now() - 60_000) / 1000);
+    const jwt = `x.${Buffer.from(JSON.stringify({ exp: past })).toString("base64url")}.y`;
+    const expiredNoRefresh = JSON.stringify({ tokens: { access_token: jwt, refresh_token: "" } });
+    expect(readCodexCacheToken("/home/op", (p) => (p.replace(/\\/gu, "/") === "/home/op/.codex/auth.json" ? expiredNoRefresh : null))).toBeNull();
+  });
+});
+
 describe("guru-oauth lane resolves token + account id from the vault registry (never a cache)", () => {
   const route = ProviderRouteDescriptorSchema.parse({
-    providerId: "openai-codex-direct",
+    providerId: "openai-codex",
     modelId: "gpt-5.5",
-    routeId: "openai-codex-direct/gpt-5.5",
+    routeId: "openai-codex/gpt-5.5",
     routeType: "operator-provider-plan-auth",
     apiFamily: "openai-responses",
     baseUrl: "https://chatgpt.com/backend-api/codex",
@@ -112,7 +139,7 @@ describe("guru-oauth lane resolves token + account id from the vault registry (n
   });
 
   it("resolveRouteCredential returns the vaulted access token; the wire header carries the account id", () => {
-    registerOAuthTokenAccessor((providerId) => (providerId === "openai-codex-direct" ? { accessToken: "AT-123", accountId: "acct_42" } : null));
+    registerOAuthTokenAccessor((providerId) => (providerId === "openai-codex" ? { accessToken: "AT-123", accountId: "acct_42" } : null));
     const credential = resolveRouteCredential(route, EMPTY_ENV);
     expect(credential.usable).toBe(true);
     expect(credential.source).toBe("guru-oauth");

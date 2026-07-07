@@ -262,9 +262,9 @@ describe("streaming: anthropic tool_use round-trip parity (no live credential â€
 
 describe("streaming: openai-responses codex backfill (Finale Wave)", () => {
   const responsesRoute = defineProviderRoute({
-    providerId: "openai-codex-direct",
+    providerId: "openai-codex",
     modelId: "gpt-5.5",
-    routeId: "openai-codex-direct/gpt-5.5",
+    routeId: "openai-codex/gpt-5.5",
     routeType: "operator-provider-plan-auth",
     apiFamily: "openai-responses",
     baseUrl: "https://example.test/codex",
