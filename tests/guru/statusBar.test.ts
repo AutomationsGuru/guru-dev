@@ -41,10 +41,11 @@ function baseState(overrides: Record<string, unknown> = {}): never {
 const strip = (s: string): string => s.replace(/\x1b\[[0-9;]*m/gu, "");
 
 describe("buildStatusBar — full-width indicator bar", () => {
-  it("fills wide terminals exactly and right-justifies the model", () => {
+  it("fills wide terminals to columns-1 (xenl-safe) and right-justifies the model", () => {
     for (const cols of [120, 160, 200]) {
       const bar = strip(buildStatusBar(baseState(), cols));
-      expect(visibleWidth(bar), `fills ${cols}`).toBe(cols);
+      // One trailing cell reserved so the bar never soft-wraps (composer paint accounting).
+      expect(visibleWidth(bar), `fills ${cols - 1}`).toBe(cols - 1);
       expect(bar.trimEnd().endsWith("· high")).toBe(true);
     }
   });
@@ -98,11 +99,11 @@ describe("buildStatusBar — full-width indicator bar", () => {
     expect(visibleWidth("\x1b[1m汉\x1b[0m")).toBe(2);
   });
 
-  it("status bar still fills exactly with a CJK suit label (gap math is display-width-honest)", () => {
+  it("status bar still fills columns-1 with a CJK suit label (gap math is display-width-honest)", () => {
     const suited = baseState({ activeRole: { slug: "finance", label: "财务", capabilityMode: "all", tools: [], skills: [], extensions: [], mcpServers: [], modelPreference: { requires: ["chat"] }, verifiedTools: [], wornCount: 1, notes: "" } });
     for (const cols of [120, 160]) {
       const bar = strip(buildStatusBar(suited, cols));
-      expect(visibleWidth(bar), `fills ${cols} with CJK label`).toBe(cols);
+      expect(visibleWidth(bar), `fills ${cols - 1} with CJK label`).toBe(cols - 1);
     }
   });
 

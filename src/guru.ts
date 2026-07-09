@@ -748,7 +748,10 @@ export function buildStatusBar(state: GuruState, columns: number = process.stdou
   const effort = state.connectedRoute?.compat?.supportsReasoningEffort ? " · high" : "";
   const right = `${paint.fg("fgBright", modelText)}${paint.fg("muted", effort)}`;
 
-  const gap = Math.max(2, columns - visibleWidth(left) - visibleWidth(right));
+  // Reserve one trailing cell so the status line never soft-wraps (xenl). A
+  // full-width bar desyncs the composer's relative cursor accounting on WT/xterm.
+  const usable = Math.max(8, columns - 1);
+  const gap = Math.max(1, usable - visibleWidth(left) - visibleWidth(right));
   return `${left}${" ".repeat(gap)}${right}`;
 }
 
@@ -2854,17 +2857,33 @@ export function attachComposer(deps: ComposerDeps): {
   };
 
   /**
-   * Paint the editor frame + overlay at the current width. No busy guard — the
-   * caller decides whether to paint. Relative moves only: up to the block's first
-   * row, clear below, rewrite, reposition.
+   * Move from the live cursor (parked on `lastCursorRow` within the block) to
+   * the block's first row so the next clear/rewrite overwrites in place.
    */
-  const paintFrame = (): void => {
-    const width = columns();
-    const frame = renderEditorFrame(paint, editor, { text: promptText, width: promptCols }, width);
-    const below = overlayRows().map((row) => clampToWidth(row, width));
+  const moveToBlockTop = (): void => {
     if (rendered && lastCursorRow > 0) {
       deps.output.write(`\x1b[${lastCursorRow}A`);
     }
+  };
+
+  /**
+   * Paint the editor frame + overlay at the current width. No busy guard — the
+   * caller decides whether to paint. Relative moves only: up to the block's first
+   * row, clear below, rewrite, reposition.
+   *
+   * CRITICAL: paint at most `columns - 1` cells wide. A full-width row triggers
+   * terminal soft-wrap / xenl (Windows Terminal, xterm): the cursor advances to
+   * the next line without a CR, so the following `\x1b[NA` undercounts by one
+   * per full-width row. The status bar is intentionally full-bleed, so without
+   * this clamp every keystroke stacks a dead `▸ …` line in scrollback — the
+   * live "I still cannot type" field bug.
+   */
+  const paintFrame = (): void => {
+    const termWidth = Math.max(8, columns());
+    const width = Math.max(1, termWidth - 1);
+    const frame = renderEditorFrame(paint, editor, { text: promptText, width: promptCols }, width);
+    const below = overlayRows().map((row) => clampToWidth(row, width));
+    moveToBlockTop();
     deps.output.write("\x1b[1G\x1b[0J");
     deps.output.write(frame.rows.join("\n"));
     if (below.length > 0) {
@@ -2922,9 +2941,7 @@ export function attachComposer(deps: ComposerDeps): {
     if (!deps.interactive) {
       return;
     }
-    if (rendered && lastCursorRow > 0) {
-      deps.output.write(`\x1b[${lastCursorRow}A`);
-    }
+    moveToBlockTop();
     deps.output.write("\x1b[1G\x1b[0J");
     const echoed = text.split("\n").map((line, index) => (index === 0 ? `${promptText}${line}` : `${" ".repeat(promptCols)}${line}`));
     deps.output.write(`${echoed.join("\n")}\n`);
@@ -3218,12 +3235,11 @@ export function attachComposer(deps: ComposerDeps): {
     closed = true;
     if (deps.interactive) {
       // Finalize the on-screen frame so exit text lands cleanly below it.
-      if (rendered && lastCursorRow > 0) {
-        deps.output.write(`\x1b[${lastCursorRow}A`);
-      }
       if (rendered) {
+        moveToBlockTop();
         deps.output.write("\x1b[1G\x1b[0J");
         rendered = false;
+        lastCursorRow = 0;
       }
       deps.input.removeListener("data", onData);
       decoder.dispose();
@@ -3286,10 +3302,8 @@ export function attachComposer(deps: ComposerDeps): {
     },
     /** Clear the current frame without submitting (Ctrl+C hint path). */
     abortPrompt: () => {
-      if (rendered && lastCursorRow > 0) {
-        deps.output.write(`\x1b[${lastCursorRow}A`);
-      }
       if (rendered) {
+        moveToBlockTop();
         deps.output.write("\x1b[1G\x1b[0J");
         rendered = false;
         lastCursorRow = 0;

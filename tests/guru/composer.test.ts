@@ -45,6 +45,7 @@ function rig(options: {
   allowBusySteer?: () => boolean;
   steers?: string[];
   followUps?: string[];
+  columns?: number;
 } = {}): Rig {
   const input = new PassThrough();
   const frames: string[] = [];
@@ -66,7 +67,7 @@ function rig(options: {
     },
     interactive: true,
     promptText: "> ",
-    columns: () => 100,
+    columns: () => options.columns ?? 100,
     isBusy: options.busy ?? (() => false),
     ...(options.allowBusySteer ? { allowBusySteer: options.allowBusySteer } : {}),
     onBusySteer: (text) => {
@@ -421,6 +422,44 @@ describe("composer — chrome + rendering invariants", () => {
     expect(all).not.toContain("\x1b8"); // DECRC banned
     expect(all).toContain("\x1b[0J"); // relative clear-below
     expect(/\x1b\[\d+A/u.test(all)).toBe(true); // relative cursor-up
+  });
+
+  it("REGRESSION (field bug): full-width chrome never fills terminal columns (xenl)", async () => {
+    // A full-width status bar soft-wraps on Windows Terminal / xterm (xenl): the
+    // cursor drops a phantom row, relative CUU undercounts, and every keystroke
+    // stacks a dead `▸ …` line. Paint must reserve one trailing cell.
+    const cols = 40;
+    const r = rig({
+      columns: cols,
+      chromeRows: () => ["S".repeat(cols), "H".repeat(cols)]
+    });
+    r.composer.beginPrompt();
+    await r.type("abc");
+    const all = r.frames.join("");
+    // Full-width input must be clamped away — the raw cols-wide strings never paint.
+    expect(all).not.toContain("S".repeat(cols));
+    expect(all).not.toContain("H".repeat(cols));
+    // And the clamped forms DO paint (one cell reserved).
+    expect(all).toContain("S".repeat(cols - 1));
+    expect(all).toContain("H".repeat(cols - 1));
+    // At least beginPrompt + one keystroke repaint clear in place.
+    expect((all.match(/\x1b\[0J/gu) ?? []).length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("REGRESSION (field bug): successive keystrokes with chrome re-clear in place", async () => {
+    const r = rig({ chromeRows: () => ["STATUS-BAR", "HINT"] });
+    r.composer.beginPrompt();
+    r.frames.length = 0;
+    await r.type("x");
+    await r.type("y");
+    await r.type("z");
+    const all = r.frames.join("");
+    // Three separate keystrokes → three clear-below rewrites of the buffer.
+    expect((all.match(/\x1b\[0J/gu) ?? []).length).toBe(3);
+    // Chrome is below the cursor → each paint ends with CUU from the chrome.
+    expect((all.match(/\x1b\[\d+A/gu) ?? []).length).toBeGreaterThanOrEqual(3);
+    expect(stripAnsi(all)).toContain("xyz");
+    expect(r.composer.bufferText()).toBe("xyz");
   });
 
   it("ctrl+c raises interrupt; ctrl+d on an empty buffer closes (EOF → readLine null)", async () => {

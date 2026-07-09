@@ -2,6 +2,12 @@
 
 All notable changes to GuruHarness are documented here.
 
+## [1.4.1] - 2026-07-09
+
+### Fixed
+
+- **Composer keystroke leak (Windows Terminal / xterm xenl):** full-width status/chrome rows soft-wrapped and undercounted relative cursor-up, so every keystroke stacked a dead `▸ …` line. Paint now reserves one trailing cell; status bar gap math matches.
+
 ## [1.4.0] - 2026-07-09
 
 YOLO-by-default agency + preserve-don't-replace — guru acts like a model harness, not a passive Q&A bot — plus the working-stack daily-driver UX/MCP/self-build hardening from the multi-agent integration.
