@@ -37,24 +37,27 @@ function stealStaleLock(): void {
 
 /** One dist build per vitest wave; file lock covers stray parallel npm test runs. */
 function withBuildLock(run: () => void): void {
-  for (let attempt = 0; attempt < 300; attempt += 1) {
+  // ~100s wait so a stale lock (STALE_LOCK_MS=90s) can be stolen within the window.
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    let fd: number | undefined;
     try {
-      const fd = openSync(lockPath, "wx");
-      try {
-        run();
-      } finally {
-        closeSync(fd);
-        try {
-          unlinkSync(lockPath);
-        } catch {
-          /* lock already gone */
-        }
-      }
-      return;
+      fd = openSync(lockPath, "wx");
     } catch {
       stealStaleLock();
       sleepSync(250);
+      continue;
     }
+    try {
+      run();
+    } finally {
+      closeSync(fd);
+      try {
+        unlinkSync(lockPath);
+      } catch {
+        /* lock already gone */
+      }
+    }
+    return;
   }
   throw new Error("Timed out waiting for GuruHarness dist build lock.");
 }

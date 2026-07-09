@@ -152,12 +152,21 @@ export interface RetryHooks {
   readonly random?: () => number;
 }
 
-const defaultSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+const defaultSleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    if (typeof timer === "object" && timer !== null && "unref" in timer) {
+      (timer as NodeJS.Timeout).unref();
+    }
+  });
 
 /**
  * Sleep that wakes early when `signal` aborts — so cancel during backoff is
  * immediate instead of waiting out a multi-second exponential delay. Uses the
  * injectable `sleep` so tests still observe exact delay values.
+ *
+ * When using the default timer path, cancelation clears the timeout so abort
+ * mid-backoff does not pin the event loop until the full delay elapses.
  */
 export function abortableSleep(ms: number, signal?: AbortSignal, sleep: (ms: number) => Promise<void> = defaultSleep): Promise<void> {
   if (!signal) {
@@ -165,6 +174,27 @@ export function abortableSleep(ms: number, signal?: AbortSignal, sleep: (ms: num
   }
   if (signal.aborted) {
     return Promise.resolve();
+  }
+  // Own the timer when using defaultSleep so abort can clear it immediately.
+  if (sleep === defaultSleep) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        signal.removeEventListener("abort", onAbort);
+        resolve();
+      };
+      const onAbort = (): void => finish();
+      const timer = setTimeout(finish, ms);
+      if (typeof timer === "object" && timer !== null && "unref" in timer) {
+        (timer as NodeJS.Timeout).unref();
+      }
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
   }
   return new Promise((resolve) => {
     let settled = false;

@@ -98,6 +98,11 @@ export function connectStdioJsonRpc(options: JsonRpcStdioOptions): JsonRpcConnec
     failAllPending(spawnFailure);
   });
 
+  // Prevent uncaught EPIPE when the child exits before we finish writing.
+  child.stdin.on("error", () => {
+    /* closed pipe — failAllPending runs from the exit handler */
+  });
+
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk: string) => {
     stderrTail = (stderrTail + chunk).slice(-MAX_STDERR_CHARS);

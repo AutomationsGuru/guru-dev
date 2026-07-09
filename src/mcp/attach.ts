@@ -46,17 +46,23 @@ export async function attachConfiguredMcpServers(options: AttachMcpOptions): Pro
         env,
         ...(options.clientInfo ? { clientInfo: options.clientInfo } : {})
       });
-      const bridged = await discoverMcpTools({ client, callTimeoutMs: config.timeoutMs });
-      clients.push(client);
-      tools.push(...bridged);
-      statuses.push({
-        serverId: config.id,
-        status: "ready",
-        transport: config.transport,
-        missingEnvNames: [],
-        toolCount: bridged.length,
-        summary: `${config.id} attached: ${bridged.length} tool(s).`
-      });
+      try {
+        const bridged = await discoverMcpTools({ client, callTimeoutMs: config.timeoutMs });
+        clients.push(client);
+        tools.push(...bridged);
+        statuses.push({
+          serverId: config.id,
+          status: "ready",
+          transport: config.transport,
+          missingEnvNames: [],
+          toolCount: bridged.length,
+          summary: `${config.id} attached: ${bridged.length} tool(s).`
+        });
+      } catch (error) {
+        // Connect succeeded but discovery failed — close the orphaned client.
+        await client.close();
+        throw error;
+      }
     } catch (error) {
       statuses.push({
         serverId: config.id,

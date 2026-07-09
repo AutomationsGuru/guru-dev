@@ -898,9 +898,11 @@ async function openSseResponse(
     "content-type": "application/json",
     accept: "text/event-stream",
     ...(useBearer && context.secretValue
-      ? context.headerStyle === "api-key"
-        ? { "api-key": context.secretValue }
-        : { authorization: `Bearer ${context.secretValue}` }
+      ? context.headerStyle === "bearer"
+        ? { authorization: `Bearer ${context.secretValue}` }
+        : context.headerStyle === "api-key"
+          ? { "api-key": context.secretValue }
+          : { "x-api-key": context.secretValue }
       : {}),
     ...context.extraHeaders,
     ...(headerOverride ?? {})
@@ -1362,9 +1364,11 @@ async function postJson(
   const headers: Record<string, string> = {
     "content-type": "application/json",
     ...(useBearer && context.secretValue
-      ? context.headerStyle === "api-key"
-        ? { "api-key": context.secretValue }
-        : { authorization: `Bearer ${context.secretValue}` }
+      ? context.headerStyle === "bearer"
+        ? { authorization: `Bearer ${context.secretValue}` }
+        : context.headerStyle === "api-key"
+          ? { "api-key": context.secretValue }
+          : { "x-api-key": context.secretValue }
       : {}),
     ...context.extraHeaders,
     ...(headerOverride ?? {})

@@ -300,7 +300,10 @@ export async function runDevCycle(input: RunDevCycleInput = {}): Promise<DevCycl
               const stdout = execFileSync("git", [...args], {
                 cwd: gitCwd,
                 encoding: "utf8",
-                stdio: ["ignore", "pipe", "pipe"]
+                stdio: ["ignore", "pipe", "pipe"],
+                // Bound stalled push/fetch so SHIP cannot hang the cycle forever.
+                timeout: 120_000,
+                maxBuffer: 8 * 1024 * 1024
               });
               return { exitCode: 0, stdout, stderr: "" };
             } catch (error) {

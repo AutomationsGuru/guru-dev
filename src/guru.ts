@@ -2989,14 +2989,16 @@ export function attachComposer(deps: ComposerDeps): {
     }
     const name = key?.name ?? "";
     if (deps.isBusy()) {
-      // Mid-turn: Esc OR Ctrl+C abort the running agent (hint promises "esc interrupt").
-      if ((key?.ctrl === true && name === "c") || name === "escape") {
+      // Approval prompt owns the next key — don't steal y/N/a into a steer draft,
+      // and don't let Esc/Ctrl+C double as turn-abort while [n/enter/esc]=deny.
+      const steerOk = deps.allowBusySteer?.() ?? true;
+      // Mid-turn: Esc OR Ctrl+C abort the running agent (hint promises "esc interrupt")
+      // only when the approval prompt is not the one that owns Esc/Ctrl+C right now.
+      if (steerOk && ((key?.ctrl === true && name === "c") || name === "escape")) {
         busyDraft = "";
         interruptHandler();
         return;
       }
-      // Approval prompt owns the next key — don't steal y/N/a into a steer draft.
-      const steerOk = deps.allowBusySteer?.() ?? true;
       if (!steerOk) {
         return;
       }
