@@ -12,11 +12,51 @@ import type { Painter } from "./theme.js";
  * Width ladder: ≥162 cols full lockup · ≥40 AG mark · below that compact mark.
  */
 
-const ASSETS_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "assets");
+/**
+ * The splash reads the brand art from a sibling `assets/` directory. The compiled
+ * `dist/tui/splash.js` runs in many layouts (tsx source, `npm link` symlink, global
+ * `npm i -g` from the tarball, monorepo workspace) — the assets may live at
+ * different relative paths in each. Resolve once on first use by walking a small
+ * set of candidates so the brand splash surfaces in every installed context.
+ */
+const ASSET_CANDIDATES: ReadonlyArray<string> = (() => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  return [
+    // source layout: main/src/tui/splash.ts → ../../assets (main/assets)
+    join(here, "..", "..", "assets"),
+    // npm-link / monorepo: dist/tui/splash.js → ../../assets (root assets)
+    join(here, "..", "..", "..", "assets"),
+    // tarball global install: dist/tui/splash.js → ../../assets (pkg root assets)
+    join(here, "..", "..", "..", "..", "assets")
+  ];
+})();
+let resolvedAssetsDir: string | null = null;
+
+function resolveAssetsDir(): string | null {
+  if (resolvedAssetsDir !== null) {
+    return resolvedAssetsDir;
+  }
+  for (const candidate of ASSET_CANDIDATES) {
+    try {
+      // Probe with a file we KNOW exists — splash.ans is the lockup, so if it's
+      // there, the directory is real.
+      readFileSync(join(candidate, "splash.ans"));
+      resolvedAssetsDir = candidate;
+      return candidate;
+    } catch {
+      /* try next */
+    }
+  }
+  return null;
+}
 
 function readAsset(name: string): string | null {
+  const dir = resolveAssetsDir();
+  if (dir === null) {
+    return null;
+  }
   try {
-    return readFileSync(join(ASSETS_DIR, name), "utf8");
+    return readFileSync(join(dir, name), "utf8");
   } catch {
     return null;
   }

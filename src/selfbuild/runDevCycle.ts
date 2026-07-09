@@ -1,3 +1,5 @@
+import { execFileSync } from "node:child_process";
+
 import {
   runSelfBuildExecutor,
   type MandatePolicyFn,
@@ -11,6 +13,7 @@ import type { AskModel } from "../review/nativeCriticPanel.js";
 import { ledgerRecordingPolicy, type ApprovalLedger, type LedgerEntry } from "./approvalLedger.js";
 import { runDiscoveredValidation } from "./discoverGates.js";
 import { makeDevCycleReviewer, type ReviewContextGatherer } from "./devCycleReview.js";
+import { makeGatedGitDelivery } from "./gitDelivery.js";
 import { deriveLearning, type LearnedFact } from "./learn.js";
 import { parseGateFailure, type GateFailureNote } from "./parseGateFailure.js";
 import { EMPTY_HISTORY, selectNextTask, type SelectableTask, type TaskOutcomeHistory } from "./selectTask.js";
@@ -270,7 +273,7 @@ export async function runDevCycle(input: RunDevCycleInput = {}): Promise<DevCycl
       if (input.ship) {
         return input.ship();
       }
-      // Presence-detecting SHIP: git → delivery (when wired), else a durable on-disk record.
+      // Presence-detecting SHIP: git → gated delivery (default), else a durable on-disk record.
       // Roll up the stages recorded so far so the change-record carries a real verdict,
       // not the schema default (any RED → RED, any YELLOW → YELLOW, else GREEN).
       const shipVerdict: StageVerdict = stages.some((s) => s.verdict === "RED")
@@ -278,15 +281,43 @@ export async function runDevCycle(input: RunDevCycleInput = {}): Promise<DevCycl
         : stages.some((s) => s.verdict === "YELLOW")
           ? "YELLOW"
           : "GREEN";
+      const payload = ChangeRecordSchema.parse({
+        taskId: selectedTaskId,
+        summary: `dev-cycle delivery for ${selectedTaskId}`,
+        overallVerdict: shipVerdict,
+        stages: stages.map((s) => ({ stage: s.stage, verdict: s.verdict, evidence: s.evidence }))
+      });
+      // Default: compose gated git delivery so SHIP can actually push when granted.
+      // Callers still override via shipDeps.gitDelivery (tests inject fakes).
+      const gitDelivery =
+        input.shipDeps?.gitDelivery ??
+        makeGatedGitDelivery({
+          cwd,
+          policy,
+          payload,
+          runGit: (args, gitCwd) => {
+            try {
+              const stdout = execFileSync("git", [...args], {
+                cwd: gitCwd,
+                encoding: "utf8",
+                stdio: ["ignore", "pipe", "pipe"]
+              });
+              return { exitCode: 0, stdout, stderr: "" };
+            } catch (error) {
+              const err = error as { status?: number; stdout?: string; stderr?: string; message?: string };
+              return {
+                exitCode: typeof err.status === "number" ? err.status : 1,
+                stdout: typeof err.stdout === "string" ? err.stdout : "",
+                stderr: typeof err.stderr === "string" ? err.stderr : (err.message ?? String(error))
+              };
+            }
+          }
+        });
       const result = await runShipStage({
         cwd,
-        payload: ChangeRecordSchema.parse({
-          taskId: selectedTaskId,
-          summary: `dev-cycle delivery for ${selectedTaskId}`,
-          overallVerdict: shipVerdict,
-          stages: stages.map((s) => ({ stage: s.stage, verdict: s.verdict, evidence: s.evidence }))
-        }),
-        ...input.shipDeps
+        payload,
+        ...input.shipDeps,
+        gitDelivery
       });
       return { verdict: result.verdict, evidence: `${result.evidence}${result.recordPath ? ` → ${result.recordPath}` : ""}` };
     },

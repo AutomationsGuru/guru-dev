@@ -25,6 +25,12 @@ export interface SwarmWorkerRequest {
    * isolation (§9): a mandate change after spawn does not reach an in-flight worker.
    */
   readonly mandateSnapshot?: unknown;
+  /**
+   * Abort signal tripped by kill_task (review 2026-07-08): the runner forwards it
+   * into the agent turn so a killed worker actually stops hitting the model
+   * instead of running to its timeout. Absent for runners that can't abort.
+   */
+  readonly signal?: AbortSignal;
 }
 
 export interface SwarmWorkerResult {
@@ -64,6 +70,10 @@ export function createSwarmManager(rawConfig: Partial<SwarmConfig> = {}): SwarmM
   const tasks = new Map<string, SwarmTaskRecord>();
   const queue: Array<{ record: SwarmTaskRecord; prompt: string; snapshot: unknown }> = [];
   const inFlight = new Set<Promise<void>>();
+  // Per-task abort controllers so kill_task actually reaches the running worker's
+  // fetch (review 2026-07-08): without this, kill only flipped a state flag and
+  // the worker kept burning tokens until its timeout.
+  const controllers = new Map<string, AbortController>();
   let runner: SwarmTurnRunner | null = null;
   let snapshotProvider: SwarmSnapshotProvider | null = null;
   let running = 0;
@@ -90,6 +100,8 @@ export function createSwarmManager(rawConfig: Partial<SwarmConfig> = {}): SwarmM
       }
       running += 1;
       record.state = "running";
+      const controller = new AbortController();
+      controllers.set(record.id, controller);
       const work = activeRunner({
         prompt,
         mode: record.mode,
@@ -98,7 +110,8 @@ export function createSwarmManager(rawConfig: Partial<SwarmConfig> = {}): SwarmM
         timeoutMs: config.workerTimeoutMs,
         depth: record.depth,
         // The mandate snapshot captured at SPAWN — sibling isolation (§9).
-        ...(snapshot !== undefined ? { mandateSnapshot: snapshot } : {})
+        ...(snapshot !== undefined ? { mandateSnapshot: snapshot } : {}),
+        signal: controller.signal
       })
         .then((result) => {
           record.toolCallCount = result.toolCallCount;
@@ -119,6 +132,7 @@ export function createSwarmManager(rawConfig: Partial<SwarmConfig> = {}): SwarmM
         })
         .finally(() => {
           record.endedAt = new Date().toISOString();
+          controllers.delete(record.id);
           running -= 1;
           inFlight.delete(work);
           pump();
@@ -171,6 +185,13 @@ export function createSwarmManager(rawConfig: Partial<SwarmConfig> = {}): SwarmM
       if (record && (record.state === "queued" || record.state === "running")) {
         record.state = "killed";
         record.endedAt = new Date().toISOString();
+        // Abort the in-flight worker's fetch (review 2026-07-08). For a queued task
+        // there is no controller yet (it never started); for a running one this
+        // trips the signal the runner forwarded into the agent turn.
+        const controller = controllers.get(taskId);
+        if (controller) {
+          controller.abort();
+        }
       }
       return record;
     },

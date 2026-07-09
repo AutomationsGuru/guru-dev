@@ -9,6 +9,12 @@ export interface ToolExecutionContext {
   readonly cwd?: string;
   readonly startedBy?: string;
   readonly metadata?: Readonly<Record<string, unknown>>;
+  /**
+   * The turn's abort signal (review 2026-07-08): forwarded from the agent loop so
+   * a long-running tool (notably bash) can kill its child on operator cancel
+   * instead of running to its own timeout. Optional — most tools ignore it.
+   */
+  readonly signal?: AbortSignal;
 }
 
 export interface ToolObservation<TOutput = unknown> {

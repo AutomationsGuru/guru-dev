@@ -88,6 +88,48 @@ describe("swarm manager — bounded scheduling", () => {
     expect(started()).toBe(1); // the killed-queued worker never started
   });
 
+  it("kill_task aborts the running worker's signal (review 2026-07-08)", async () => {
+    // Old behavior: kill only flipped a state flag and the worker kept running
+    // until its timeout. Now the manager trips the AbortController whose signal
+    // was forwarded into the runner, so the in-flight fetch actually stops.
+    let observedSignal: AbortSignal | undefined;
+    let resolve!: (value: { text: string; toolCallCount: number }) => void;
+    const blocking = new Promise<{ text: string; toolCallCount: number }>((r) => {
+      resolve = r;
+    });
+    const manager = createSwarmManager({ maxConcurrentWorkers: 1 });
+    manager.setRunner(async (request) => {
+      observedSignal = request.signal;
+      // Simulate a worker blocked on a long fetch. When kill aborts the signal,
+      // a real runner's fetch would reject; here we resolve early once aborted.
+      if (request.signal) {
+        const aborted = new Promise<void>((r) => {
+          request.signal!.addEventListener("abort", () => r(), { once: true });
+        });
+        await Promise.race([blocking.then(() => undefined), aborted]);
+      } else {
+        await blocking;
+      }
+      return { text: "should not reach", toolCallCount: 0 };
+    });
+    const running = manager.spawn("long job", "read-only");
+    // Let the pump start the worker.
+    await Promise.resolve();
+    expect(manager.get(running.id)?.state).toBe("running");
+    expect(observedSignal).toBeDefined();
+    expect(observedSignal?.aborted).toBe(false);
+
+    manager.kill(running.id);
+    // The abort is synchronous on the controller.
+    expect(observedSignal?.aborted).toBe(true);
+    expect(manager.get(running.id)?.state).toBe("killed");
+    // Releasing the blocker must NOT un-deadlock the turn into a "done" — the
+    // aborted race already settled. Give it a microtask to settle.
+    resolve({ text: "late", toolCallCount: 1 });
+    await manager.drain();
+    expect(manager.get(running.id)?.resultText).toBeUndefined(); // discarded
+  });
+
   it("session task cap is a hard backstop", () => {
     const manager = createSwarmManager({ maxTasksPerSession: 2 });
     manager.setRunner(async () => ({ text: "x", toolCallCount: 0 }));
@@ -205,5 +247,32 @@ describe("swarm GOVERNOR (§17 scenario 5): depth error + per-spawn budgets + ma
     await manager.drain();
     // Both workers saw the mandate as it was AT THEIR SPAWN (v1), not the live v2.
     expect(seen).toEqual(["mandate-v1", "mandate-v1"]);
+  });
+
+  it("the model-facing spawn_agent tool threads `depth` to the swarm manager (§9 / §17 S5)", async () => {
+    // Regression for B21: the spawn tool used to never pass `depth`, which made the
+    // recursion-depth ceiling unreachable from a real worker — the limit was advertised
+    // but never enforceable on the live spawn path.
+    const manager = createSwarmManager({ maxSpawnDepth: 1 });
+    const [spawnTool] = createSwarmTools({ manager });
+    expect(spawnTool).toBeDefined();
+
+    // Default: no depth passed → manager uses 0.
+    const spawned = (await spawnTool!.execute({ prompt: "top-level", mode: "read-only" }, {} as never)) as { taskId: string };
+    expect(spawned.taskId).toBeDefined();
+    expect(manager.get(spawned.taskId)?.depth).toBe(0);
+
+    // Explicit depth=1 is below the ceiling → succeeds.
+    const child = (await spawnTool!.execute({ prompt: "child", mode: "read-only", depth: 1 }, {} as never)) as { taskId: string };
+    expect(manager.get(child.taskId)?.depth).toBe(1);
+
+    // depth=2 exceeds maxSpawnDepth=1 → the manager's structured error surfaces.
+    // Note: tools.ts execute throws synchronously when manager.spawn rejects (the
+    // tool registry's catch in executeRegisteredTool turns this into a failed
+    // ToolObservation in production — here we test the layer below to confirm the
+    // structured error type propagates).
+    expect(() =>
+      spawnTool!.execute({ prompt: "grandchild", mode: "read-only", depth: 2 }, {} as never)
+    ).toThrow(SwarmDepthExceededError);
   });
 });

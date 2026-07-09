@@ -24,6 +24,8 @@ export const ShellExecToolOutputSchema = z
     exitCode: z.number().int().nullable().optional(),
     stdout: z.string().optional(),
     stderr: z.string().optional(),
+    /** True when the child was KILLED (timeout/abort); stdout/stderr are partial. */
+    cancelled: z.boolean().default(false),
     durationMs: z.number().int().nonnegative().optional(),
     blockers: z.array(z.string()),
     summary: z.string()
@@ -61,6 +63,7 @@ export function createShellExecTool(
           executed: false,
           dryRun: input.dryRun,
           command: redactCommand(input.command),
+          cancelled: false,
           blockers,
           summary: `Shell command blocked by ${blockers.length} policy check(s).`
         };
@@ -71,14 +74,19 @@ export function createShellExecTool(
           executed: false,
           dryRun: true,
           command: input.command,
+          cancelled: false,
           blockers: [],
           summary: "Dry run only; command was not executed."
         };
       }
 
+      // Executor owns timeout (kills child + cancelled + partial). Outer race is a
+      // backstop for custom executors that ignore the contract — resolves cancelled,
+      // never rejects (parity with bash).
       const timeoutResult = await runWithTimeout(
         executor(input.command, {
           cwd,
+          timeoutMs: input.timeoutMs,
           gate: {
             kind: "validation",
             name: "shell.command.run",
@@ -86,8 +94,14 @@ export function createShellExecTool(
             required: true
           }
         }),
-        input.timeoutMs
-      );
+        input.timeoutMs + 5_000
+      ).catch((error: unknown) => ({
+        exitCode: null as number | null,
+        stdout: "",
+        stderr: `Backstop timeout: the executor did not resolve within ${input.timeoutMs + 5_000}ms (${error instanceof Error ? error.message : String(error)}).`,
+        durationMs: input.timeoutMs + 5_000,
+        cancelled: true as const
+      }));
 
       const outputDecision = guardContent(
         [
@@ -102,6 +116,7 @@ export function createShellExecTool(
         }
       );
       const redactedOutput = !outputDecision.allowed;
+      const cancelled = timeoutResult.cancelled === true;
 
       return {
         executed: true,
@@ -110,13 +125,16 @@ export function createShellExecTool(
         exitCode: timeoutResult.exitCode,
         stdout: redactedOutput ? "[redacted: sensitive output detected]" : timeoutResult.stdout,
         stderr: redactedOutput ? "[redacted: sensitive output detected]" : timeoutResult.stderr,
+        cancelled,
         durationMs: timeoutResult.durationMs,
         blockers: [...outputDecision.blockers],
-        summary: redactedOutput
-          ? "Command completed, but output was redacted by sensitive-output policy."
-          : timeoutResult.exitCode === 0
-            ? "Command completed successfully."
-            : "Command completed with a non-zero or null exit code."
+        summary: cancelled
+          ? "Command was KILLED (timeout/abort) — stdout/stderr contain the partial output captured before the kill."
+          : redactedOutput
+            ? "Command completed, but output was redacted by sensitive-output policy."
+            : timeoutResult.exitCode === 0
+              ? "Command completed successfully."
+              : "Command completed with a non-zero or null exit code."
       };
     }
   };

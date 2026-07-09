@@ -62,7 +62,7 @@ FIX: Derive a wall-clock deadline from config.wallClockMs and enforce it DURING 
 TITLE: gitDelivery (makeGatedGitDelivery) is built but never composed — SHIP can never actually push
 FIX: Wire the gated delivery into the default SHIP so it is not dependent on an external caller. In runDevCycle.ts's default `ship` runner (lines 269-284), when git is present construct `gitDelivery: makeGatedGitDelivery({ cwd, policy, payload, runGit })` using the cycle's own mandate `policy` (already in scope), the `cwd`, the change-record `payload` it already builds at lines 276-280, and a real git runner — and pass it as shipDeps.gitDelivery to runShipStage (still allowing input.shipDeps/input.ship to override for tests). This closes the seam without changing the spine: SHIP then actually route
 
-### [11] HIGH — D:\.projects\guruharness\main\src\selfbuild\runDevCycle.ts (wiring-gaps)
+### [11] HIGH — P:\guruharness\main\src\selfbuild\runDevCycle.ts (wiring-gaps)
 TITLE: LEARN default runner hardcodes YELLOW, making a clean dev cycle structurally unable to report GREEN
 FIX: In src/selfbuild/runDevCycle.ts, change the default LEARN runner's return at line 295 from the hardcoded `verdict: "YELLOW"` to the already-computed `softVerdict`:
 
@@ -86,7 +86,7 @@ FIX: Applied the minimal fix in the default SHIP runner (runDevCycle.ts): comput
 TITLE: --dry-run plan reports SMOKE/REVIEW "not wired" while --run actually wires them
 FIX: In the cli.ts --dry-run branch, compute the same wiring signals the --run path uses and pass them to buildDevCyclePlan: (1) hasSmoke: true (the run path wires makeSmokeDeps unconditionally); (2) hasReviewer: load the config and check plannerModel !== undefined && the apiKeyEnvVar is present — the exact keyPresent test at cli.ts:268; (3) hasGitDelivery: detect git presence the same way SHIP does. Concretely, load devCycleConfig before the dry-run branch (or inside it) and pass buildDevCyclePlan({ cwd, hasSmoke: true, hasReviewer: keyPresent, hasGitDelivery: <git detected>, ...taskId }). This ma
 
-### [16] LOW — D:\.projects\guruharness\main\src\cli.ts (wiring-gaps)
+### [16] LOW — P:\guruharness\main\src\cli.ts (wiring-gaps)
 TITLE: SMOKE self-call is never wired from the CLI, so SMOKE ships as a capability-smoke half-run
 FIX: In cli.ts (near line 271-273, the `--run` path), construct a bounded self-call closure that starts an AgentSession against `cwd` and runs one real `driveTurn`, then pass it plus a timeout into makeSmokeDeps: `smoke: makeSmokeDeps({ cwd, selfCall: (signal) => runOneBoundedTurn(cwd, signal), timeoutMs: 60_000 })`. `runOneBoundedTurn` should honor the AbortSignal and reject on driveTurn error/timeout so runSmokeStage maps a broken turn to selfCall:"error"/"timeout" → SMOKE RED. Keep the self-call skippable in tests (the `input.selfCall ? ...` guard already allows that), so only the production CLI
 
@@ -138,3 +138,27 @@ FIX: Add a smoke.test.ts case that invokes `self-build-run` (no --dry-run) again
 ### PLAUSIBLE LOW — src/selfbuild/smokeStage.ts: SMOKE self-call timeout timer is never cleared → dangling timer can delay process exit
 ### PLAUSIBLE LOW — src/selfbuild/runDevCycleLoop.ts: runDevCycleLoop passes baseInput.tasks into inner runDevCycle, letting SELECT re-pick a different task than the loop chose
 ### PLAUSIBLE LOW — tests/selfbuild/discoverGates.test.ts: discoverGates polyglot precedence and Makefile spacing edge cases lack test coverage
+---
+
+## STATUS 2026-07-09 — session pass (working tree, not yet committed)
+
+Closed this pass:
+- [4] HIGH — executor live push/PR now evaluated through options.mandatePolicy before runGitPrAutomation (selfBuildExecutor.ts, mirrors makeGatedGitDelivery; blocked → git-pr-mandate report). Tests: tests/executor/selfBuildExecutor.test.ts (mandate-block + dry-run-ungated).
+- [5]/[6] MEDIUM — `guruharness run --git --git-live` now injects failClosedMandatePolicy(createMandateStore().load()) so a live push requires an explicit grant (config flag alone is no longer an approval). Dry runs unaffected (cli.ts).
+- [13] MEDIUM — runDevCycleLoop wired to `self-build-run --loop` (+ --max-cycles), fed from the self-build task graph; readiness snapshotted at loop start. SDK barrel now exports runDevCycle/runDevCycleLoop/selectTask. Test: tests/cli/selfBuildLoop.test.ts.
+- [21] MEDIUM — verified already closed (generic fallback in parseGateFailure.ts + cargo-test regression in place).
+- [1] HIGH — verified already closed in gitDelivery.ts (commit exit code inspected, nothing-to-commit → YELLOW).
+
+Verified closed by the in-flight test/hardening WIP (other lane): [7] [8] [10] [11].
+Still open (files under active edit by another lane — left to owner): [2] [3] [9] [12] [14]–[20] [22] [23] + 3 PLAUSIBLE LOW.
+
+Also closed this pass (outside this log's scope): critic-bench C1 — quoted-assignment secret scrub gap in secretSafety.ts (quoted multi-word values leaked their tail past the first space; same scanner gates memory writes). Fix + 6 regressions in tests/safety/secretEnvLeak.test.ts.
+
+Additional this pass — MCP ATTACH subsystem (FR-10 / never-stuck ATTACH move, previously schema-only dead code):
+- src/mcp/jsonRpcStdio.ts — newline-delimited JSON-RPC 2.0 stdio transport (bounded buffers, per-request timeouts, abort, TERM→KILL close, secret-scrubbed errors, tolerates prose on stdout, answers server→client requests -32601).
+- src/mcp/client.ts — initialize handshake (2025-03-26), paginated tools/list, tools/call; presence-only env readiness (names never values).
+- src/mcp/toolBridge.ts — discovered MCP tools become registry ToolDefinitions (id mcp.<server>.<tool>) so the render-layer sanitizer + mandate policy govern attached tools by construction.
+- src/mcp/attach.ts — one-call attachConfiguredMcpServers(config.mcpServers) → {clients, tools, statuses}; non-ready servers degrade to honest statuses.
+- config: optional HarnessConfigSchema.mcpServers (default []); McpServerIdSchema widened from closed 9-server enum to open slug (module had zero consumers). SDK barrel exports all of src/mcp/.
+- Tests: tests/mcp/ (13) incl. live fake-server fixture and a constitution test proving token-shaped output from an ATTACHED server is redacted at the registry choke point.
+- NOT yet wired into runtime/session.ts, guru.ts /tools, or the resolver ATTACH move — those files are under active edit by another lane; attachConfiguredMcpServers is the intended one-call seam.

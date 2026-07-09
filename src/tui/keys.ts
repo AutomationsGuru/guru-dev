@@ -154,7 +154,8 @@ export function parseKeys(chunk: string): ParsedChunk {
         continue;
       }
       // ESC + ordinary char = meta chord (alt+x): swallow, no editor meaning yet.
-      keys.push({ name: next, meta: true, sequence: chunk.slice(at, at + 2) });
+      const chordName = next === "\r" ? "return" : next === "\n" ? "enter" : next;
+      keys.push({ name: chordName, meta: true, sequence: chunk.slice(at, at + 2) });
       at += 2;
       continue;
     }
@@ -165,6 +166,8 @@ export function parseKeys(chunk: string): ParsedChunk {
       if (chunk[at + 1] === "\n") {
         at += 1; // CRLF pairs coalesce into ONE return (Windows-origin pastes)
       }
+      at += 1;
+      continue;
     } else if (char === "\n") {
       flushPrintable();
       keys.push({ name: "enter", sequence: "\n" }); // LF IS Ctrl+J

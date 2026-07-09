@@ -258,6 +258,8 @@ export async function startHarnessApiServer(options: ApiServerOptions = {}): Pro
     server,
     close() {
       return new Promise((resolve, reject) => {
+        // Drop keep-alive clients so close() does not hang the next test.
+        server.closeAllConnections?.();
         server.close((error) => {
           if (error) {
             reject(error);

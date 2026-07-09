@@ -19,7 +19,10 @@ import {
   createHarnessRuntime
 } from "./index.js";
 import { proposeEvidenceTasks } from "./selfbuild/evidence.js";
-import { runDevCycle } from "./selfbuild/runDevCycle.js";
+import { failClosedMandatePolicy, runDevCycle } from "./selfbuild/runDevCycle.js";
+import { runDevCycleLoop } from "./selfbuild/runDevCycleLoop.js";
+import type { SelectableTask } from "./selfbuild/selectTask.js";
+import { createMandateStore } from "./mandates/store.js";
 import { buildDevCyclePlan, renderDevCyclePlan } from "./selfbuild/devCyclePlan.js";
 import { makeAskModelFromRoute, routeFromPlannerConfig } from "./selfbuild/askModelAdapter.js";
 import { makeSmokeDeps } from "./selfbuild/smokeDeps.js";
@@ -198,7 +201,14 @@ if (command === "self-build-plan") {
   const gitTitle = getFlagValue(args, "--git-title");
   const gitBody = getFlagValue(args, "--git-body");
 
+  // Hardening #5/#6 (spend-safety): a LIVE push (--git-live) must clear the operator's
+  // persisted mandate policy — the config flag alone is not an approval. Fail-closed:
+  // no grant / no YOLO ⇒ the push escalates and the executor blocks it. Dry runs unaffected.
+  const gitIsLive = runGit && hasFlag(args, "--git-live") && !hasFlag(args, "--git-dry-run");
+  const liveGitMandatePolicy = gitIsLive ? failClosedMandatePolicy(createMandateStore().load()) : undefined;
+
   const runCommandReport = await runSelfBuildExecutor({
+    ...(liveGitMandatePolicy ? { mandatePolicy: liveGitMandatePolicy } : {}),
     ...(configPath ? { configPath } : {}),
     ...(cwd ? { cwd } : {}),
     ...(targetPath ? { targetPath } : {}),
@@ -239,6 +249,11 @@ if (command === "self-build-plan") {
         "",
         "  --dry-run                      Discover gates + print the stage plan; execute NOTHING.",
         "  --task-id <id>                 Task to build.",
+        "  --loop                         UNATTENDED multi-cycle: drive the whole ready task set",
+        "                                 (SELECT re-picks after every cycle; blocked tasks are",
+        "                                 deprioritised). Tasks unlocked by cycles completed in",
+        "                                 this run are picked up on the next invocation.",
+        "  --max-cycles <n>               Hard cap on loop cycles (default: ready task count).",
         "  --cwd <path>                   Working directory (default: cwd).",
         "  --config <path>                Config file.",
         "  --allow-dirty-workspace        Permit a dirty git tree.",
@@ -268,19 +283,56 @@ if (command === "self-build-plan") {
   const keyPresent = plannerModel !== undefined && (process.env[plannerModel.apiKeyEnvVar] ?? "").length > 0;
   const askModel = plannerModel && keyPresent ? makeAskModelFromRoute(routeFromPlannerConfig(plannerModel), { env: process.env }) : undefined;
 
-  const devCycleReport = await runDevCycle({
-    ...(askModel ? { askModel } : {}),
-    smoke: makeSmokeDeps({ cwd }),
-    executorOptions: {
-      cwd,
-      ...(taskId ? { taskId } : {}),
-      ...(configPath ? { configPath } : {}),
-      ...(hasFlag(args, "--allow-dirty-workspace") ? { allowDirtyWorkspace: true } : {}),
-      ...(hasFlag(args, "--allow-risky-paths") ? { allowRiskyPaths: true } : {})
-    }
-  });
-  console.log(JSON.stringify(devCycleReport, null, 2));
-  process.exitCode = devCycleReport.terminal === "done" ? 0 : 1;
+  const executorOptions = {
+    cwd,
+    ...(taskId ? { taskId } : {}),
+    ...(configPath ? { configPath } : {}),
+    ...(hasFlag(args, "--allow-dirty-workspace") ? { allowDirtyWorkspace: true } : {}),
+    ...(hasFlag(args, "--allow-risky-paths") ? { allowRiskyPaths: true } : {})
+  };
+
+  if (hasFlag(args, "--loop")) {
+    // Hardening #13: the UNATTENDED multi-cycle driver, fed from the same task graph
+    // self-build-plan reads. Readiness is snapshotted at loop start — a task whose
+    // dependencies complete DURING this run becomes eligible on the next invocation.
+    const state = applySelfBuildProgress(createSelfBuildState(), devCycleConfig.selfBuild.completedTaskIds);
+    const doneIds = new Set(state.tasks.filter((task) => task.status === "done").map((task) => task.id));
+    // Kernel priority is rank-ordered (now=0 best); SELECT scores higher-is-better — invert.
+    const priorityScore: Record<string, number> = { now: 2, next: 1, later: 0 };
+    const tasks: SelectableTask[] = state.tasks.map((task) => ({
+      id: task.id,
+      priority: priorityScore[task.priority] ?? 0,
+      ready: task.status === "ready" && task.dependsOn.every((dependency) => doneIds.has(dependency)),
+      completed: task.status === "done"
+    }));
+    const maxCycles = getOptionalPositiveInt(args, "--max-cycles");
+
+    const loopReport = await runDevCycleLoop({
+      tasks,
+      ...(maxCycles !== undefined ? { maxCycles } : {}),
+      baseInput: {
+        ...(askModel ? { askModel } : {}),
+        smoke: makeSmokeDeps({ cwd, timeoutMs: 30_000 }),
+        executorOptions
+      },
+      // Progress to stderr so stdout stays a single parseable JSON report.
+      onCycle: (report, cycleTaskId) => {
+        console.error(`[self-build-loop] ${cycleTaskId}: terminal=${report.terminal} stages=${report.stages.map((s) => `${s.stage}:${s.verdict}`).join(",")}`);
+      }
+    });
+
+    console.log(JSON.stringify(loopReport, null, 2));
+    process.exitCode = loopReport.blocked.length === 0 ? 0 : 1;
+  } else {
+    const devCycleReport = await runDevCycle({
+      ...(askModel ? { askModel } : {}),
+      // Real SMOKE: nucleus boot + model-free session/tool self-call (bounded).
+      smoke: makeSmokeDeps({ cwd, timeoutMs: 30_000 }),
+      executorOptions
+    });
+    console.log(JSON.stringify(devCycleReport, null, 2));
+    process.exitCode = devCycleReport.terminal === "done" ? 0 : 1;
+  }
 } else if (command === "api") {
   const host = getFlagValue(args, "--host") ?? "127.0.0.1";
   const port = getOptionalPositiveInt(args, "--port");

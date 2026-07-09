@@ -108,6 +108,24 @@ describe("editor reducer — the ADR key map", () => {
     expect(drive(base, [KEY.ctrl("e")]).state.col).toBe("alpha beta gamma".length);
   });
 
+  it("Ctrl+W deletes a trailing emoji word whole (never splits a surrogate pair)", () => {
+    // "foo 😀" — 😀 is a surrogate pair (2 UTF-16 units). Old code stepped back
+    // one UTF-16 unit at a time, leaving a lone high surrogate (\uD83E) that
+    // corrupted the buffer. The fix steps whole code points via prevCharLength.
+    const withEmoji = drive(createEditorState(), type("foo 😀")).state;
+    const after = drive(withEmoji, [KEY.ctrl("w")]).state;
+    expect(after.lines[0]).toBe("foo ");
+    // No lone surrogate left behind: every remaining char is a complete code point.
+    const line = after.lines[0] ?? "";
+    for (const char of line) {
+      expect(char.codePointAt(0)).toBeLessThan(0xd800);
+    }
+    // An emoji-leading word deletes whole too.
+    expect(drive(drive(createEditorState(), type("x 😀yo")).state, [KEY.ctrl("w")]).state.lines[0]).toBe("x ");
+    // A CJK word deletes whole (汉 is BMP, exercises the same whole-step path).
+    expect(drive(drive(createEditorState(), type("foo 汉")).state, [KEY.ctrl("w")]).state.lines[0]).toBe("foo ");
+  });
+
   it("Ctrl+C interrupts; Ctrl+D on an EMPTY buffer is EOF, otherwise forward-deletes", () => {
     expect(drive(createEditorState(), [KEY.ctrl("c")]).effect.kind).toBe("interrupt");
     expect(drive(createEditorState(), [KEY.ctrl("d")]).effect.kind).toBe("eof");

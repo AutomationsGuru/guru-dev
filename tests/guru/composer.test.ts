@@ -12,7 +12,20 @@ import type { MenuItem } from "../../src/tui/menu.js";
  * the physical TTY. Absorbs every regression from the old menu-controller rig.
  */
 
-const KEYS = { up: "\x1b[A", down: "\x1b[B", right: "\x1b[C", left: "\x1b[D", enter: "\r", ctrlJ: "\n", esc: "\x1b", tab: "\t", ctrlC: "\x03", ctrlD: "\x04", backspace: "\x7f" };
+const KEYS = {
+  up: "\x1b[A",
+  down: "\x1b[B",
+  right: "\x1b[C",
+  left: "\x1b[D",
+  enter: "\r",
+  altEnter: "\x1b\r",
+  ctrlJ: "\n",
+  esc: "\x1b",
+  tab: "\t",
+  ctrlC: "\x03",
+  ctrlD: "\x04",
+  backspace: "\x7f"
+};
 
 interface Rig {
   type(text: string): Promise<void>;
@@ -29,6 +42,9 @@ function rig(options: {
   pickFiles?: (query: string) => readonly string[];
   completePath?: ComposerDeps["completePath"];
   busy?: () => boolean;
+  allowBusySteer?: () => boolean;
+  steers?: string[];
+  followUps?: string[];
 } = {}): Rig {
   const input = new PassThrough();
   const frames: string[] = [];
@@ -38,6 +54,8 @@ function rig(options: {
     { id: "/model", label: "/model", hint: "models", drillable: true },
     { id: "/resume", label: "/resume", hint: "resume", drillable: true }
   ];
+  const steers = options.steers ?? [];
+  const followUps = options.followUps ?? [];
   const deps: ComposerDeps = {
     input,
     output: {
@@ -50,6 +68,13 @@ function rig(options: {
     promptText: "> ",
     columns: () => 100,
     isBusy: options.busy ?? (() => false),
+    ...(options.allowBusySteer ? { allowBusySteer: options.allowBusySteer } : {}),
+    onBusySteer: (text) => {
+      steers.push(text);
+    },
+    onBusyFollowUp: (text) => {
+      followUps.push(text);
+    },
     commandItems: (buffer) => commands.filter((c) => c.id.startsWith(buffer.trim()) || buffer.trim() === "/"),
     drillItems: (parentId) => options.drills?.[parentId] ?? [],
     ...(options.chromeRows ? { chromeRows: options.chromeRows } : {}),
@@ -407,16 +432,42 @@ describe("composer — chrome + rendering invariants", () => {
     expect(await pending).toBeNull();
   });
 
-  it("busy turns ignore keys (except ctrl+c) and never repaint", async () => {
+  it("busy turns: Esc/Ctrl+C interrupt; type+Enter steers; no full composer repaint", async () => {
     let busy = true;
-    const r = rig({ busy: () => busy });
+    const steers: string[] = [];
+    const r = rig({ busy: () => busy, steers });
     const before = r.frames.length;
-    await r.type("ignored text");
-    expect(r.frames.length).toBe(before); // no renders while busy
-    await r.type(KEYS.ctrlC);
+    // Mid-turn draft accumulates + writes feedback lines (not a full composer frame).
+    await r.type("focus the parser");
+    expect(r.frames.length).toBeGreaterThan(before); // busy feedback lines
+    expect(r.frames.join("")).toMatch(/steering…/u);
+    expect(r.composer.bufferText()).toBe(""); // main buffer untouched mid-turn
+    await r.type(KEYS.enter);
+    expect(steers).toEqual(["focus the parser"]);
+    // Esc aborts the running turn (same handler as ctrl+c).
+    await r.type(KEYS.esc);
     expect(r.interrupts).toBe(1);
+    await r.type(KEYS.ctrlC);
+    expect(r.interrupts).toBe(2);
+    // Approval gate: steer accumulation suppressed.
+    const steers2: string[] = [];
+    const r2 = rig({ busy: () => true, allowBusySteer: () => false, steers: steers2 });
+    await r2.type("y");
+    await r2.type(KEYS.enter);
+    expect(steers2).toEqual([]);
     busy = false;
     await r.type("live");
     expect(r.composer.bufferText()).toBe("live");
+  });
+
+  it("busy turns: Alt+Enter queues a follow-up instead of steering", async () => {
+    const steers: string[] = [];
+    const followUps: string[] = [];
+    const r = rig({ busy: () => true, steers, followUps });
+    await r.type("then run tests");
+    await r.type(KEYS.altEnter);
+    expect(steers).toEqual([]);
+    expect(followUps).toEqual(["then run tests"]);
+    expect(r.frames.join("")).toMatch(/follow-up queued/u);
   });
 });

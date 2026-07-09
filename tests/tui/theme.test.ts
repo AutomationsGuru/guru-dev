@@ -149,6 +149,16 @@ describe("splash (spec §4)", () => {
     }
   });
 
+  it("wide truecolor surfaces the .ans lockup (not just the medium AG mark tier)", () => {
+    // The brand lockup is the shipped "you installed this correctly" first impression.
+    // If asset resolution regresses (tarball global install path), this test catches it.
+    const out = renderSplash(createPainter({ level: "truecolor" }), { version: "0.8.0", themeName: "automationsguru", node: "24" }, 220);
+    // The 220-col splash reads splash.ans (18 rows of half-block art). The medium-tier
+    // fallback is <5 rows (AG mark + wordmark + eyebrow). 10+ rows proves the lockup.
+    const visibleLines = out.split("\n").filter((line) => line.replace(/\x1b\[[0-9;]*m/gu, "").trim().length > 0);
+    expect(visibleLines.length).toBeGreaterThanOrEqual(10);
+  });
+
   it("full-width eyebrow right-justifies to the terminal edge, not a fixed 160", () => {
     const strip = (s: string): string => s.replace(/\x1b\[[0-9;]*m/gu, "");
     const wide = renderSplash(createPainter({ level: "truecolor" }), { version: "0.8.0", themeName: "automationsguru", node: "24" }, 220);

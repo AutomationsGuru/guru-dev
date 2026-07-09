@@ -1,4 +1,18 @@
-import { completeSlashCommand, filterSlashCommands, injectRepoRoot, parseSlashCommand, resolveRouteSelector, sortedRoutes, SLASH_COMMANDS } from "../../src/guru.js";
+import { Readable } from "node:stream";
+
+import {
+  approvalChoiceFromAnswer,
+  completeSlashCommand,
+  evaluateSlashGuess,
+  filterSlashCommands,
+  formatApprovalOutcome,
+  injectRepoRoot,
+  parseSlashCommand,
+  readApprovalAnswer,
+  resolveRouteSelector,
+  sortedRoutes,
+  SLASH_COMMANDS
+} from "../../src/guru.js";
 import { createDirectProviderCatalog } from "../../src/providers/catalog.js";
 
 describe("parseSlashCommand", () => {
@@ -28,13 +42,37 @@ describe("resolveRouteSelector", () => {
     expect(resolveRouteSelector(routes, String(routes.length))?.routeId).toBe(ordered[routes.length - 1]?.routeId);
   });
 
-  it("resolves a providerId prefix (e.g. openai-codex for plugging in codex)", () => {
-    expect(resolveRouteSelector(routes, "openai-codex")?.routeId).toBe("openai-codex/gpt-5.5");
+  it("resolves an UNAMBIGUOUS providerId prefix; an ambiguous one returns undefined (review 2026-07-08)", () => {
+    // A providerId with exactly one route resolves directly.
+    const single = routes.filter((r) => r.providerId === "sakana");
+    const singleRoutes = single.length === 1 ? routes : routes;
+    // `openai-codex` has multiple routes in the full catalog → ambiguous → undefined
+    // (old behavior silently picked whichever sorted first; now the operator is
+    // told to be specific).
+    const codexMatches = routes.filter((r) => r.providerId === "openai-codex" || r.routeId.startsWith("openai-codex/"));
+    if (codexMatches.length > 1) {
+      expect(resolveRouteSelector(routes, "openai-codex")).toBeUndefined();
+    }
+    // A synthetic single-route provider resolves.
+    expect(resolveRouteSelector([{ ...routes[0]!, providerId: "solo-prov", routeId: "solo-prov/only-model" }], "solo-prov")?.routeId).toBe("solo-prov/only-model");
   });
 
   it("returns undefined for unknown selectors", () => {
     expect(resolveRouteSelector(routes, "nope/never")).toBeUndefined();
     expect(resolveRouteSelector(routes, "999")).toBeUndefined();
+  });
+
+  it("rejects non-canonical numeric input (no silent truncation of '1.5' → 1)", () => {
+    // `Number.parseInt("1.5", 10)` returns 1; before the strict guard, /model 1.5
+    // would silently connect to the first route. The strict guard rejects any
+    // input that isn't a clean positive integer and falls through to the
+    // providerId prefix lookup — which for "1.5" finds no route, returning
+    // undefined instead of misrouting to the wrong model.
+    expect(resolveRouteSelector(routes, "1.5")).toBeUndefined();
+    expect(resolveRouteSelector(routes, "01")).toBeUndefined();
+    expect(resolveRouteSelector(routes, "0")).toBeUndefined();
+    expect(resolveRouteSelector(routes, "-1")).toBeUndefined();
+    expect(resolveRouteSelector(routes, "1e3")).toBeUndefined();
   });
 });
 
@@ -101,5 +139,194 @@ describe("slash command filtering (live menu + Tab guess)", () => {
   it("Tab accepts exactly the top guess", () => {
     expect(completeSlashCommand("/re")[0]).toEqual(["/resume"]);
     expect(completeSlashCommand("hello")[0]).toEqual([]);
+  });
+});
+
+describe("evaluateSlashGuess — Enter-on-slash policy", () => {
+  // Exact match: runs as-is, no "→ /x" hint.
+  it("exact /model is 'exact', no hint", () => {
+    expect(evaluateSlashGuess({ command: "/model", args: [] })).toEqual({
+      kind: "exact",
+      command: "/model"
+    });
+  });
+
+  // Confident prefix: auto-runs with a "→ /x" hint.
+  it("/mo → auto-run /model", () => {
+    expect(evaluateSlashGuess({ command: "/mo", args: [] })).toEqual({
+      kind: "auto-run",
+      command: "/model"
+    });
+  });
+
+  it("/memo → auto-run /memory", () => {
+    expect(evaluateSlashGuess({ command: "/memo", args: [] })).toEqual({
+      kind: "auto-run",
+      command: "/memory"
+    });
+  });
+
+  // Side-effect commands require the full name — the original /exit hardening,
+  // extended in this pass.
+  it("/exi → blocked: must type /exit in full", () => {
+    expect(evaluateSlashGuess({ command: "/exi", args: [] })).toEqual({
+      kind: "blocked",
+      command: "/exit",
+      reason: "no-guess-run"
+    });
+  });
+
+  it("/logi → blocked: must type /login in full (no surprise OAuth fires)", () => {
+    expect(evaluateSlashGuess({ command: "/logi", args: [] })).toEqual({
+      kind: "blocked",
+      command: "/login",
+      reason: "no-guess-run"
+    });
+  });
+
+  it("/log → blocked (first match in registration order, both are in blocklist)", () => {
+    // Both /login and /logout are in the blocklist; the matcher picks the first
+    // by stable sort order of SLASH_COMMANDS (login precedes logout). The verdict
+    // kind is what matters: blocked. Either target command is a valid outcome.
+    const verdict = evaluateSlashGuess({ command: "/log", args: [] });
+    expect(verdict.kind).toBe("blocked");
+    expect(verdict).toMatchObject({ kind: "blocked", reason: "no-guess-run" });
+    if (verdict.kind === "blocked") {
+      expect(["/login", "/logout"]).toContain(verdict.command);
+    }
+  });
+
+  it("/compact (side-effect: durable history rewrite) → blocked", () => {
+    expect(evaluateSlashGuess({ command: "/com", args: [] })).toEqual({
+      kind: "blocked",
+      command: "/compact",
+      reason: "no-guess-run"
+    });
+  });
+
+  it("/yolo → blocked: must type /yolo in full", () => {
+    expect(evaluateSlashGuess({ command: "/yol", args: [] })).toEqual({
+      kind: "blocked",
+      command: "/yolo",
+      reason: "no-guess-run"
+    });
+  });
+
+  // Exact-name on a blocked command still runs (operator typed it in full).
+  it("/logout (full name) is 'exact', runs without hint", () => {
+    expect(evaluateSlashGuess({ command: "/logout", args: ["anthropic"] })).toEqual({
+      kind: "exact",
+      command: "/logout"
+    });
+  });
+
+  // Substring / description-keyword matches surface a weak-match warning instead
+  // of auto-running (defensive — most partials that hit a non-blocklisted command
+  // via substring also happen to be prefix matches, so this verdict is rare).
+  it("substring-only matches surface a weak-match warning instead of auto-running", () => {
+    // The fuzzy matcher's substring tier matches when the partial appears inside
+    // a command name WITHOUT being a prefix of any name. /elp is a substring of
+    // /help (the only command containing "elp" in its name), and /elp is NOT
+    // a prefix of any other command. /help is NOT in the blocklist → weak-match.
+    expect(evaluateSlashGuess({ command: "/elp", args: [] })).toEqual({
+      kind: "weak-match",
+      command: "/help",
+      reason: "substring-or-description"
+    });
+  });
+
+  it("unknown commands resolve to 'no-match'", () => {
+    expect(evaluateSlashGuess({ command: "/banana", args: [] })).toEqual({
+      kind: "no-match"
+    });
+  });
+});
+
+describe("readApprovalAnswer — single-key approval prompt input", () => {
+  // Mock stream that pushes input via .push() — node's stream.Readable supports
+  // read() mode; we mimic a TTY's data events by emitting Buffer chunks.
+  const makeStream = (): Readable => {
+    const r = new Readable({ read() {} });
+    return r;
+  };
+
+  it("resolves 'y' on a single printable byte", async () => {
+    const stream = makeStream();
+    const promise = readApprovalAnswer(stream);
+    queueMicrotask(() => stream.push(Buffer.from("y")));
+    await expect(promise).resolves.toBe("y");
+  });
+
+  it("resolves 'n' on a single printable byte (fail-safe default)", async () => {
+    const stream = makeStream();
+    const promise = readApprovalAnswer(stream);
+    queueMicrotask(() => stream.push(Buffer.from("n")));
+    await expect(promise).resolves.toBe("n");
+  });
+
+  it("does NOT resolve on backspace (\"fixing a typo\" no longer denies the prompt)", async () => {
+    const stream = makeStream();
+    const promise = readApprovalAnswer(stream);
+    queueMicrotask(() => stream.push(Buffer.from("\x7f")));
+    // Backspace should be ignored. Push 'y' after to confirm the prompt stays open.
+    queueMicrotask(() => stream.push(Buffer.from("y")));
+    await expect(promise).resolves.toBe("y");
+  });
+
+  it("does NOT resolve on an arrow-key CSI (arrow up) — only a lone Esc denies", async () => {
+    const stream = makeStream();
+    const promise = readApprovalAnswer(stream);
+    queueMicrotask(() => stream.push(Buffer.from("\x1b[A"))); // arrow up
+    queueMicrotask(() => stream.push(Buffer.from("y")));
+    await expect(promise).resolves.toBe("y");
+  });
+
+  it("Enter denies (matches the on-screen [n/enter/esc] hint)", async () => {
+    const stream = makeStream();
+    const promise = readApprovalAnswer(stream);
+    queueMicrotask(() => stream.push(Buffer.from("\r")));
+    await expect(promise).resolves.toBe("n");
+  });
+
+  it("lone Esc denies (fail-safe)", async () => {
+    const stream = makeStream();
+    const promise = readApprovalAnswer(stream);
+    // Grace timer (~30ms) for lone ESC in the key decoder.
+    setTimeout(() => stream.push(Buffer.from("\x1b")), 0);
+    await expect(promise).resolves.toBe("n");
+  }, 5_000);
+
+  it("maps answers to once/always/deny (hard edge cannot always)", () => {
+    expect(approvalChoiceFromAnswer("y", true)).toBe("once");
+    expect(approvalChoiceFromAnswer("a", true)).toBe("always");
+    expect(approvalChoiceFromAnswer("a", false)).toBe("deny");
+    expect(approvalChoiceFromAnswer("n", true)).toBe("deny");
+    expect(formatApprovalOutcome("once", "write")).toMatch(/allowed once.*write/u);
+    expect(formatApprovalOutcome("deny", "bash")).toMatch(/denied.*bash/u);
+  });
+
+  it("Ctrl+C during an approval prompt resolves as deny (fail-safe)", async () => {
+    const stream = makeStream();
+    const promise = readApprovalAnswer(stream);
+    queueMicrotask(() => stream.push(Buffer.from("\x03")));
+    await expect(promise).resolves.toBe("n");
+  });
+
+  it("lowercase and uppercase both resolve correctly", async () => {
+    for (const byte of ["y", "Y", "a", "A", "n", "N"]) {
+      const stream = makeStream();
+      const promise = readApprovalAnswer(stream);
+      queueMicrotask(() => stream.push(Buffer.from(byte)));
+      await expect(promise, `byte "${byte}"`).resolves.toBe(byte.toLowerCase());
+    }
+  });
+
+  it("ignores characters outside y/a/n (e.g. typing 'x' or 'q' keeps prompt open)", async () => {
+    const stream = makeStream();
+    const promise = readApprovalAnswer(stream);
+    queueMicrotask(() => stream.push(Buffer.from("x")));
+    queueMicrotask(() => stream.push(Buffer.from("q")));
+    queueMicrotask(() => stream.push(Buffer.from("y")));
+    await expect(promise).resolves.toBe("y");
   });
 });

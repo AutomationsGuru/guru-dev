@@ -123,6 +123,8 @@ async function getJson(url: URL, path: string): Promise<JsonResponse> {
 }
 
 describe("startHarnessApiServer", () => {
+  // Session start + tool-run + inspect chains are integration-heavy; allow headroom under parallel CI load.
+  const integrationTimeoutMs = 30_000;
   it("serves plan and direction routes and routes run/session-start payloads", async () => {
     let receivedSessionRequest: unknown;
     let receivedSessionListRequest: unknown;
@@ -301,6 +303,7 @@ describe("startHarnessApiServer", () => {
   });
 
   it("supports session status and running tools against an existing API session", async () => {
+    // Real session start + tool-run + inspect chain can exceed the default 5s under load.
     const server = await startHarnessApiServer({ port: 0, host: "127.0.0.1" });
     const url = new URL(server.url);
 
@@ -405,7 +408,7 @@ describe("startHarnessApiServer", () => {
     } finally {
       await server.close();
     }
-  });
+  }, integrationTimeoutMs);
 
   it("inspects persisted session timeline evidence after an API runtime restart", async () => {
     const sessionPersistenceStore = createInMemorySessionPersistenceStore();
@@ -450,7 +453,7 @@ describe("startHarnessApiServer", () => {
     } finally {
       await secondServer.close();
     }
-  });
+  }, integrationTimeoutMs);
 
   it("returns a clear error for invalid JSON request bodies", async () => {
     const server = await startHarnessApiServer({ port: 0, host: "127.0.0.1" });
@@ -464,7 +467,7 @@ describe("startHarnessApiServer", () => {
     } finally {
       await server.close();
     }
-  });
+  }, integrationTimeoutMs);
 
   it("passes /run safety overrides only when the API server opts in", async () => {
     let receivedRunRequest: unknown;

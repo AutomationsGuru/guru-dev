@@ -39,6 +39,7 @@
     "guru": "tsx src/guru.ts",
     "build": "tsc -p tsconfig.build.json",
     "test": "vitest run",
+    "test:ci": "vitest run --reporter=dot",
     "typecheck": "tsc --noEmit",
     "dogfood:portfolio": "tsx scripts/portfolioDogfoodSmoke.ts",
     "lint:docs": "node --eval \"console.log('docs lint not configured yet')\"",

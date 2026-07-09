@@ -66,7 +66,14 @@ export const SpawnAgentInputSchema = z
     prompt: z.string().trim().min(1),
     /** read-only scouts by default: the worker physically cannot mutate. */
     mode: SwarmWorkerModeSchema.default("read-only"),
-    label: z.string().trim().min(1).max(60).optional()
+    label: z.string().trim().min(1).max(60).optional(),
+    /**
+     * Recursion depth of this spawn (0 = parent session; a worker spawning passes
+     * its own depth + 1). Optional — the swarm manager defaults to 0. A worker that
+     * does not know its own depth should pass 0; the manager fires
+     * `SwarmDepthExceededError` past `maxSpawnDepth`.
+     */
+    depth: z.number().int().nonnegative().optional()
   })
   .strict();
 

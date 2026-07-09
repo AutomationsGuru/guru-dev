@@ -103,6 +103,46 @@ describe("directAgentTurn (openai-chat-completions)", () => {
     expect(result.usage).toEqual({ inputTokens: 30, outputTokens: 13, lastRequestInputTokens: 20 });
   });
 
+  it("falls back to the earlier turn's text when the terminal turn is empty (review 2026-07-08)", async () => {
+    // Common pattern: the model says "Let me check" + tool_use on turn 1, runs
+    // the tool, then ends on turn 2 with empty text. Old code returned "" from
+    // the terminal turn and the user saw a blank reply.
+    let call = 0;
+    const result = await directAgentTurn(route, [{ role: "user", content: "branch?" }], {
+      env,
+      tools: [repoTool],
+      executeTool: async (toolId) => observation(toolId, { gitStatus: "## main [ahead 7]" }),
+      approveTool: () => true,
+      fetchImpl: (async (_url: unknown, init: { body?: string }) => {
+        call += 1;
+        if (call === 1) {
+          return new Response(
+            JSON.stringify({
+              choices: [
+                {
+                  message: {
+                    content: "Let me check the branch.",
+                    tool_calls: [{ id: "c1", function: { name: "repo__context__resolve", arguments: JSON.stringify({ cwd: "." }) } }]
+                  }
+                }
+              ],
+              usage: { prompt_tokens: 10, completion_tokens: 5 }
+            }),
+            { status: 200 }
+          );
+        }
+        // Terminal turn: empty content, no tool calls.
+        return new Response(
+          JSON.stringify({ choices: [{ message: { content: "" } }], usage: { prompt_tokens: 20, completion_tokens: 2 } }),
+          { status: 200 }
+        );
+      }) as typeof fetch
+    });
+
+    expect(result.toolCallCount).toBe(1);
+    expect(result.text).toBe("Let me check the branch."); // NOT "" — falls back to turn-1 text
+  });
+
   it("blocks non-approved (mutating) tools and tells the model", async () => {
     const executed: string[] = [];
     let call = 0;
@@ -164,6 +204,55 @@ describe("directAgentTurn (openai-chat-completions)", () => {
 
     expect(result.text).toContain("budget exhausted");
     expect(result.toolCallCount).toBeLessThanOrEqual(2);
+  });
+
+  it("normalizes array-shaped assistant content (Bedrock/GLM) so the next turn doesn't 400 (review 2026-07-08)", async () => {
+    // Some OpenAI-compatible providers return message.content as an array of
+    // {type:"text",text:...} blocks. Pushing that array back into the conversation
+    // made the provider reject the next turn ("content must be a string"). The
+    // loop now normalizes array content to a string at the boundary.
+    let call = 0;
+    let secondRequestBody = "";
+    const result = await directAgentTurn(route, [{ role: "user", content: "branch?" }], {
+      env,
+      tools: [repoTool],
+      executeTool: async (toolId) => observation(toolId, { gitStatus: "## main" }),
+      approveTool: () => true,
+      fetchImpl: (async (_url: unknown, init: { body?: string }) => {
+        call += 1;
+        if (call === 2) {
+          secondRequestBody = init.body ?? "";
+        }
+        if (call === 1) {
+          // Tool-bearing turn with ARRAY content (the Bedrock mantle shape).
+          return new Response(
+            JSON.stringify({
+              choices: [
+                {
+                  message: {
+                    content: [{ type: "text", text: "Let me check." }],
+                    tool_calls: [{ id: "c1", function: { name: "repo__context__resolve", arguments: JSON.stringify({ cwd: "." }) } }]
+                  }
+                }
+              ],
+              usage: { prompt_tokens: 10, completion_tokens: 5 }
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response(
+          JSON.stringify({ choices: [{ message: { content: "On main." } }], usage: { prompt_tokens: 20, completion_tokens: 3 } }),
+          { status: 200 }
+        );
+      }) as typeof fetch
+    });
+
+    expect(result.toolCallCount).toBe(1);
+    expect(result.text).toBe("On main.");
+    // The assistant message echoed into the second request must carry content as a
+    // STRING ("Let me check."), not the raw array — that's what was crashing the turn.
+    expect(secondRequestBody).toContain('"Let me check."');
+    expect(secondRequestBody).not.toContain('"type":"text"');
   });
 });
 
@@ -284,6 +373,39 @@ describe("directAgentTurn (anthropic-messages)", () => {
     expect(result.text).toBe("main branch.");
     expect(result.toolCallCount).toBe(1);
   });
+
+  it("falls back to the tool-turn's text when the terminal turn is empty (review 2026-07-08)", async () => {
+    // Claude often emits the real answer as text alongside the tool_use
+    // ("Let me read it" + tool_use), then ends on a later turn with no text.
+    // Old code returned "" on that empty terminal turn.
+    let call = 0;
+    const result = await directAgentTurn(anthropicRoute, [{ role: "user", content: "branch?" }], {
+      env,
+      tools: [repoTool],
+      executeTool: async (toolId) => observation(toolId, { gitStatus: "## main" }),
+      approveTool: () => true,
+      fetchImpl: (async () => {
+        call += 1;
+        if (call === 1) {
+          return new Response(
+            JSON.stringify({
+              stop_reason: "tool_use",
+              content: [
+                { type: "text", text: "Let me check the branch for you." },
+                { type: "tool_use", id: "t1", name: "repo__context__resolve", input: {} }
+              ]
+            }),
+            { status: 200 }
+          );
+        }
+        // Terminal turn: empty text, end_turn.
+        return new Response(JSON.stringify({ stop_reason: "end_turn", content: [] }), { status: 200 });
+      }) as typeof fetch
+    });
+
+    expect(result.toolCallCount).toBe(1);
+    expect(result.text).toBe("Let me check the branch for you."); // NOT ""
+  });
 });
 
 describe("iteration hard cap (probe-harness discovery)", () => {
@@ -326,5 +448,55 @@ describe("iteration hard cap (probe-harness discovery)", () => {
           )) as typeof fetch
       })
     ).rejects.toThrow(/iteration cap/u);
+  });
+});
+
+describe("tool trace dry-run visibility", () => {
+  it("surfaces DRY RUN detail and [dry-run] input preview for bash dry runs", async () => {
+    const events: import("../../src/model/agentTurn.js").AgentToolEvent[] = [];
+    const bashTool: ToolDefinition = {
+      id: "bash",
+      title: "Bash",
+      description: "Run shell",
+      inputSchema: z.object({ command: z.union([z.string(), z.array(z.string())]), dryRun: z.boolean().optional() }),
+      outputSchema: z.object({ executed: z.boolean(), dryRun: z.boolean() }),
+      execute: () => ({ executed: false, dryRun: true, command: ["npm", "test"], truncated: false, cancelled: false, blockers: [], summary: "Dry run only" })
+    };
+
+    let call = 0;
+    await directAgentTurn(route, [{ role: "user", content: "run tests" }], {
+      env,
+      tools: [bashTool],
+      executeTool: async (toolId, input) => {
+        expect(input).toMatchObject({ dryRun: true });
+        return observation(toolId, { executed: false, dryRun: true, command: ["npm", "test"], summary: "Dry run only" });
+      },
+      approveTool: () => true,
+      onToolEvent: (event) => events.push(event),
+      fetchImpl: (async (_url: unknown, init: { body?: string }) => {
+        call += 1;
+        if (call === 1) {
+          return new Response(
+            JSON.stringify({
+              choices: [
+                {
+                  message: {
+                    content: null,
+                    tool_calls: [{ id: "b1", function: { name: "bash", arguments: JSON.stringify({ command: ["npm", "test"], dryRun: true }) } }]
+                  }
+                }
+              ],
+              usage: { prompt_tokens: 5, completion_tokens: 3 }
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response(JSON.stringify({ choices: [{ message: { content: "done" } }], usage: { prompt_tokens: 5, completion_tokens: 2 } }), { status: 200 });
+      }) as typeof fetch
+    });
+
+    expect(events).toHaveLength(1);
+    expect(events[0]?.detail).toMatch(/DRY RUN/iu);
+    expect(events[0]?.inputPreview).toMatch(/\[dry-run\]/u);
   });
 });

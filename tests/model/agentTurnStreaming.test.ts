@@ -99,7 +99,29 @@ describe("streaming: openai-chat-completions", () => {
     expect(result.text).toBe("On main.");
   });
 
-  it("falls back to non-streaming when the provider rejects the stream request", async () => {
+  it("surfaces a streaming 400 as a real error instead of silently doubling the request (review 2026-07-08)", async () => {
+    // Old behavior: ANY non-OK on the streaming request returned null → the caller
+    // re-sent the identical request non-streaming. A 400/401/404 is a genuine
+    // request error (bad model, bad URL, bad key); doubling it wasted a call and
+    // reported the SECOND attempt's error. Now it surfaces the first immediately.
+    let calls = 0;
+    await expect(
+      directAgentTurn(chatRoute, [{ role: "user", content: "hi" }], {
+        env,
+        tools: [],
+        executeTool: async () => ({ toolId: "x", status: "succeeded", startedAt: "", endedAt: "", durationMs: 0 }),
+        approveTool: () => true,
+        onToken: () => undefined,
+        fetchImpl: (async () => {
+          calls += 1;
+          return new Response(JSON.stringify({ error: "bad request" }), { status: 400 });
+        }) as typeof fetch
+      })
+    ).rejects.toThrow(/HTTP 400/);
+    expect(calls).toBe(1); // NOT 2 — the request was not re-sent
+  });
+
+  it("falls back to non-streaming only on streaming-unsupported statuses (415/405/501)", async () => {
     let calls = 0;
     const result = await directAgentTurn(chatRoute, [{ role: "user", content: "hi" }], {
       env,
@@ -110,7 +132,7 @@ describe("streaming: openai-chat-completions", () => {
       fetchImpl: (async () => {
         calls += 1;
         if (calls === 1) {
-          return new Response(JSON.stringify({ error: "streaming not supported" }), { status: 400 });
+          return new Response(JSON.stringify({ error: "streaming not supported" }), { status: 415 });
         }
         return new Response(JSON.stringify({ choices: [{ message: { content: "non-stream ok" } }] }), { status: 200 });
       }) as typeof fetch
@@ -189,6 +211,35 @@ describe("streaming: network-level failure fallback", () => {
         }) as typeof fetch
       })
     ).rejects.toThrow(/failed/iu);
+  });
+});
+
+describe("streaming: per-request timeout is terminal, not retried (review 2026-07-08)", () => {
+  it("surfaces a timeout immediately instead of retrying into the same hang", async () => {
+    // Old behavior: the timeout AbortController fires a SEPARATE signal, so
+    // context.signal (the operator signal) was NOT aborted. The catch fell to the
+    // network-failure branch → retried 3× → a blackholed route hung for minutes.
+    // Now an abort-style error with no operator abort is a terminal timeout.
+    let calls = 0;
+    await expect(
+      directAgentTurn(chatRoute, [{ role: "user", content: "hi" }], {
+        env,
+        tools: [],
+        executeTool: async () => ({ toolId: "x", status: "succeeded", startedAt: "", endedAt: "", durationMs: 0 }),
+        approveTool: () => true,
+        onToken: () => undefined,
+        retrySleep: () => Promise.resolve(),
+        fetchImpl: (async () => {
+          calls += 1;
+          // The timeout AbortController aborts the fetch — the fetch rejects with
+          // a DOMException named "AbortError". No operator signal is involved.
+          const err = new Error("The operation was aborted");
+          err.name = "AbortError";
+          throw err;
+        }) as typeof fetch
+      })
+    ).rejects.toThrow(/timed out/iu);
+    expect(calls).toBe(1); // NOT retried
   });
 });
 

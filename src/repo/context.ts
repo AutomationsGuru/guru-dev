@@ -24,6 +24,9 @@ export interface ResolveRepositoryContextOptions {
 export function resolveRepositoryContext(options: ResolveRepositoryContextOptions = {}): RepositoryContext {
   const cwd = options.cwd ?? process.cwd();
   const targetPath = resolvePath(options.targetPath ?? cwd, cwd);
+  // Prefer a root in the SAME path form as the target (walk for .git). Git's
+  // rev-parse can return a UNC path while the process cwd is a mapped drive
+  // letter — string containment then false-fails on Windows network shares.
   const repoRoot = options.rootPath ? resolvePath(options.rootPath, cwd) : findGitRoot(targetPath);
 
   if (!repoRoot) {
@@ -49,6 +52,13 @@ export function findGitRoot(startPath: string): string | undefined {
   } catch {
     searchDir = dirname(startPath);
   }
+
+  // Walk first so the returned root keeps the caller's path form (P:\… vs \\server\…).
+  const walked = walkGitRoot(searchDir);
+  if (walked) {
+    return walked;
+  }
+
   try {
     const output = execFileSync("git", ["-C", searchDir, "rev-parse", "--show-toplevel"], {
       encoding: "utf8",
@@ -61,13 +71,23 @@ export function findGitRoot(startPath: string): string | undefined {
   }
 }
 
-export function readGitStatus(repoRoot: string): string {
+/** Bound git status so a wedged network share cannot hang session start forever. */
+export const GIT_STATUS_TIMEOUT_MS = 8_000;
+
+export function readGitStatus(repoRoot: string, options: { readonly timeoutMs?: number } = {}): string {
+  const timeoutMs = options.timeoutMs ?? GIT_STATUS_TIMEOUT_MS;
   try {
     return execFileSync("git", ["-C", repoRoot, "status", "--short", "--branch"], {
       encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: timeoutMs
     }).trimEnd();
   } catch (error) {
+    const err = error as { code?: string; killed?: boolean; signal?: string; message?: string };
+    // Node sets killed=true when the timeout fires; code may be ETIMEDOUT or null.
+    if (err.killed === true || err.code === "ETIMEDOUT" || /ETIMEDOUT/u.test(err.message ?? "")) {
+      return `git status timed out after ${timeoutMs}ms (slow network share?) — continuing without live status`;
+    }
     return `git status unavailable: ${formatError(error)}`;
   }
 }
@@ -82,15 +102,18 @@ export function readAgentsChain(options: ReadAgentsChainOptions): readonly Agent
   const targetPath = resolve(options.targetPath);
   assertInsideRoot(rootPath, targetPath);
 
+  // Prefer the target's path form for directory walks so joins stay coherent
+  // when root arrived as UNC and target as a mapped drive (or vice versa).
+  const rootForWalk = walkGitRoot(targetPath) ?? rootPath;
   const targetDirectory = resolveTargetDirectory(targetPath);
-  const directories = directoriesFromRoot(rootPath, targetDirectory);
+  const directories = directoriesFromRoot(rootForWalk, targetDirectory);
 
   return directories
     .map((directory) => join(directory, "AGENTS.md"))
     .filter((agentsPath) => existsSync(agentsPath))
     .map((agentsPath) => ({
       path: agentsPath,
-      relativePath: normalizeRelativePath(relative(rootPath, agentsPath)),
+      relativePath: normalizeRelativePath(relative(rootForWalk, agentsPath)),
       contents: readFileSync(agentsPath, "utf8")
     }));
 }
@@ -99,12 +122,64 @@ function resolvePath(path: string, cwd: string): string {
   return isAbsolute(path) ? resolve(path) : resolve(cwd, path);
 }
 
-function assertInsideRoot(rootPath: string, targetPath: string): void {
-  const relativePath = relative(rootPath, targetPath);
-
-  if (relativePath.startsWith("..") || isAbsolute(relativePath)) {
-    throw new Error(`Target path ${targetPath} is outside repository root ${rootPath}`);
+/** Walk parents looking for a `.git` entry; preserves the caller's path form. */
+function walkGitRoot(startPath: string): string | undefined {
+  let dir = resolve(startPath);
+  try {
+    if (statSync(dir).isFile()) {
+      dir = dirname(dir);
+    }
+  } catch {
+    dir = dirname(dir);
   }
+  for (;;) {
+    if (existsSync(join(dir, ".git"))) {
+      return dir;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) {
+      return undefined;
+    }
+    dir = parent;
+  }
+}
+
+/** True when two path strings name the same filesystem object (drive letter ↔ UNC). */
+function samePathIdentity(left: string, right: string): boolean {
+  try {
+    const a = statSync(left);
+    const b = statSync(right);
+    return a.dev === b.dev && a.ino === b.ino;
+  } catch {
+    return resolve(left).toLowerCase() === resolve(right).toLowerCase();
+  }
+}
+
+function assertInsideRoot(rootPath: string, targetPath: string): void {
+  const root = resolve(rootPath);
+  const target = resolve(targetPath);
+  if (samePathIdentity(root, target)) {
+    return;
+  }
+  const relativePath = relative(root, target);
+  if (!relativePath.startsWith("..") && !isAbsolute(relativePath)) {
+    return;
+  }
+  // Windows network-share aliases: `P:\repo` and `\\server\share\repo` are the
+  // same inode. Walk from target toward the filesystem root; if we hit root's
+  // inode, containment holds even when string relative() fails.
+  let current = resolveTargetDirectory(target);
+  for (;;) {
+    if (samePathIdentity(current, root)) {
+      return;
+    }
+    const parent = dirname(current);
+    if (parent === current) {
+      break;
+    }
+    current = parent;
+  }
+  throw new Error(`Target path ${targetPath} is outside repository root ${rootPath}`);
 }
 
 function resolveTargetDirectory(targetPath: string): string {

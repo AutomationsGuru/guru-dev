@@ -99,7 +99,7 @@ export interface TurnDriver {
   readonly route?: ProviderRouteDescriptor;
   readonly session?: HarnessSession;
   readonly tools?: readonly ToolDefinition[];
-  readonly executeTool?: (toolId: string, input: unknown) => Promise<ToolObservation>;
+  readonly executeTool?: (toolId: string, input: unknown, signal?: AbortSignal) => Promise<ToolObservation>;
   readonly approveTool?: (toolId: string, input: unknown) => boolean | Promise<boolean>;
   /** Transform the history into the messages actually sent (compaction windowing). */
   readonly prepareMessages?: (history: readonly ChatTurnMessage[]) => readonly ChatTurnMessage[];
@@ -282,9 +282,9 @@ export class AgentSession {
         tools: driver.tools ?? this.offeredTools(),
         executeTool:
           driver.executeTool ??
-          ((toolId, input) =>
+          ((toolId, input, signal) =>
             harnessSession
-              ? this.deps.runtime.executeTool(harnessSession.id, toolId, this.prepareToolInput(toolId, input))
+              ? this.deps.runtime.executeTool(harnessSession.id, toolId, this.prepareToolInput(toolId, input), signal)
               : Promise.resolve({ toolId, status: "failed" as const, startedAt: "", endedAt: "", durationMs: 0, error: "No live harness session." })),
         approveTool: driver.approveTool ?? this.defaultApprove(harnessSession),
         ...(driver.onToolPending ? { onToolPending: driver.onToolPending } : {}),
@@ -316,10 +316,17 @@ export class AgentSession {
 
   /** SDK turn: the full lifecycle (steer drain → @-expand → push user → execute). */
   async prompt(text: string): Promise<AgentTurnResult> {
-    // Drain steering into this turn (the injection point) — before the user message.
-    for (const item of this.steerQueue.splice(0)) {
-      this.history.push({ role: "system", content: `[${item.kind === "steer" ? "steering" : "follow-up"}] ${item.text}` });
-      this.emit("steer.injected", { text: item.text, kind: item.kind });
+    // Drain ONLY pre-queued steers into this turn. Follow-ups stay queued for
+    // takeFollowUps() so the driver runs them as fresh turns when the agent stops.
+    for (let i = 0; i < this.steerQueue.length; ) {
+      const item = this.steerQueue[i] as QueuedSteer;
+      if (item.kind === "steer") {
+        this.steerQueue.splice(i, 1);
+        this.history.push({ role: "system", content: `[steering] ${item.text}` });
+        this.emit("steer.injected", { text: item.text, kind: "steer" });
+      } else {
+        i += 1;
+      }
     }
     let submitted = text;
     const repo = this.deps.session?.repo;
@@ -334,6 +341,24 @@ export class AgentSession {
     this.history.push({ role: "user", content: submitted });
     this.emit("turn.start", { text: submitted });
     return this.driveTurn();
+  }
+
+  /**
+   * Run one prompt, then drain queued follow-ups as fresh prompts — the driver
+   * contract shared by the REPL and the RPC surface.
+   */
+  async promptDrainingFollowUps(text: string): Promise<AgentTurnResult> {
+    let result = await this.prompt(text);
+    while (true) {
+      const queued = this.takeFollowUps();
+      if (queued.length === 0) {
+        break;
+      }
+      for (const followUpText of queued) {
+        result = await this.prompt(followUpText);
+      }
+    }
+    return result;
   }
 
   // -- garage --------------------------------------------------------------

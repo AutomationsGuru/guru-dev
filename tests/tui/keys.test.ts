@@ -26,7 +26,8 @@ describe("parseKeys — table-driven decoder branches", () => {
     { label: "Shift+Enter modifyOtherKeys", bytes: "\x1b[27;2;13~", expect: { name: "return", shift: true } },
     { label: "plain Enter CSI-u (unshifted)", bytes: "\x1b[13;1u", expect: { name: "return", shift: false } },
     { label: "shifted arrow \\x1b[1;2A", bytes: "\x1b[1;2A", expect: { name: "up", shift: true } },
-    { label: "double ESC", bytes: "\x1b\x1b", expect: { name: "escape" } }
+    { label: "double ESC", bytes: "\x1b\x1b", expect: { name: "escape" } },
+    { label: "Alt+Enter (ESC+CR)", bytes: "\x1b\r", expect: { name: "return", meta: true } }
   ];
 
   for (const testCase of cases) {
@@ -47,6 +48,23 @@ describe("parseKeys — table-driven decoder branches", () => {
 
   it("batches printable runs into ONE key (paste-friendly) and splits around controls", () => {
     const parsed = parseKeys("hello\rworld");
+    expect(parsed.keys.map((key) => key.name ?? key.sequence)).toEqual(["hello", "return", "world"]);
+  });
+
+  it("CRLF is ONE 'return' (Windows ConPTY / mintty Enter), not submit + newline", () => {
+    const parsed = parseKeys("\r\n");
+    expect(parsed.keys).toHaveLength(1);
+    expect(parsed.keys[0]?.name).toBe("return");
+  });
+
+  it("bare LF is 'enter' (Ctrl+J newline contract), untouched", () => {
+    const parsed = parseKeys("\n");
+    expect(parsed.keys).toHaveLength(1);
+    expect(parsed.keys[0]?.name).toBe("enter");
+  });
+
+  it("CRLF inside a paste stays a single 'return' between printable runs", () => {
+    const parsed = parseKeys("hello\r\nworld");
     expect(parsed.keys.map((key) => key.name ?? key.sequence)).toEqual(["hello", "return", "world"]);
   });
 

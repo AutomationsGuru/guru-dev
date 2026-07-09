@@ -72,18 +72,29 @@ const REDACTED_SHAPE = "[redacted:secret-shape]";
  */
 const SECRET_KEY_WORD =
   /(?:password|passwd|passphrase|secret|api[_-]?key|apikey|access[_-]?key|secret[_-]?key|access[_-]?token|auth[_-]?token|oauth[_-]?token|client[_-]?secret|credential|private[_-]?key|token)/i;
-const ASSIGNMENT_SCAN = /(^|[\s'"(){}[\],;&|>])([A-Za-z0-9_.-]{1,64})(\s*[:=]\s*)(["']?)([^\s"'`]{4,})/;
+// Quote-aware value branches (C1, critic-bench 2026-07-06): a quoted value may
+// contain spaces (`PASSWORD="long secret tail"`), so the double-/single-quoted
+// branches run to the closing quote (or end of line) instead of stopping at the
+// first space — the old whitespace-bounded class leaked everything after it.
+// The optional ["']? in the separator also covers quoted KEYS (`"password": "..."`).
+// Every branch stays a single bounded class — no nesting, linear on large output.
+const ASSIGNMENT_SCAN =
+  /(^|[\s'"(){}[\],;&|>])([A-Za-z0-9_.-]{1,64})(["']?\s*[:=]\s*)(?:(")([^"\r\n]{4,})|(')([^'\r\n]{4,})|()([^\s"'`]{4,}))/;
 
 /** Redact the VALUE of every secret-word assignment, keeping the key + any opening quote. */
 function scrubAssignments(text: string): { readonly text: string; readonly matched: boolean } {
   let matched = false;
-  const out = text.replace(new RegExp(ASSIGNMENT_SCAN.source, "gm"), (full, lead: string, key: string, sep: string, quote: string) => {
-    if (!SECRET_KEY_WORD.test(key)) {
-      return full;
+  const out = text.replace(
+    new RegExp(ASSIGNMENT_SCAN.source, "gm"),
+    (full, lead: string, key: string, sep: string, dq?: string, _dv?: string, sq?: string, _sv?: string, bq?: string) => {
+      if (!SECRET_KEY_WORD.test(key)) {
+        return full;
+      }
+      matched = true;
+      const quote = dq ?? sq ?? bq ?? "";
+      return `${lead}${key}${sep}${quote}${REDACTED_VALUE}`;
     }
-    matched = true;
-    return `${lead}${key}${sep}${quote}${REDACTED_VALUE}`;
-  });
+  );
   return { text: out, matched };
 }
 

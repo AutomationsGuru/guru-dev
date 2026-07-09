@@ -168,6 +168,29 @@ describe("AgentSession — steering + @-expansion", () => {
     expect(s.queueDepth()).toBe(1); // the steer remains
   });
 
+  it("promptDrainingFollowUps() runs queued follow-ups after the primary prompt", async () => {
+    const submitted: string[] = [];
+    const runner: TurnRunner = (async (_r, messages) => {
+      submitted.push(messages.at(-1)?.content ?? "");
+      return { text: "done", modelId: "m", routeId: "stub/model", apiFamily: "openai-chat-completions", toolCallCount: 0, toolEvents: [] };
+    }) as TurnRunner;
+    const s = makeSession({ runTurn: runner });
+    s.followUp("write the tests next");
+    await s.promptDrainingFollowUps("ship it");
+    expect(submitted).toEqual(["ship it", "write the tests next"]);
+  });
+
+  it("prompt() drains ONLY steers — follow_ups stay queued for takeFollowUps()", async () => {
+    const s = makeSession({ runTurn: stubRunner({ text: "done" }) });
+    s.followUp("write the tests next");
+    s.steer("be terse");
+    await s.prompt("ship it");
+    // Steer was injected into history as a system line; follow-up is still waiting.
+    expect(s.history.some((m) => m.role === "system" && m.content.includes("be terse"))).toBe(true);
+    expect(s.history.some((m) => m.content.includes("write the tests next"))).toBe(false);
+    expect(s.takeFollowUps()).toEqual(["write the tests next"]);
+  });
+
   it("@-expansion inlines file contents into the submitted prompt when the session has a repo", async () => {
     const repoRoot = join(tmpdir(), `guru-as-${process.pid}-${dirs.length}`);
     dirs.push(repoRoot);

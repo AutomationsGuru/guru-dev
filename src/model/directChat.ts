@@ -51,6 +51,13 @@ export interface DirectChatOptions {
   /** Override the model id sent to the API (e.g. a real local ollama model name). */
   readonly modelIdOverride?: string;
   readonly timeoutMs?: number;
+  /**
+   * Operator/session abort signal (review 2026-07-08): when provided, an abort
+   * fires the request's controller immediately instead of waiting for the
+   * timeoutMs ceiling. Previously this one-shot path couldn't be cancelled by
+   * the operator at all — only its own timeout reached the fetch.
+   */
+  readonly signal?: AbortSignal;
 }
 
 export class DirectChatError extends Error {
@@ -446,6 +453,18 @@ export async function directChat(
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? 120000);
+  // Link the caller's abort signal so an operator cancel reaches the in-flight
+  // fetch immediately (review 2026-07-08). Without this, only the timeout could
+  // abort the request — the operator's Esc/Ctrl+C was ignored on this path.
+  const callerSignal = options.signal;
+  const onCallerAbort = (): void => controller.abort();
+  if (callerSignal) {
+    if (callerSignal.aborted) {
+      controller.abort();
+    } else {
+      callerSignal.addEventListener("abort", onCallerAbort, { once: true });
+    }
+  }
 
   try {
     if (apiFamily === "anthropic-messages") {
@@ -520,6 +539,9 @@ export async function directChat(
     };
   } finally {
     clearTimeout(timeout);
+    if (callerSignal) {
+      callerSignal.removeEventListener("abort", onCallerAbort);
+    }
   }
 }
 
@@ -533,10 +555,6 @@ function buildUsage(inputTokens: number | undefined, outputTokens: number | unde
       ...(outputTokens !== undefined ? { outputTokens } : {})
     }
   };
-}
-
-function authHeader(secretValue: string | undefined): Record<string, string> {
-  return secretValue ? { authorization: `Bearer ${secretValue}` } : {};
 }
 
 async function postJson(

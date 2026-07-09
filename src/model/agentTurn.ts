@@ -67,7 +67,12 @@ export interface AgentToolEvent {
 
 export interface AgentTurnOptions extends DirectChatOptions {
   readonly tools: readonly ToolDefinition[];
-  readonly executeTool: (toolId: string, input: unknown) => Promise<ToolObservation>;
+  /**
+   * Execute a tool. The optional signal (review 2026-07-08) carries the turn's
+   * abort so a long-running tool (bash) can kill its child on operator cancel;
+   * call sites that don't care about cancellation ignore it.
+   */
+  readonly executeTool: (toolId: string, input: unknown, signal?: AbortSignal) => Promise<ToolObservation>;
   /** Approval policy: return true to allow execution. Called for EVERY tool call. */
   readonly approveTool: (toolId: string, input: unknown) => boolean | Promise<boolean>;
   readonly onToolEvent?: (event: AgentToolEvent) => void;
@@ -282,8 +287,8 @@ interface FamilyContext {
   readonly bodyExtras: Record<string, unknown>;
   /** Force streaming even without an onToken sink (codex-direct rejects non-stream). */
   readonly requireStreaming: boolean;
-  /** Omit max_output_tokens from the Responses body (codex rejects it). */
-  readonly omitMaxTokens: boolean;
+  /** Omit max_output_tokens from the Responses body (codex rejects it). Flipped on 400 evidence. */
+  omitMaxTokens: boolean;
   readonly secretValue: string | undefined;
   readonly modelId: string;
   readonly maxTokens: number;
@@ -291,7 +296,7 @@ interface FamilyContext {
   readonly declarations: readonly ToolDeclaration[];
   readonly byApiName: ReadonlyMap<string, ToolDeclaration>;
   readonly approveTool: (toolId: string, input: unknown) => boolean | Promise<boolean>;
-  readonly executeTool: (toolId: string, input: unknown) => Promise<ToolObservation>;
+  readonly executeTool: (toolId: string, input: unknown, signal?: AbortSignal) => Promise<ToolObservation>;
   readonly onToolEvent: ((event: AgentToolEvent) => void) | undefined;
   readonly onToken: ((text: string) => void) | undefined;
   readonly onToolPending: ((toolId: string, input: unknown) => void) | undefined;
@@ -344,14 +349,19 @@ async function performToolCall(context: FamilyContext, apiName: string, rawArgum
 
   // Dead-time signal: approved and about to block on the tool result.
   context.onToolPending?.(declaration.toolId, input);
-  const observation = await context.executeTool(declaration.toolId, input);
+  const observation = await context.executeTool(declaration.toolId, input, context.signal);
   const inputPreview = buildInputPreview(input);
   const outputPreview = buildOutputPreview(observation.output);
+  const dryRun = isDryRunObservation(observation.output);
   const event: AgentToolEvent = {
     toolId: declaration.toolId,
     status: observation.status === "succeeded" ? "succeeded" : "failed",
     durationMs: observation.durationMs,
-    ...(observation.error ? { detail: sanitizeErrorMessage(observation.error) } : {}),
+    ...(dryRun
+      ? { detail: DRY_RUN_TOOL_DETAIL }
+      : observation.error
+        ? { detail: sanitizeErrorMessage(observation.error) }
+        : {}),
     ...(inputPreview !== undefined ? { inputPreview } : {}),
     ...(outputPreview !== undefined ? { outputPreview } : {})
   };
@@ -366,6 +376,17 @@ async function performToolCall(context: FamilyContext, apiName: string, rawArgum
     : serialized;
 }
 
+/** Operator-visible label when a tool returned a dry-run payload (bash default). */
+const DRY_RUN_TOOL_DETAIL = "DRY RUN — not executed (approve workspace-write to run for real)";
+
+function isDryRunObservation(output: unknown): boolean {
+  if (typeof output !== "object" || output === null) {
+    return false;
+  }
+  const record = output as Record<string, unknown>;
+  return record.dryRun === true && record.executed === false;
+}
+
 /** Human hint of the call: command line, path, or first short string field. */
 function buildInputPreview(input: unknown): string | undefined {
   if (typeof input !== "object" || input === null) return undefined;
@@ -376,8 +397,12 @@ function buildInputPreview(input: unknown): string | undefined {
     (typeof record.path === "string" && record.path) ||
     (typeof record.targetPath === "string" && record.targetPath) ||
     undefined;
+  const dryPrefix = record.dryRun === true ? "[dry-run] " : "";
 
-  return typeof candidate === "string" && candidate.length > 0 ? candidate.slice(0, 80) : undefined;
+  if (typeof candidate === "string" && candidate.length > 0) {
+    return `${dryPrefix}${candidate.slice(0, 80)}`;
+  }
+  return dryPrefix.length > 0 ? dryPrefix.trim() : undefined;
 }
 
 /** First meaningful lines of the result — stdout/text/summary preferred over raw JSON. */
@@ -412,6 +437,23 @@ function toolCallBudgetExhaustedMessage(): string {
 
 async function runChatCompletionsLoop(context: FamilyContext, messages: readonly ChatTurnMessage[]): Promise<string> {
   type OpenAiToolCall = { id: string; function: { name: string; arguments: string } };
+  // Some OpenAI-compatible providers (Bedrock mantle, certain GLM builds) return
+  // `message.content` as an ARRAY of {type:"text",text:...} blocks instead of a
+  // string. Pushing that array back into the conversation makes the provider 400
+  // on the next turn ("content must be a string"). Normalize to a string at the
+  // boundary (review 2026-07-08).
+  type ContentBlock = { type?: string; text?: string };
+  const normalizeContent = (content: unknown): string => {
+    if (typeof content === "string") {
+      return content;
+    }
+    if (Array.isArray(content)) {
+      return content
+        .map((block) => (typeof block === "object" && block !== null ? String((block as ContentBlock).text ?? "") : ""))
+        .join("");
+    }
+    return "";
+  };
   const conversation: unknown[] = messages.map((message) => ({ role: message.role, content: message.content }));
   const tools = context.declarations.map((declaration) => ({
     type: "function",
@@ -441,7 +483,7 @@ async function runChatCompletionsLoop(context: FamilyContext, messages: readonly
       ...(tools.length > 0 ? { tools } : {})
     };
     let response: {
-      choices?: Array<{ message?: { content?: string | null; tool_calls?: OpenAiToolCall[] } }>;
+      choices?: Array<{ message?: { content?: string | null | ContentBlock[]; tool_calls?: OpenAiToolCall[] } }>;
       usage?: { prompt_tokens?: number; completion_tokens?: number };
     };
     try {
@@ -456,6 +498,10 @@ async function runChatCompletionsLoop(context: FamilyContext, messages: readonly
         iteration -= 1;
         continue;
       }
+      // Mid-stream failure after partial tokens — return what we have, don't torch the turn.
+      if (lastAssistant.length > 0 && isTransientStreamError(error)) {
+        return lastAssistant;
+      }
       throw error;
     }
     context.usage.input += response.usage?.prompt_tokens ?? 0;
@@ -466,18 +512,30 @@ async function runChatCompletionsLoop(context: FamilyContext, messages: readonly
 
     const message = response.choices?.[0]?.message;
     const toolCalls = message?.tool_calls ?? [];
-    if (typeof message?.content === "string" && message.content.length > 0) {
-      lastAssistant = message.content;
+    const assistantText = normalizeContent(message?.content);
+    if (assistantText.length > 0) {
+      lastAssistant = assistantText;
     }
     if (toolCalls.length === 0) {
-      return message?.content ?? "";
+      // Terminal turn: fall back to the last non-empty assistant text when the
+      // final turn is empty (mirrors the anthropic loop fix, review 2026-07-08).
+      return assistantText.length > 0 ? assistantText : lastAssistant;
     }
 
-    conversation.push({ role: "assistant", content: message?.content ?? null, tool_calls: toolCalls });
+    // Push the NORMALIZED string content (never the raw array) so the next turn's
+    // request is valid for every OpenAI-compatible provider (review 2026-07-08).
+    conversation.push({ role: "assistant", content: assistantText || null, tool_calls: toolCalls });
     for (const toolCall of toolCalls) {
       const result =
         toolBudget > 0 ? await performToolCall(context, toolCall.function.name, toolCall.function.arguments) : toolCallBudgetExhaustedMessage();
-      toolBudget -= 1;
+      // Only a REAL (approved + executed) call consumes budget (review 2026-07-08).
+      // A denied/blocked call returns an error string but pushes a "blocked" event;
+      // counting those drained the budget invisibly and the model, told only
+      // "blocked", would retry the same call and exhaust the loop early.
+      const lastEvent = context.events[context.events.length - 1];
+      if (lastEvent && lastEvent.status !== "blocked") {
+        toolBudget -= 1;
+      }
       conversation.push({ role: "tool", tool_call_id: toolCall.id, content: result });
     }
   }
@@ -515,7 +573,7 @@ async function runResponsesLoop(context: FamilyContext, messages: readonly ChatT
       ...(tools.length > 0 ? { tools } : {}),
       ...context.bodyExtras
     };
-    const response = (wantsStreaming(context) ? await streamResponses(context, body) : await postJson(context, "/responses", body)) as {
+    let response: {
       output_text?: string;
       output?: Array<
         | ResponsesFunctionCall
@@ -523,6 +581,22 @@ async function runResponsesLoop(context: FamilyContext, messages: readonly ChatT
       >;
       usage?: { input_tokens?: number; output_tokens?: number };
     };
+    try {
+      response = (wantsStreaming(context) ? await streamResponses(context, body) : await postJson(context, "/responses", body)) as typeof response;
+    } catch (error) {
+      // Auto-adapt: some Responses lanes reject max_output_tokens (codex-class quirks).
+      const message = error instanceof Error ? error.message : String(error);
+      if (!context.omitMaxTokens && /max_output_tokens/iu.test(message)) {
+        context.omitMaxTokens = true;
+        iteration -= 1;
+        continue;
+      }
+      // Mid-stream failure after partial tokens — return what we have, don't torch the turn.
+      if (lastText.length > 0 && isTransientStreamError(error)) {
+        return lastText;
+      }
+      throw error;
+    }
     context.usage.input += response.usage?.input_tokens ?? 0;
     context.usage.output += response.usage?.output_tokens ?? 0;
     // Missing usage keeps the last known request size — deliberate (see chat-completions site).
@@ -541,7 +615,9 @@ async function runResponsesLoop(context: FamilyContext, messages: readonly ChatT
       lastText = responseText;
     }
     if (functionCalls.length === 0) {
-      return responseText;
+      // Terminal turn: fall back to the last non-empty text when the final turn
+      // is empty (mirrors the anthropic/chat-completions fix, review 2026-07-08).
+      return responseText.length > 0 ? responseText : lastText;
     }
 
     for (const item of output) {
@@ -550,7 +626,11 @@ async function runResponsesLoop(context: FamilyContext, messages: readonly ChatT
     for (const functionCall of functionCalls) {
       const result =
         toolBudget > 0 ? await performToolCall(context, functionCall.name, functionCall.arguments) : toolCallBudgetExhaustedMessage();
-      toolBudget -= 1;
+      // Only a REAL (approved + executed) call consumes budget (review 2026-07-08).
+      const lastEvent = context.events[context.events.length - 1];
+      if (lastEvent && lastEvent.status !== "blocked") {
+        toolBudget -= 1;
+      }
       input.push({ type: "function_call_output", call_id: functionCall.call_id, output: result });
     }
   }
@@ -598,20 +678,35 @@ async function runAnthropicLoop(context: FamilyContext, messages: readonly ChatT
     };
     const anthropicHeaders = {
       "anthropic-version": "2023-06-01",
+      // Honor each declared HeaderStyle explicitly (review 2026-07-08): the old
+      // ternary mapped bearer → authorization and EVERYTHING ELSE → x-api-key,
+      // silently rewriting a lane configured `api-key` style (valid per the
+      // HeaderStyle union) into x-api-key, which 401s cryptically.
       ...(context.secretValue
         ? context.headerStyle === "bearer"
           ? { authorization: `Bearer ${context.secretValue}` }
-          : { "x-api-key": context.secretValue }
+          : context.headerStyle === "api-key"
+            ? { "api-key": context.secretValue }
+            : { "x-api-key": context.secretValue }
         : {}),
       ...context.extraHeaders
     };
-    const response = (wantsStreaming(context)
-      ? await streamAnthropicMessages(context, body, anthropicHeaders)
-      : await postJson(context, "/v1/messages", body, anthropicHeaders, false)) as {
+    let response: {
       content?: AnthropicBlock[];
       stop_reason?: string;
       usage?: { input_tokens?: number; output_tokens?: number };
     };
+    try {
+      response = (wantsStreaming(context)
+        ? await streamAnthropicMessages(context, body, anthropicHeaders)
+        : await postJson(context, "/v1/messages", body, anthropicHeaders, false)) as typeof response;
+    } catch (error) {
+      // Mid-stream failure after partial tokens — keep the partial, don't torch the turn.
+      if (lastText.length > 0 && isTransientStreamError(error)) {
+        return lastText;
+      }
+      throw error;
+    }
     context.usage.input += response.usage?.input_tokens ?? 0;
     context.usage.output += response.usage?.output_tokens ?? 0;
     // Missing usage keeps the last known request size — deliberate (see chat-completions site).
@@ -627,7 +722,11 @@ async function runAnthropicLoop(context: FamilyContext, messages: readonly ChatT
       lastText = blockText;
     }
     if (toolUses.length === 0 || response.stop_reason !== "tool_use") {
-      return blockText;
+      // Terminal turn. A common Claude pattern emits the real answer as text on
+      // the tool-requesting turn ("Let me read foo.txt" + tool_use), then ends
+      // on a later turn with empty text. Returning blockText alone gave the user
+      // an empty reply even though lastText holds the answer (review 2026-07-08).
+      return blockText.length > 0 ? blockText : lastText;
     }
 
     conversation.push({ role: "assistant", content: blocks });
@@ -635,7 +734,11 @@ async function runAnthropicLoop(context: FamilyContext, messages: readonly ChatT
     for (const toolUse of toolUses) {
       const result =
         toolBudget > 0 ? await performToolCall(context, toolUse.name ?? "", toolUse.input ?? {}) : toolCallBudgetExhaustedMessage();
-      toolBudget -= 1;
+      // Only a REAL (approved + executed) call consumes budget (review 2026-07-08).
+      const lastEvent = context.events[context.events.length - 1];
+      if (lastEvent && lastEvent.status !== "blocked") {
+        toolBudget -= 1;
+      }
       results.push({ type: "tool_result", tool_use_id: toolUse.id ?? "", content: result });
     }
     conversation.push({ role: "user", content: results });
@@ -656,7 +759,66 @@ interface SseEvent {
   readonly data: string;
 }
 
-async function* sseEvents(response: Response): AsyncGenerator<SseEvent> {
+/** Compose operator abort + per-request timeout into one signal for fetch. */
+function composeRequestSignal(operator: AbortSignal | undefined, timeoutMs: number | undefined): {
+  readonly signal: AbortSignal | undefined;
+  readonly disarm: () => void;
+} {
+  const parts: AbortSignal[] = [];
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  if (operator) {
+    parts.push(operator);
+  }
+  if (timeoutMs !== undefined && timeoutMs > 0) {
+    const controller = new AbortController();
+    timer = setTimeout(() => controller.abort(), timeoutMs);
+    // Don't pin the event loop (or vitest workers) for the full timeout window.
+    if (typeof timer === "object" && timer !== null && "unref" in timer) {
+      (timer as NodeJS.Timeout).unref();
+    }
+    parts.push(controller.signal);
+  }
+  const disarm = (): void => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
+  };
+  if (parts.length === 0) {
+    return { signal: undefined, disarm };
+  }
+  if (parts.length === 1) {
+    return { signal: parts[0], disarm };
+  }
+  // AbortSignal.any is Node 20+ / modern runtimes (engines >= 22).
+  return { signal: AbortSignal.any(parts), disarm };
+}
+
+function isAbortError(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+  const name = (error as { name?: string }).name;
+  if (name === "AbortError" || name === "TimeoutError") {
+    return true;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return /aborted|abort/iu.test(message);
+}
+
+/** Network/reset mid-stream — safe to surface partial text instead of hard-fail. */
+function isTransientStreamError(error: unknown): boolean {
+  if (isAbortError(error)) {
+    return true;
+  }
+  if (error instanceof DirectChatError) {
+    const annotated = error as DirectChatError & { networkFailure?: boolean; aborted?: boolean };
+    return annotated.networkFailure === true || annotated.aborted === true;
+  }
+  return false;
+}
+
+async function* sseEvents(response: Response, signal?: AbortSignal): AsyncGenerator<SseEvent> {
   const body = response.body;
   if (!body) {
     return;
@@ -665,26 +827,46 @@ async function* sseEvents(response: Response): AsyncGenerator<SseEvent> {
   const decoder = new TextDecoder();
   let buffer = "";
 
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) {
-      break;
+  const onAbort = (): void => {
+    void reader.cancel().catch(() => undefined);
+  };
+  if (signal) {
+    if (signal.aborted) {
+      await reader.cancel().catch(() => undefined);
+      return;
     }
-    buffer += decoder.decode(value, { stream: true });
-    let boundary = buffer.indexOf("\n\n");
-    while (boundary !== -1) {
-      const raw = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-      const parsed = parseSseEvent(raw);
-      if (parsed) {
-        yield parsed;
-      }
-      boundary = buffer.indexOf("\n\n");
-    }
+    signal.addEventListener("abort", onAbort, { once: true });
   }
-  const tail = parseSseEvent(buffer);
-  if (tail) {
-    yield tail;
+
+  try {
+    for (;;) {
+      if (signal?.aborted) {
+        break;
+      }
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary !== -1) {
+        const raw = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        const parsed = parseSseEvent(raw);
+        if (parsed) {
+          yield parsed;
+        }
+        boundary = buffer.indexOf("\n\n");
+      }
+    }
+    if (!signal?.aborted) {
+      const tail = parseSseEvent(buffer);
+      if (tail) {
+        yield tail;
+      }
+    }
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
   }
 }
 
@@ -735,23 +917,37 @@ async function openSseResponse(
     return response;
   }
 
-  // retry.provider.timeoutMs bounds TIME-TO-HEADERS on the SSE open too — a
-  // blackholed connection (accepted, never answers) would otherwise hang the
-  // turn forever with the configured timeout doing nothing (adversarial review
-  // 2026-07-05). No retry loop here: the timeout abort lands in the catch below,
-  // which falls back to the policy-carrying non-streaming path.
+  // Operator abort + timeout bound TIME-TO-HEADERS on the SSE open. A blackholed
+  // connection must not hang forever; an operator cancel must reach the fetch.
+  // No retry loop here: abort/timeout lands in the catch below, which falls back
+  // to the policy-carrying non-streaming path (unless the operator cancelled).
   const timeoutMs = context.retry.provider.timeoutMs;
-  const controller = timeoutMs !== undefined ? new AbortController() : undefined;
-  const timer = controller && timeoutMs !== undefined ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
+  const { signal, disarm } = composeRequestSignal(context.signal, timeoutMs);
   let response: Response;
   try {
     response = await context.fetchImpl(url, {
       method: "POST",
       headers,
       body: JSON.stringify(body),
-      ...(controller ? { signal: controller.signal } : {})
+      ...(signal ? { signal } : {})
     });
-  } catch {
+  } catch (error) {
+    disarm();
+    // Operator cancel is not a "try non-streaming" event — rethrow so the turn stops.
+    if (context.signal?.aborted) {
+      throw annotateForRetry(
+        new DirectChatError(`Streaming request aborted: ${sanitizeErrorMessage(error)}`, { routeId: context.routeId }),
+        { aborted: true }
+      );
+    }
+    // Per-request timeout: don't fall through to a non-stream retry (it would just
+    // wait out the same timeout again). Surface it honestly as a terminal timeout.
+    if (isAbortError(error)) {
+      throw annotateForRetry(
+        new DirectChatError(`Streaming request timed out after ${context.retry.provider.timeoutMs}ms (retry.provider.timeoutMs).`, { routeId: context.routeId }),
+        { timeout: true }
+      );
+    }
     // Network-level failure on the streaming request (DNS blip, reset socket).
     // Don't kill the turn: disable streaming and let the caller retry the identical
     // request non-streaming. If the network is truly down, that retry raises its own
@@ -759,14 +955,31 @@ async function openSseResponse(
     context.streamingDisabled = true;
     return null;
   } finally {
-    if (timer) {
-      clearTimeout(timer); // headers arrived; the stream body stays open by design
-    }
+    disarm(); // headers arrived; the stream body stays open by design
   }
 
   if (!response.ok) {
-    // Provider rejected streaming (or the request) — disable streaming and let the
-    // caller retry the identical request non-streaming. Honest fallback, not fake.
+    // Distinguish "provider doesn't support streaming" (a fallback case) from a
+    // real request error (review 2026-07-08). A 405/415/501 on `stream:true` often
+    // means the endpoint rejects SSE — fall back to non-streaming. But a 401/403
+    // (auth) or 400/404 (bad model/path/URL) is a genuine request error: falling
+    // back would silently re-send the identical bad request, doubling latency and
+    // rate-limit hits while obscuring the real first error. Surface those now.
+    const status = response.status;
+    const isStreamingUnsupported = status === 405 || status === 415 || status === 501 || status === 502;
+    if (!isStreamingUnsupported) {
+      const detail = await response.text().catch(() => "");
+      const retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"));
+      throw annotateForRetry(
+        new DirectChatError(`Streaming request failed with HTTP ${status}: ${sanitizeErrorMessage(detail).slice(0, 300)}`, {
+          routeId: context.routeId,
+          status
+        }),
+        { ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) }
+      );
+    }
+    // Provider rejected streaming — disable streaming and let the caller retry the
+    // identical request non-streaming. Honest fallback, not fake.
     context.streamingDisabled = true;
     return null;
   }
@@ -789,7 +1002,7 @@ async function streamChatCompletions(context: FamilyContext, body: Record<string
   const toolCalls = new Map<number, ToolCallAcc>();
   let usage: { prompt_tokens?: number; completion_tokens?: number } | undefined;
 
-  for await (const event of sseEvents(response)) {
+  for await (const event of sseEvents(response, context.signal)) {
     if (event.data === "[DONE]") {
       break;
     }
@@ -864,7 +1077,7 @@ async function streamResponses(context: FamilyContext, body: Record<string, unkn
   let completed: unknown = null;
   let streamedText = "";
 
-  for await (const event of sseEvents(response)) {
+  for await (const event of sseEvents(response, context.signal)) {
     let payload: unknown;
     try {
       payload = JSON.parse(event.data) as unknown;
@@ -899,8 +1112,12 @@ async function streamResponses(context: FamilyContext, body: Record<string, unkn
     }
     return completed;
   }
-  // Stream ended without a completed event — return what streamed as plain text.
-  return { output_text: streamedText };
+  // Stream ended without a completed event — return what streamed as plain text,
+  // with a rough output-token estimate so the turn's usage isn't zeroed (review
+  // 2026-07-08). The compaction TRIGGER (lastRequestInput) is already preserved
+  // upstream via the `?? context.usage.lastRequestInput` fallback; this keeps the
+  // cumulative output count honest instead of silently under-reporting.
+  return { output_text: streamedText, usage: { input_tokens: 0, output_tokens: Math.ceil(streamedText.length / 4) } };
 }
 
 async function streamAnthropicMessages(
@@ -924,7 +1141,7 @@ async function streamAnthropicMessages(
   let stopReason: string | undefined;
   const usage: { input_tokens?: number; output_tokens?: number } = {};
 
-  for await (const event of sseEvents(response)) {
+  for await (const event of sseEvents(response, context.signal)) {
     let payload: unknown;
     try {
       payload = JSON.parse(event.data) as unknown;
@@ -991,6 +1208,10 @@ async function streamAnthropicMessages(
 interface RetryAnnotated {
   networkFailure?: boolean;
   retryAfterMs?: number;
+  /** Operator/session abort — never retry. */
+  aborted?: boolean;
+  /** Per-request timeout fired — terminal (retrying waits out the same timeout again). */
+  timeout?: boolean;
 }
 
 function annotateForRetry(error: DirectChatError, annotation: RetryAnnotated): DirectChatError {
@@ -999,22 +1220,27 @@ function annotateForRetry(error: DirectChatError, annotation: RetryAnnotated): D
 }
 
 /** Maps a thrown request error onto the retry policy's failure shape. */
-function describeRequestFailure(error: unknown): { status?: number; networkError?: boolean; retryAfterMs?: number } {
+function describeRequestFailure(error: unknown): { status?: number; networkError?: boolean; retryAfterMs?: number; aborted?: boolean } {
   if (error instanceof DirectChatError) {
     const annotated = error as DirectChatError & RetryAnnotated;
     return {
       ...(error.details.status !== undefined ? { status: error.details.status } : {}),
       ...(annotated.networkFailure === true ? { networkError: true } : {}),
-      ...(annotated.retryAfterMs !== undefined ? { retryAfterMs: annotated.retryAfterMs } : {})
+      ...(annotated.retryAfterMs !== undefined ? { retryAfterMs: annotated.retryAfterMs } : {}),
+      ...(annotated.aborted === true ? { aborted: true } : {})
     };
+  }
+  if (error && typeof error === "object" && (error as { aborted?: boolean }).aborted === true) {
+    return { aborted: true };
   }
   return {};
 }
 
 /**
- * One provider request with the ADR 2026-07-05 policy: optional per-request
- * timeout (retry.provider.timeoutMs), network failures marked retryable, and
- * Retry-After parsed off non-ok responses for the backoff/fail-fast decision.
+ * One provider request with the ADR 2026-07-05 policy: default per-request
+ * timeout (retry.provider.timeoutMs), operator abort composed into fetch,
+ * network failures marked retryable, aborts never retried, Retry-After parsed
+ * off non-ok responses for the backoff/fail-fast decision.
  *
  * `readBody: true` (non-streaming callers) consumes the body INSIDE the attempt
  * so the timeout covers the whole read — headers-then-hang can't stall the turn
@@ -1032,24 +1258,38 @@ async function fetchWithPolicy(
   return runWithRetryPolicy(
     async () => {
       const timeoutMs = context.retry.provider.timeoutMs;
-      const controller = timeoutMs !== undefined ? new AbortController() : undefined;
-      const timer = controller && timeoutMs !== undefined ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
-      const disarm = (): void => {
-        if (timer) {
-          clearTimeout(timer);
-        }
-      };
+      const { signal, disarm } = composeRequestSignal(context.signal, timeoutMs);
       let response: Response;
       try {
         response = await context.fetchImpl(url, {
           method: "POST",
           headers,
           body: JSON.stringify(body),
-          ...(controller ? { signal: controller.signal } : {})
+          ...(signal ? { signal } : {})
         });
       } catch (error) {
         disarm();
-        // Network level: DNS, reset socket, or our own timeout abort — retryable.
+        // Operator cancel: never retry.
+        if (context.signal?.aborted) {
+          throw annotateForRetry(
+            new DirectChatError(`${failurePrefix} aborted: ${sanitizeErrorMessage(error)}`, { routeId: context.routeId }),
+            { aborted: true }
+          );
+        }
+        // Per-request timeout (review 2026-07-08): the timeout fires a SEPARATE
+        // AbortController (composeRequestSignal), so context.signal is not set.
+        // An abort-style error here with no operator abort means the TIMEOUT
+        // fired — and retrying just waits out the same timeout again (3× = a
+        // multi-minute hang on a blackholed route). Treat it as terminal, not
+        // retryable: annotate with neither networkFailure nor aborted, and tag
+        // it so the error message can say "timed out" instead of "request failed".
+        if (isAbortError(error)) {
+          throw annotateForRetry(
+            new DirectChatError(`${failurePrefix} timed out after ${context.retry.provider.timeoutMs}ms (retry.provider.timeoutMs).`, { routeId: context.routeId }),
+            { timeout: true }
+          );
+        }
+        // Genuine network failure (DNS, reset, connection refused): retryable.
         throw annotateForRetry(
           new DirectChatError(`${failurePrefix} request failed: ${sanitizeErrorMessage(error)}`, { routeId: context.routeId }),
           { networkFailure: true }
@@ -1077,6 +1317,12 @@ async function fetchWithPolicy(
         return { response, bodyText };
       } catch (error) {
         disarm();
+        if (context.signal?.aborted) {
+          throw annotateForRetry(
+            new DirectChatError(`${failurePrefix} body read aborted: ${sanitizeErrorMessage(error)}`, { routeId: context.routeId }),
+            { aborted: true }
+          );
+        }
         // Body read stalled/aborted after 200 headers — transient, retryable.
         throw annotateForRetry(
           new DirectChatError(`${failurePrefix} body read failed: ${sanitizeErrorMessage(error)}`, { routeId: context.routeId }),
@@ -1084,7 +1330,12 @@ async function fetchWithPolicy(
         );
       }
     },
-    { config: context.retry, describeFailure: describeRequestFailure, hooks: context.retryHooks }
+    {
+      config: context.retry,
+      describeFailure: describeRequestFailure,
+      hooks: context.retryHooks,
+      ...(context.signal ? { signal: context.signal } : {})
+    }
   );
 }
 

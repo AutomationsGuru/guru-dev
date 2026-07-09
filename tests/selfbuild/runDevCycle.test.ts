@@ -298,7 +298,11 @@ describe("runDevCycle (P7) — full unattended cycle, REAL stages, only leaf I/O
       // TEST — real discovery of THIS repo's gates, run through a passing stub executor.
       executorOptions: { taskId: "end-to-end", commandExecutor: passExec },
       // SMOKE — the real makeSmokeDeps assembly, capability-smoke stubbed GREEN.
-      smoke: makeSmokeDeps({ runCapabilitySmoke: async () => ({ verdict: "GREEN" }) }),
+      smoke: makeSmokeDeps({
+        runCapabilitySmoke: async () => ({ verdict: "GREEN" }),
+        // E2E uses a stub nucleus; skip the real session self-call (slow on shares).
+        skipSelfCall: true
+      }),
       // REVIEW — the real live-reviewer factory + panel, model stubbed (finds nothing).
       askModel,
       reviewContext: async () => ({ diff: "a real change under review" }),

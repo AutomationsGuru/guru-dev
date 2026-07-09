@@ -28,7 +28,7 @@ describe("composer chrome — pure render", () => {
     const p = createPainter({ level: "truecolor" });
     const hint = strip(composerHintLine(p, ["shift+tab mode"]));
     expect(hint).toContain("/ commands");
-    expect(hint).toContain("esc interrupt");
+    expect(hint).toContain("esc/ctrl+c interrupt");
     expect(hint).toContain("shift+tab mode");
   });
 

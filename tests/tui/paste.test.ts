@@ -26,6 +26,19 @@ describe("bracketed paste — multi-line pastes insert literally, never per-line
     expect(editorText(step.state)).toBe("alpha\nbeta\ngamma");
   });
 
+  it("drops a SINGLE trailing newline (editor-line copy) but keeps intentional blank lines (review 2026-07-08)", () => {
+    // Selecting a whole line in most editors copies its trailing \n. Pasting that
+    // used to create a stray blank buffer line and leave the cursor on it.
+    const single = editorReduce(createEditorState(), { name: "paste", sequence: "print('hi')\n" });
+    expect(single.state.lines).toEqual(["print('hi')"]); // NOT ["print('hi')", ""]
+    expect(single.state.col).toBe(11); // cursor at end of the line, not on a blank
+
+    // A pasted code block with intentional blank lines (two+ trailing \n) is preserved
+    // — only a SINGLE trailing newline is stripped, so "\n\n" at the end stays.
+    const block = editorReduce(createEditorState(), { name: "paste", sequence: "a\n\nb\n\n" });
+    expect(block.state.lines).toEqual(["a", "", "b", "", ""]); // the intentional trailing blank stays
+  });
+
   it("a paste at the cursor preserves the text before and after it", () => {
     let state = createEditorState();
     state = editorReduce(state, { sequence: "XY" }).state; // type XY
