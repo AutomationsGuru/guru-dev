@@ -2,6 +2,29 @@
 
 All notable changes to GuruHarness are documented here.
 
+## [1.4.0] - 2026-07-09
+
+YOLO-by-default agency + preserve-don't-replace — guru acts like a model harness, not a passive Q&A bot — plus the working-stack daily-driver UX/MCP/self-build hardening from the multi-agent integration.
+
+### Added
+
+- **YOLO-by-default identity**: boot default is YOLO (ordinary permission gates lifted); `/yolo off` engages safe mode. Hard edges (spend / destructive / secrets / ecosystem-auth) still escalate in every mode. Banner + status line announce it.
+- **Operating identity rewrite** in the system prompt: WHO YOU ARE, ORIENT YOURSELF, ACT WITHIN THE GUARDRAILS, PRESERVE DON'T REPLACE, BE HONEST.
+- **PRESERVE, DON'T REPLACE** mechanical backstop (`src/mandates/preservation.ts`): a write/edit/`fs.edit.apply` that guts existing content escalates as destructive-class even under YOLO; shared guard on main-turn and swarm worker approval paths.
+- **Working-stack interactive UX**: provider timeouts, mid-turn Esc/steer/follow-up, approval banner (y/a/n/enter/esc), spinner lifecycle, menu + status polish; `/model` keeps history; model drill connectable-first.
+- **MCP attach/client/bridge** and secret-scrubbed stdio JSON-RPC transport (stdin EPIPE-safe; client closed if discovery fails after connect).
+- **Self-build hardening**: REVIEW/TEST timeouts, gated SHIP git delivery with bounded `git` timeout, SMOKE session self-call with abort signal.
+
+### Changed
+
+- Auth header construction honors `bearer` / `api-key` / `x-api-key` consistently in streaming and non-stream paths.
+- Timeout failures are explicit non-retry (`AttemptFailure` / retry policy); shell tools forward `AbortSignal`.
+- Vitest dist build lock no longer swallows real `tsc` errors as lock contention.
+
+### Validation
+
+typecheck / build / **1187 tests** / CI (repo-hygiene + CodeQL + CodeRabbit) green on main.
+
 ## [1.3.0] - 2026-07-07
 
 Native plan/OAuth provider auth — every model runs through guru's own engine, with exactly two auth mechanisms (API key, or a guru-native OAuth login) and **no CLI delegation**.

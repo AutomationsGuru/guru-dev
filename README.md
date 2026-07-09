@@ -3,7 +3,7 @@
 [![CI](https://github.com/AutomationsGuru/guru-dev/actions/workflows/ci.yml/badge.svg)](https://github.com/AutomationsGuru/guru-dev/actions/workflows/ci.yml)
 ![guru harness](https://img.shields.io/badge/guru%20harness-AI%20agent%20harness-8C11E1?labelColor=1A1130&style=flat-square)
 ![node](https://img.shields.io/badge/node-%E2%89%A522-B56EF1?labelColor=1A1130&style=flat-square)
-![tests](https://img.shields.io/badge/tests-1174%20passing-31C48D?labelColor=1A1130&style=flat-square)
+![tests](https://img.shields.io/badge/tests-1187%20passing-31C48D?labelColor=1A1130&style=flat-square)
 ![version](https://img.shields.io/badge/release-v1.4.0-E958BE?labelColor=1A1130&style=flat-square)
 
 **`guru` is a repo-aware terminal agent harness.** `cd` into any project, launch it, connect the model you want — your own provider API keys or a provider subscription/plan — and it does real coding work: reads your code, edits files, runs your tests, and iterates to green, with every action shown and every mutation behind an approval gate.
@@ -49,8 +49,8 @@ And it survives its own turns: near the context window, older history folds into
 
 ```bash
 # Global — from a release tarball (avoids the npm prepare/devDependencies quirk)
-gh release download v1.3.0 --repo AutomationsGuru/guru-dev --pattern "*.tgz"
-npm install -g ./guruharness-1.3.0.tgz
+gh release download v1.4.0 --repo AutomationsGuru/guru-dev --pattern "*.tgz"
+npm install -g ./guruharness-1.4.0.tgz
 
 # As a project dependency (builds via prepare)
 npm install github:AutomationsGuru/guru-dev
@@ -144,7 +144,7 @@ The finished product is written down, present-tense and testable — the pillars
 
 - **P0 — runtime survival: CLOSED** (v0.9.0 compaction, v0.10.0 retry + cancellation). Long and autonomous sessions no longer die.
 - **P1 — daily-driver ergonomics: COMPLETE (v1.0.0).** Composer, typed grep/glob/ls + the bash token optimizer + the render-layer secret sanitizer, @-content expansion + prompt templates + mandate-everywhere (v0.11–v0.13); the **session tree** (v0.14); the **role/capability spine** (typed manifest + verified-only save + re-verify-before-load, v0.15); the **knowledge flywheel** (v0.16); the **enforced 5-phase boot ritual** (v0.17); the **AgentSession engine** + the TUI driving it (v0.18); the **headless RPC surface** (v0.19); **npm publish readiness** (v0.20); the **L0→L3 promotion diagonal** (v0.21); the **per-call approval prompt** (v0.22); **memory scopes** (v0.23); **cross-harness import** (v0.24); **Smart Connections** (v0.25); **bridge skills** (v0.26). Then the hardening pass that closed every acceptance-scenario partial: the **spend hard edge** (v0.27), the **look-ahead governor** (v0.28), the **swarm governor** (v0.29), the **flywheel end-to-end test** (v0.30), the **natural-language role trigger** (v0.31), and **mid-run steer + real abort** (v0.32). **The acceptance board reached 14/14 pass, 0 partial — and v1.0.0 is CUT.** Every core pillar is shipped.
-- **P2/P3 — breadth.** RPC + npm (on the engine), memory scopes, the L0→L3 promotion diagonal, cross-harness import, Smart Connections, and bridge skills — shipped; the dynamic extension loader + hot-reload, themes, the encrypted credential vault (v1.1.0), the **spend-gated self-build developer loop** (`guru self-build-run`, v1.2.0 — a governed build cycle, every model loop bounded and spend as the one hard gate), and **native plan/OAuth provider auth** (v1.3.0 — two auth mechanisms only, ChatGPT/Codex and SuperGrok sign in through guru's OWN flow, the CLI delegate removed) — the post-1.0 track.
+- **P2/P3 — breadth.** RPC + npm (on the engine), memory scopes, the L0→L3 promotion diagonal, cross-harness import, Smart Connections, and bridge skills — shipped; the dynamic extension loader + hot-reload, themes, the encrypted credential vault (v1.1.0), the **spend-gated self-build developer loop** (`guru self-build-run`, v1.2.0 — a governed build cycle, every model loop bounded and spend as the one hard gate), **native plan/OAuth provider auth** (v1.3.0 — two auth mechanisms only, ChatGPT/Codex and SuperGrok sign in through guru's OWN flow, the CLI delegate removed), and **YOLO-by-default agency + preserve-don't-replace** (v1.4.0 — the daily-driver identity and content-preservation guard, plus the working-stack UX/MCP/self-build hardening) — the post-1.0 track.
 
 Explicitly **out of scope**, by design: an external routing sidecar in the loop (on-tap only), SaaS/web/multi-user/billing, and **ungoverned self-improvement** — guru mutating its own constitution or capabilities without gates (constitutionally excluded, not deferred). This is distinct from the v1.2.0 **self-build developer loop**, which is *governed* unattended execution: every stage is mandate- and review-gated, RED blocks ship, and spend is a hard edge YOLO cannot lift — the constitution runs the loop, the loop never edits the constitution.
 
