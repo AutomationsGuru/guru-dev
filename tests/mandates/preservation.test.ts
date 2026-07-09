@@ -74,4 +74,24 @@ describe("assessContentRemoval — PRESERVE, DON'T REPLACE backstop", () => {
   it("ignores an edit with empty oldText (no region to remove)", () => {
     expect(assessContentRemoval("edit", { oldText: "", newText: "" }, NEVER_READ)).toBeNull();
   });
+
+  it("flags fs.edit.apply overwrite that guts a rich file (same as write)", () => {
+    const verdict = assessContentRemoval(
+      "fs.edit.apply",
+      { path: "docs/spec.md", contents: lines(5), mode: "overwrite" },
+      { resolvePath: (p) => `/repo/${p}`, readExisting: () => lines(40) }
+    );
+    expect(verdict).not.toBeNull();
+    expect(verdict?.removedLines).toBe(35);
+  });
+
+  it("ignores fs.edit.apply createOnly — never overwrites", () => {
+    expect(
+      assessContentRemoval(
+        "fs.edit.apply",
+        { path: "docs/spec.md", contents: lines(5), mode: "createOnly" },
+        { resolvePath: (p) => p, readExisting: () => lines(40) }
+      )
+    ).toBeNull();
+  });
 });

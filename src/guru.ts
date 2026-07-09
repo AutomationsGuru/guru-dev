@@ -74,7 +74,7 @@ import { setResolverContext } from "./selfbuild/resolverTool.js";
 import { createLookAheadEngine, type LookAheadEngine } from "./lookahead/engine.js";
 import { createForkEnumerator } from "./lookahead/forks.js";
 import { createMandateStore, type MandateStore } from "./mandates/store.js";
-import { evaluateToolMandate, MANDATE_READ_ONLY_TOOLS } from "./mandates/evaluate.js";
+import { evaluateToolMandate, MANDATE_READ_ONLY_TOOLS, type MandateDecision } from "./mandates/evaluate.js";
 import { HARD_EDGE_VERBS, type MandateState, type MandateVerb } from "./mandates/schema.js";
 import { resolveApproval, type ApprovalChoice, type ApprovalRequest } from "./mandates/approval.js";
 import { assessContentRemoval } from "./mandates/preservation.js";
@@ -349,6 +349,49 @@ function runFlywheelAtPark(roleSlug: string, earnedTools: readonly string[], use
   }
   const levels = promoted > 0 || demoted > 0 ? ` · ${promoted} promoted · ${demoted} demoted` : "";
   return `${extracted} learned · ${cited} cited · ${pruned} pruned${levels}${flagged > 0 ? ` · ${flagged} to review` : ""}`;
+}
+
+/**
+ * PRESERVE, DON'T REPLACE mechanical backstop shared by main-turn and swarm
+ * approveTool paths. Escalates gutting write/edit/fs.edit.apply to destructive.
+ */
+function applyPreservationGuard(
+  decision: MandateDecision,
+  toolId: string,
+  input: unknown,
+  defaultRepoRoot: string
+): MandateDecision {
+  if (decision.outcome === "deny") {
+    return decision;
+  }
+  const removal = assessContentRemoval(toolId, input, {
+    resolvePath: (p) => {
+      const record = typeof input === "object" && input !== null ? (input as Record<string, unknown>) : {};
+      const root =
+        typeof record.repoRoot === "string" && record.repoRoot.length > 0 ? record.repoRoot : defaultRepoRoot;
+      return resolvePath(root, p);
+    },
+    readExisting: (abs) => {
+      try {
+        return readFileSync(abs, "utf8");
+      } catch (error) {
+        // Only a genuinely missing file is "brand new"; other errors must not
+        // silently skip the guard (EACCES / EISDIR / I/O).
+        if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+          return null;
+        }
+        throw error;
+      }
+    }
+  });
+  if (!removal) {
+    return decision;
+  }
+  return {
+    outcome: "escalate",
+    reason: `content preservation — ${removal.reason}`,
+    verbs: decision.verbs.includes("destructive") ? decision.verbs : [...decision.verbs, "destructive"]
+  };
 }
 
 /** Base tools that need repoRoot injected from the live session's repo context. */
@@ -3809,29 +3852,7 @@ async function chatTurn(state: GuruState, text: string): Promise<void> {
         // is a destructive-class action — force the "are you sure this needs to go?"
         // double-check even when YOLO or a standing grant would pass it silently. The
         // behavioral rule lives in the system prompt; this is its mechanical backstop.
-        if (decision.outcome !== "deny") {
-          const removal = assessContentRemoval(toolId, input, {
-            resolvePath: (p) => {
-              const record = typeof input === "object" && input !== null ? (input as Record<string, unknown>) : {};
-              const root = typeof record.repoRoot === "string" && record.repoRoot.length > 0 ? record.repoRoot : session?.repo?.repoRoot ?? process.cwd();
-              return resolvePath(root, p);
-            },
-            readExisting: (abs) => {
-              try {
-                return readFileSync(abs, "utf8");
-              } catch {
-                return null;
-              }
-            }
-          });
-          if (removal) {
-            decision = {
-              outcome: "escalate",
-              reason: `content preservation — ${removal.reason}`,
-              verbs: decision.verbs.includes("destructive") ? decision.verbs : [...decision.verbs, "destructive"]
-            };
-          }
-        }
+        decision = applyPreservationGuard(decision, toolId, input, session?.repo?.repoRoot ?? process.cwd());
         // Per-call approval (v0.22): a standing mandate/YOLO allows silently; an
         // escalation PROMPTS the operator (y/N/always), and a hard edge prompts
         // every time regardless of a session grant.
@@ -4333,7 +4354,7 @@ export async function runGuru(): Promise<void> {
             if (request.mode === "read-only") {
               return false; // scouts cannot mutate, by construction
             }
-            const decision = evaluateToolMandate(toolId, input, {
+            let decision = evaluateToolMandate(toolId, input, {
               cwd: session.repo?.repoRoot ?? process.cwd(),
               // The SNAPSHOTTED mandate (frozen at spawn), not live state.
               state: workerMandate,
@@ -4341,6 +4362,9 @@ export async function runGuru(): Promise<void> {
               // WITHOUT the parent's YOLO — hard edges + denies bind for workers.
               yolo: false
             });
+            // Same PRESERVE, DON'T REPLACE backstop as the main turn — gutting
+            // escalates to destructive (hard edge), so workers deny without a prompt.
+            decision = applyPreservationGuard(decision, toolId, input, session.repo?.repoRoot ?? process.cwd());
             // Workers never PROMPT (they can't block on a keypress). An escalation is
             // allowed only if the operator had session-approved the verbs AT SPAWN, and
             // never for a hard edge — otherwise it is denied.

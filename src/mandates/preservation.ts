@@ -88,10 +88,15 @@ export function assessContentRemoval(toolId: string, input: unknown, probe: Pres
     return assessGutting(oldText, newText, "edit");
   }
 
-  if (toolId === "write") {
+  // Full-file overwrite tools share the same gutting probe.
+  if (toolId === "write" || toolId === "fs.edit.apply") {
     const path = typeof record.path === "string" ? record.path : "";
     const contents = typeof record.contents === "string" ? record.contents : "";
     if (path.length === 0) {
+      return null;
+    }
+    // createOnly never overwrites existing content.
+    if (toolId === "fs.edit.apply" && record.mode === "createOnly") {
       return null;
     }
     const before = probe.readExisting(probe.resolvePath(path));
