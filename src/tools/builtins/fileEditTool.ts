@@ -45,7 +45,9 @@ export function createFileEditTool(
   return {
     id: "fs.edit.apply",
     title: "Apply bounded file edit",
-    description: "Create or overwrite a file inside a repository after path and secret-policy checks. Dry-run is the default.",
+    description:
+      "Create or overwrite a file inside a repository after path and secret-policy checks (dry-run default). " +
+      "PRESERVE, DON'T REPLACE: on overwrite, default to improving, enhancing, clarifying, or expanding — ask whether anything really needs to go (yes/no) and whether it can be enriched instead (yes/no) before cutting. A substantial content cut is double-checked even in YOLO.",
     inputSchema: FileEditToolInputSchema,
     outputSchema: FileEditToolOutputSchema,
     async execute(input) {

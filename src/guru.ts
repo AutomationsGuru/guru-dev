@@ -74,9 +74,10 @@ import { setResolverContext } from "./selfbuild/resolverTool.js";
 import { createLookAheadEngine, type LookAheadEngine } from "./lookahead/engine.js";
 import { createForkEnumerator } from "./lookahead/forks.js";
 import { createMandateStore, type MandateStore } from "./mandates/store.js";
-import { evaluateToolMandate, MANDATE_READ_ONLY_TOOLS } from "./mandates/evaluate.js";
+import { evaluateToolMandate, MANDATE_READ_ONLY_TOOLS, type MandateDecision } from "./mandates/evaluate.js";
 import { HARD_EDGE_VERBS, type MandateState, type MandateVerb } from "./mandates/schema.js";
 import { resolveApproval, type ApprovalChoice, type ApprovalRequest } from "./mandates/approval.js";
+import { assessContentRemoval } from "./mandates/preservation.js";
 import {
   estimateTranscriptTokens,
   runCompaction,
@@ -91,9 +92,9 @@ import {
 } from "./compaction/index.js";
 import type { RetryConfig } from "./model/retryPolicy.js";
 import { randomUUID } from "node:crypto";
-import { readdirSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { basename, join } from "node:path";
+import { basename, join, resolve as resolvePath } from "node:path";
 import { createPainter, loadTheme, type Painter } from "./tui/theme.js";
 import { renderSplash } from "./tui/splash.js";
 import { badge, compactMark, GLYPHS, renderTable, roundedBox, spinnerFrame, visibleWidth } from "./tui/components.js";
@@ -226,8 +227,17 @@ interface GuruCompactionState {
   noopEstimate: number | null;
 }
 
-const SYSTEM_PROMPT =
-  "You are GuruHarness, a repo-aware agent harness running in the user's terminal. You have registered tools — USE them to answer questions about the repository, environment, skills, memory, or readiness instead of guessing. Answer concisely and honestly about what is and is not implemented.";
+const SYSTEM_PROMPT = `You are Guru — an autonomous engineering agent running in the operator's terminal. You are not a chat assistant and not an automation script. You have the tools, the skill, and the mandate to do real work in whatever environment you are dropped into, and you are trusted to use them.
+
+WHO YOU ARE. The operator gives you intent and a little guidance; you supply the reasoning, the exploration, and the execution. Lean on your own intelligence — think, plan, figure things out, and improve both the work and the environment around you. You are past being used for mere automation; you are here to reason, build, and make things better.
+
+ORIENT YOURSELF. When you land in an environment, find out what you are working with before you act — because you know you will need it. Explore the repo, and discover what the environment offers you: environment variables, installed CLIs and apps, API keys and credentials, AGENTS.md / CLAUDE.md / config files, available skills, memory, and other agents or services. Use your tools to look — never guess when you can check — then turn what you find into leverage for the task in front of you.
+
+ACT WITHIN THE GUARDRAILS. You run in YOLO by default: if a task is technically possible and you have been asked to do it, do it — do not stop to ask permission and do not wait to be walked through it. Your only hard boundaries are the constitution's hard edges — spending money, destructive or irreversible actions, and writing secrets or auth credentials — which stop and confirm every time, in every mode. Everything inside those edges is yours to do.
+
+PRESERVE, DON'T REPLACE. Content exists for a reason. Your default with any document or code is to improve, enhance, clarify, or expand it — never to summarize it down, cut it, or overwrite it with your own shorter interpretation. This is the cardinal rule: you do not read something, form an interpretation, and replace the original with that interpretation. Detail you do not yet understand is likely there on purpose. Before removing anything, ask: is there a specific, valid reason this needs to go — is it wrong, obsolete, or explicitly asked to be removed? If the answer is no, do not remove it; clarify or enrich it instead so its purpose becomes unmistakable. Deletion and wholesale replacement are for genuine use cases only, and they deliberately trip the destructive guardrail — a double-check ("are you sure this needs to go?"), which you welcome rather than route around. Your standing mindset is to BUILD: a better environment, better files, better skills, better tools. Whenever you touch something, leave it clearer and stronger than you found it — never thinner. Each time you reach for write or delete, run the two questions: does this really need to go? and can it instead be enhanced, improved, or clarified?
+
+BE HONEST. Report what you actually did and what you actually found. If something failed, say so with the evidence; distinguish what is implemented from what is not; never fabricate a result or paper over a gap. Use your registered tools to answer questions and do work — about the repository, the environment, skills, memory, or readiness — instead of guessing.`;
 
 /**
  * Memory organ (Foundation Wave PR 2): guru's own handle on the global file
@@ -341,6 +351,49 @@ function runFlywheelAtPark(roleSlug: string, earnedTools: readonly string[], use
   return `${extracted} learned · ${cited} cited · ${pruned} pruned${levels}${flagged > 0 ? ` · ${flagged} to review` : ""}`;
 }
 
+/**
+ * PRESERVE, DON'T REPLACE mechanical backstop shared by main-turn and swarm
+ * approveTool paths. Escalates gutting write/edit/fs.edit.apply to destructive.
+ */
+function applyPreservationGuard(
+  decision: MandateDecision,
+  toolId: string,
+  input: unknown,
+  defaultRepoRoot: string
+): MandateDecision {
+  if (decision.outcome === "deny") {
+    return decision;
+  }
+  const removal = assessContentRemoval(toolId, input, {
+    resolvePath: (p) => {
+      const record = typeof input === "object" && input !== null ? (input as Record<string, unknown>) : {};
+      const root =
+        typeof record.repoRoot === "string" && record.repoRoot.length > 0 ? record.repoRoot : defaultRepoRoot;
+      return resolvePath(root, p);
+    },
+    readExisting: (abs) => {
+      try {
+        return readFileSync(abs, "utf8");
+      } catch (error) {
+        // Only a genuinely missing file is "brand new"; other errors must not
+        // silently skip the guard (EACCES / EISDIR / I/O).
+        if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+          return null;
+        }
+        throw error;
+      }
+    }
+  });
+  if (!removal) {
+    return decision;
+  }
+  return {
+    outcome: "escalate",
+    reason: `content preservation — ${removal.reason}`,
+    verbs: decision.verbs.includes("destructive") ? decision.verbs : [...decision.verbs, "destructive"]
+  };
+}
+
 /** Base tools that need repoRoot injected from the live session's repo context. */
 const REPO_ROOT_TOOL_IDS: ReadonlySet<string> = new Set(["read", "write", "edit", "bash", "grep", "glob", "ls"]);
 
@@ -428,7 +481,7 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = [
   { name: "/logout", usage: "/logout <provider>", description: "How to disconnect a provider (guru holds no token file)" },
   { name: "/tools", usage: "/tools", description: "List live session tools" },
   { name: "/mandate", usage: "/mandate [grant space|machine <verbs> | list | revoke]", description: "Standing permission grants (this repo/computer is yours)" },
-  { name: "/yolo", usage: "/yolo [on|off]", description: "YOLO mode: lift all permission gates (explicit ritual)" },
+  { name: "/yolo", usage: "/yolo [on|off]", description: "YOLO is the default; /yolo off engages safe mode (hard edges always hold)" },
   { name: "/clear", usage: "/clear", description: "Clear the screen" },
   { name: "/exit", usage: "/exit | /quit | ctrl+d", description: "Leave the harness" }
 ];
@@ -621,6 +674,7 @@ function banner(): string {
     splash.trimEnd(),
     "",
     paint.fg("muted", `  build ${resolveBuildStamp()} · agentic tools · streaming · resumable sessions`),
+    `  ${paint.fg("warning", "⚡ YOLO")} ${paint.fg("muted", "— the default. Guru does the job; it never pauses for permission. Only spend, destructive & secret/auth actions stop to ask. /yolo off for safe mode.")}`,
     paint.fg("muted", "  /help commands · /model connect a model · /resume continue a session · ctrl+d exit"),
     ""
   ].join("\n");
@@ -1855,21 +1909,22 @@ function cmdMandate(state: GuruState, args: readonly string[]): void {
 }
 
 function cmdYolo(state: GuruState, args: readonly string[]): void {
+  // YOLO is guru's DEFAULT, not an opt-in ritual. The only toggle is DISABLING it (safe
+  // mode); re-enabling just returns to the baseline. Hard edges hold in every mode.
   const arg = (args[0] ?? "").toLowerCase();
   if (arg === "off") {
     state.yolo = false;
-    print(colorize(theme, "green", "YOLO disabled. Standing mandates + hard-edge prompts back in force."));
+    print(colorize(theme, "green", "Safe mode ON — ordinary permission gates restored (per-call prompts + standing mandates)."));
+    print(dim(theme, "  This is the leash, not the default. /yolo on to return to YOLO (guru's baseline)."));
     return;
   }
-  if (arg !== "on") {
-    print(dim(theme, "YOLO lifts EVERY permission gate: if it exists on this computer, the model may use it."));
-    print(dim(theme, "The secret-value output law and the self-mutation gates (validation/CodeRabbit) still hold."));
-    print(dim(theme, "To confirm, type exactly:  /yolo on"));
+  if (arg === "on" || arg === "") {
+    state.yolo = true;
+    print(colorize(theme, "yellow", "⚡ YOLO — the default. Ordinary permission gates lifted."));
+    print(dim(theme, "  Hard edges — destructive / spend / secrets-adjacent / ecosystem-auth — STILL prompt every time. /yolo off for safe mode."));
     return;
   }
-  state.yolo = true;
-  print(colorize(theme, "yellow", "⚠ YOLO MODE ON — ordinary permission gates lifted for this session."));
-  print(dim(theme, "  Hard edges — destructive / spend / secrets-adjacent / ecosystem-auth — STILL prompt every time. /yolo off to restore."));
+  print(dim(theme, `YOLO is ${state.yolo ? "ON (the default)" : "OFF (safe mode)"}. Use /yolo off for safe mode, /yolo on for YOLO.`));
 }
 
 function cmdLookahead(state: GuruState, args: readonly string[]): void {
@@ -3788,11 +3843,16 @@ async function chatTurn(state: GuruState, text: string): Promise<void> {
         if (READ_ONLY_TOOL_IDS.has(toolId) || MANDATE_READ_ONLY_TOOLS.has(toolId)) {
           return true;
         }
-        const decision = evaluateToolMandate(toolId, input, {
+        let decision = evaluateToolMandate(toolId, input, {
           cwd: session?.repo?.repoRoot ?? process.cwd(),
           state: state.mandate,
           yolo: state.yolo
         });
+        // PRESERVE, DON'T REPLACE (THERE §12): a write/edit that GUTS existing content
+        // is a destructive-class action — force the "are you sure this needs to go?"
+        // double-check even when YOLO or a standing grant would pass it silently. The
+        // behavioral rule lives in the system prompt; this is its mechanical backstop.
+        decision = applyPreservationGuard(decision, toolId, input, session?.repo?.repoRoot ?? process.cwd());
         // Per-call approval (v0.22): a standing mandate/YOLO allows silently; an
         // escalation PROMPTS the operator (y/N/always), and a hard edge prompts
         // every time regardless of a session grant.
@@ -4177,7 +4237,10 @@ export async function runGuru(): Promise<void> {
     sessionApprovals: new Set<MandateVerb>(),
     mandateStore,
     mandate: mandateStore.load(),
-    yolo: false,
+    // YOLO is the DEFAULT baseline (guru's design intent): ordinary gates lifted from the
+    // start; the constitution's hard edges (destructive/spend/secrets/ecosystem-auth) still
+    // escalate in every mode. `/yolo off` engages safe mode — the opt-IN leash, not YOLO.
+    yolo: true,
     activeRole: null,
     toolsUsed: new Set<string>(),
     lookahead,
@@ -4291,7 +4354,7 @@ export async function runGuru(): Promise<void> {
             if (request.mode === "read-only") {
               return false; // scouts cannot mutate, by construction
             }
-            const decision = evaluateToolMandate(toolId, input, {
+            let decision = evaluateToolMandate(toolId, input, {
               cwd: session.repo?.repoRoot ?? process.cwd(),
               // The SNAPSHOTTED mandate (frozen at spawn), not live state.
               state: workerMandate,
@@ -4299,6 +4362,9 @@ export async function runGuru(): Promise<void> {
               // WITHOUT the parent's YOLO — hard edges + denies bind for workers.
               yolo: false
             });
+            // Same PRESERVE, DON'T REPLACE backstop as the main turn — gutting
+            // escalates to destructive (hard edge), so workers deny without a prompt.
+            decision = applyPreservationGuard(decision, toolId, input, session.repo?.repoRoot ?? process.cwd());
             // Workers never PROMPT (they can't block on a keypress). An escalation is
             // allowed only if the operator had session-approved the verbs AT SPAWN, and
             // never for a hard edge — otherwise it is denied.

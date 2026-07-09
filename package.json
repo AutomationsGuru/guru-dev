@@ -1,6 +1,6 @@
 {
   "name": "guruharness",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Independent, zero-framework agent harness for repo-aware coding agents — one importable AgentSession engine behind a TUI, an in-process SDK, and a headless JSONL RPC surface.",
   "private": false,
   "type": "module",
