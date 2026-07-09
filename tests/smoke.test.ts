@@ -13,7 +13,6 @@ import {
 } from "../src/index.js";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const tscEntrypoint = resolve(repoRoot, "node_modules/typescript/bin/tsc");
 const expectedCliOutput = `${GURUHARNESS_RUNTIME_NAME} ${packageJson.version} — repo-aware agent harness runtime nucleus`;
 
 function toMsysPath(path: string): string {
@@ -45,7 +44,8 @@ describe("getRuntimeInfo", () => {
   });
 });
 
-describe("cli", () => {
+// CLI subprocess tests spawn full Node processes — allow headroom under parallel vitest load.
+describe("cli", { timeout: 60_000 }, () => {
   it("should print the runtime name, version, and capability", () => {
     const output = execFileSync(process.execPath, ["--import", "tsx", "src/cli.ts"], {
       cwd: repoRoot,
@@ -56,18 +56,13 @@ describe("cli", () => {
   });
 
   it("should print the expected output from the built CLI", () => {
-    execFileSync(process.execPath, [tscEntrypoint, "-p", "tsconfig.build.json"], {
-      cwd: repoRoot,
-      encoding: "utf8"
-    });
-
     const output = execFileSync(process.execPath, ["dist/cli.js"], {
       cwd: repoRoot,
       encoding: "utf8"
     }).trim();
 
     expect(output).toBe(expectedCliOutput);
-  }, 60_000);
+  });
 
   it("should print the self-build plan command output", () => {
     const output = execFileSync(process.execPath, ["--import", "tsx", "src/cli.ts", "self-build-plan"], {

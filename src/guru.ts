@@ -36,6 +36,15 @@ import { createSessionLogStore, type ReconstructedSession, type SessionLineage, 
 import { importExternalSession, type ForeignHarness } from "./guru/importSession.js";
 import { detectSuitIntent, formatTodayLine } from "./guru/launchContext.js";
 import { buildSessionTree, type TreeFilter } from "./guru/sessionTree.js";
+import {
+  abortTurnMessage,
+  emptyTurnMessage,
+  preserveHistoryOnModelSwitch,
+  turnFailureTip,
+  emptyTurnFollowUpTip
+} from "./guru/turnMessages.js";
+
+export { preserveHistoryOnModelSwitch } from "./guru/turnMessages.js";
 import { createFileMemoryStore } from "./memory/store.js";
 import { mergeScopedBootInjection } from "./memory/inject.js";
 import { buildRecallIndex, queryRecall } from "./memory/recall.js";
@@ -161,6 +170,11 @@ interface GuruState {
   toolsUsed: Set<string>;
   lookahead: LookAheadEngine;
   busy: boolean;
+  /**
+   * True while a per-call approval prompt is waiting for y/N/a. Suppresses mid-turn
+   * steer accumulation so the approval keypress doesn't become a steer draft.
+   */
+  awaitingApproval: boolean;
   /** The encrypted credential vault (env-var alternative). Mutated by /keys. */
   vault: Vault;
   store: SessionLogStore;
@@ -182,6 +196,14 @@ interface GuruState {
   sessionNumber: number;
   /** The unified turn engine (Engine Extraction v0.18b): the TUI drives THIS. */
   agentSession: AgentSession | null;
+  /** Per-turn abort controller (§17 S13 / daily-driver Ctrl+C). Set at the top of
+   * chatTurn and tripped by the composer interrupt handler. Lives alongside
+   * agentSession.currentAbort because the delegated turn (Codex/Grok CLI) does not
+   * go through AgentSession — it needs its own signal to kill the child process. */
+  turnAbortController: AbortController | null;
+  /** One-time warnings shown this session (avoid noise on every turn). */
+  shownTruncationWarning: boolean;
+  shownDelegateTruncationWarning: boolean;
 }
 
 /** Retry indicator (checklist P0): attempt N/M · delay · reason, compaction-style. */
@@ -421,21 +443,173 @@ export function parseSlashCommand(line: string): { command: string; args: readon
   return { command: command.toLowerCase(), args };
 }
 
+/**
+ * Commands whose side-effects are too costly to fire from a fuzzy match —
+ * auto-execute must require the operator to type the FULL name (the
+ * `Did you mean` hint is shown instead). Review 2026-07-08 expanded this list
+ * past just /exit to cover OAuth, vault edits, mode flips, branch operations,
+ * and compaction (which destroys durable history on close).
+ */
+export const SLASH_NO_GUESS_RUN: ReadonlySet<string> = new Set([
+  "/exit", "/quit", "/clear", "/new",
+  "/logout", "/login", "/keys",
+  "/mandate", "/yolo", "/fork", "/clone",
+  "/compact", "/settings", "/lookahead"
+]);
+
+export type SlashGuessVerdict =
+  | { readonly kind: "exact"; readonly command: string }
+  | { readonly kind: "auto-run"; readonly command: string }
+  | { readonly kind: "blocked"; readonly command: string; readonly reason: "no-guess-run" }
+  | { readonly kind: "weak-match"; readonly command: string; readonly reason: "substring-or-description" }
+  | { readonly kind: "no-match" };
+
+/**
+ * Decide what Enter should do when the operator submits a slash line.
+ * Pure, exported so tests can lock the policy without spinning up the REPL.
+ *
+ *   "/mo"    → { kind: "auto-run", command: "/model" }
+ *   "/exit"  → { kind: "exact",     command: "/exit" }        (runs)
+ *   "/exi"   → { kind: "blocked",   command: "/exit", reason: "no-guess-run" }
+ *   "/logi"  → { kind: "blocked",   command: "/login", reason: "no-guess-run" }
+ *   "/logout"→ { kind: "exact",     command: "/logout" }      (runs — operator typed it in full)
+ *   "/model" → { kind: "exact",     command: "/model" }
+ *   "/banana"→ { kind: "no-match" }
+ */
+export function evaluateSlashGuess(input: { readonly command: string; readonly args: readonly string[] }): SlashGuessVerdict {
+  const term = input.command.toLowerCase();
+  const guess = filterSlashCommands(term)[0];
+  if (guess === undefined) {
+    return { kind: "no-match" };
+  }
+  const exact = guess.name.toLowerCase() === term;
+  if (exact) {
+    return { kind: "exact", command: guess.name };
+  }
+  const needle = term.startsWith("/") ? term.slice(1) : term;
+  const isPrefix = needle.length > 0 && guess.name.toLowerCase().startsWith(term);
+  if (SLASH_NO_GUESS_RUN.has(guess.name)) {
+    return { kind: "blocked", command: guess.name, reason: "no-guess-run" };
+  }
+  if (!isPrefix) {
+    return { kind: "weak-match", command: guess.name, reason: "substring-or-description" };
+  }
+  return { kind: "auto-run", command: guess.name };
+}
+
 /** Pick the route a bare `/model <selector>` refers to: exact routeId, 1-based index, or providerId prefix. */
 export function resolveRouteSelector(routes: readonly ProviderRouteDescriptor[], selector: string): ProviderRouteDescriptor | undefined {
   const byId = routes.find((route) => route.routeId === selector);
   if (byId) {
     return byId;
   }
-  const index = Number.parseInt(selector, 10);
-  if (Number.isInteger(index) && index >= 1 && index <= routes.length) {
+  // Reject non-canonical numeric input (e.g. "1.5", "01", "0", "-1") — silently
+  // truncating would surprise the operator and switch to the wrong route.
+  const isNumeric = /^[1-9][0-9]*$/u.test(selector);
+  const index = isNumeric ? Number.parseInt(selector, 10) : NaN;
+  if (isNumeric && index >= 1 && index <= routes.length) {
     return sortedRoutes(routes)[index - 1];
   }
-  return sortedRoutes(routes).find((route) => route.providerId === selector || route.routeId.startsWith(`${selector}/`));
+  // Provider-id match — but only when UNAMBIGUOUS (review 2026-07-08): `/model
+  // anthropic` with 4 anthropic routes used to silently connect to whichever
+  // sorted first. With multiple matches, return undefined so the caller's
+  // "no route matches" message nudges the operator to be specific (/model to list).
+  const providerMatches = sortedRoutes(routes).filter((route) => route.providerId === selector || route.routeId.startsWith(`${selector}/`));
+  return providerMatches.length === 1 ? providerMatches[0] : undefined;
 }
 
 export function sortedRoutes(routes: readonly ProviderRouteDescriptor[]): readonly ProviderRouteDescriptor[] {
   return [...routes].sort((a, b) => a.directFirstRank - b.directFirstRank || a.routeId.localeCompare(b.routeId));
+}
+
+export type RouteConnectMode = "direct" | "none";
+
+export interface RouteConnectAssessment {
+  readonly connectable: boolean;
+  readonly mode: RouteConnectMode;
+  readonly reason: string;
+  readonly credentialUsable: boolean;
+}
+
+/**
+ * Whether an operator can actually chat on this route right now — shared by
+ * `/model` drill ranking and `cmdModelConnect` so the menu and connect agree.
+ * v1.3.0: no CLI delegate — plan/OAuth lanes must be direct-ready (vaulted token).
+ */
+export function assessRouteConnectability(route: ProviderRouteDescriptor): RouteConnectAssessment {
+  if (!isChatCapableFamily(route.apiFamily)) {
+    return {
+      connectable: false,
+      mode: "none",
+      reason: `not chat-capable (${route.apiFamily ?? "unknown"})`,
+      credentialUsable: false
+    };
+  }
+
+  const credential = resolveRouteCredential(route);
+  const directReady = route.baseUrl !== undefined && credential.usable;
+  if (isOperatorAuthRoute(route) && !directReady) {
+    const presence = resolveOperatorAuthPresence(route);
+    const loginName = route.providerId.replace(/-direct$/u, "");
+    return {
+      connectable: false,
+      mode: "none",
+      reason: presence.present
+        ? `not signed in to guru vault — /login ${loginName}`
+        : presence.summary,
+      credentialUsable: false
+    };
+  }
+
+  if (!credential.usable) {
+    return { connectable: false, mode: "none", reason: credential.reason, credentialUsable: false };
+  }
+  return { connectable: true, mode: "direct", reason: credential.reason, credentialUsable: true };
+}
+
+/** Crush-style /model drill: chat-capable routes, connectable first, capped tail of dead rows. */
+export function buildModelDrillMenuItems(
+  routes: readonly ProviderRouteDescriptor[],
+  options: { readonly connectedRouteId?: string; readonly maxUnavailable?: number } = {}
+): MenuItem[] {
+  const connectedId = options.connectedRouteId;
+  const maxUnavailable = options.maxUnavailable ?? 12;
+  const ranked = sortedRoutes(routes)
+    .filter((route) => isChatCapableFamily(route.apiFamily))
+    .map((route) => ({ route, assessment: assessRouteConnectability(route) }));
+
+  const connectedRow = connectedId ? ranked.find((row) => row.route.routeId === connectedId) : undefined;
+  const rest = ranked.filter((row) => row.route.routeId !== connectedId);
+  const connectable = rest.filter((row) => row.assessment.connectable);
+  const unavailable = rest.filter((row) => !row.assessment.connectable);
+
+  const sortKey = (a: (typeof ranked)[number], b: (typeof ranked)[number]): number =>
+    a.route.directFirstRank - b.route.directFirstRank || a.route.routeId.localeCompare(b.route.routeId);
+
+  // Connected route always leads the list (even if currently not connectable — e.g. token expired).
+  const ordered = [
+    ...(connectedRow ? [connectedRow] : []),
+    ...connectable.sort(sortKey),
+    ...unavailable.sort(sortKey).slice(0, maxUnavailable)
+  ];
+  if (ordered.length === 0) {
+    return [{ id: "/model", label: "(no chat-capable routes in catalog)", hint: "/login · /keys · check env" }];
+  }
+
+  return ordered.map(({ route, assessment }) => {
+    const status = String(route.status ?? "");
+    const isConnected = route.routeId === connectedId;
+    let hint = formatRouteMenuHint(status, {
+      connected: isConnected,
+      usable: assessment.connectable
+    });
+    if (!assessment.connectable) {
+      const short = assessment.reason.length > 42 ? `${assessment.reason.slice(0, 41)}…` : assessment.reason;
+      // Keep "← connected" even when the current session route needs re-login.
+      hint = isConnected ? `← connected · ${short}` : short;
+    }
+    return { id: `/model ${route.routeId}`, label: route.routeId, hint };
+  });
 }
 
 function banner(): string {
@@ -471,9 +645,9 @@ function fmtTokens(value: number): string {
 /** Statusline per spec §5: left `▲ <project>`; right model · tokens · turns, muted with values in fg. */
 /**
  * Full-width status bar (the "indicators around the composer" — modern-TUI style):
- * cwd · suit · mode chips (YOLO / scout / mandate) · session tokens · context% ·
- * turns on the left; model · effort right-justified to the terminal edge. Pure so
- * it's testable at any width; reflows on resize.
+ * cwd · suit · mode chips (YOLO / scout / mandate / busy / queue) · session tokens ·
+ * context% · turns on the left; model · effort right-justified to the terminal edge.
+ * Pure so it's testable at any width; reflows on resize.
  */
 export function buildStatusBar(state: GuruState, columns: number = process.stdout.columns ?? 80): string {
   const project = state.session?.repo ? basename(state.session.repo.repoRoot) : "no repo";
@@ -484,6 +658,9 @@ export function buildStatusBar(state: GuruState, columns: number = process.stdou
     leftParts.push(paint.fg("accent", state.activeRole.label));
   }
   const chips: string[] = [];
+  if (state.busy) {
+    chips.push(paint.fg("warning", "…run"));
+  }
   if (state.yolo) {
     chips.push(paint.fg("warning", "⚡YOLO"));
   }
@@ -492,6 +669,11 @@ export function buildStatusBar(state: GuruState, columns: number = process.stdou
   }
   if (state.mandate.grants.length > 0) {
     chips.push(paint.fg("success", "⛨mandate"));
+  }
+  // Follow-up / steer queue depth (§5) — only when something is waiting.
+  const queue = state.agentSession?.queueDepth() ?? 0;
+  if (queue > 0) {
+    chips.push(paint.fg("accent", `q:${queue}`));
   }
   if (chips.length > 0) {
     leftParts.push(chips.join(" "));
@@ -566,20 +748,48 @@ function cmdModelList(state: GuruState): void {
   });
 }
 
+function applyConnectedRoute(
+  state: GuruState,
+  route: ProviderRouteDescriptor,
+  override: string | null
+): { readonly keptMessages: number } {
+  const keptMessages = state.history.filter((message) => message.role === "user" || message.role === "assistant").length;
+  state.connectedRoute = route;
+  state.modelIdOverride = override;
+  state.history = preserveHistoryOnModelSwitch(state.history, systemPrompt());
+  resetTurnEngine(state);
+  return { keptMessages };
+}
+
+/**
+ * Drop the bound turn engine so the next turn rebuilds against the current
+ * (route, session, history). Called on any context switch — model change,
+ * /new, /resume, /fork, /clone, /role change that flips the registered tools —
+ * because the lazy AgentSession bound in chatTurn captures the route and
+ * harnessSession AT CONSTRUCTION; if either changes, the next turn would
+ * route the model call to the old route.
+ */
+function resetTurnEngine(state: GuruState): void {
+  state.agentSession = null;
+}
+
 function cmdModelConnect(state: GuruState, selector: string, override: string | undefined): void {
   const route = resolveRouteSelector(state.routes, selector);
   if (!route) {
-    print(colorize(theme, "red", `No route matches '${selector}'. Try /model to list.`));
+    // Distinguish ambiguous provider id from nothing matched.
+    const ambiguousCount = state.routes.filter((r) => r.providerId === selector || r.routeId.startsWith(`${selector}/`)).length;
+    const hint =
+      ambiguousCount > 1
+        ? `'${selector}' matches ${ambiguousCount} routes — be specific (e.g. /model ${selector}/<model-id>).`
+        : `No route matches '${selector}'.`;
+    print(colorize(theme, "red", `${hint} Try /model to list.`));
     return;
   }
   // Plan/OAuth lanes with REAL direct wiring (baseUrl + a credential the layered
   // resolver finds — an API key OR a vaulted OAuth token) connect DIRECT and run the
-  // native tool loop. guru no longer delegates any turn to a provider CLI.
+  // native tool loop. guru no longer delegates any turn to a provider CLI (v1.3.0).
   const directReady = route.baseUrl !== undefined && isChatCapableFamily(route.apiFamily) && resolveRouteCredential(route).usable;
   if (isOperatorAuthRoute(route) && !directReady) {
-    // A plan/OAuth lane that isn't directly connectable = not signed in with a token
-    // guru can use. Sign in through guru's OWN /login (loopback OAuth → vaulted token),
-    // then the turn runs natively — there is no CLI-delegate fallback anymore.
     const loginName = route.providerId.replace(/-direct$/u, "");
     const presence = resolveOperatorAuthPresence(route);
     print(colorize(theme, "yellow", `${route.routeId}: not signed in. Run /login ${loginName} to sign in through guru.`));
@@ -587,25 +797,27 @@ function cmdModelConnect(state: GuruState, selector: string, override: string | 
     return;
   }
 
-  const credential = resolveRouteCredential(route);
-  if (!isChatCapableFamily(route.apiFamily)) {
-    print(colorize(theme, "yellow", `${route.routeId} is not chat-capable in this slice (family: ${route.apiFamily ?? "unknown"}).`));
+  const assessment = assessRouteConnectability(route);
+  if (!assessment.connectable) {
+    print(colorize(theme, "yellow", `${route.routeId}: ${assessment.reason}`));
     const availability = state.availability.find((row) => row.routeId === route.routeId);
     for (const hint of availability?.setupHints ?? []) {
       print(dim(theme, `  hint: ${hint}`));
     }
+    if (isOperatorAuthRoute(route)) {
+      print(dim(theme, "  Plan-auth routes need /login (guru-native OAuth → vault) for full harness tool support."));
+    } else {
+      print(dim(theme, "  Fix the credential (env NAME only — value never shown), then /model again."));
+    }
     return;
   }
-  if (!credential.usable) {
-    print(colorize(theme, "yellow", `${route.routeId}: ${credential.reason}`));
-    print(dim(theme, "  Connect after fixing the credential (env NAME above; value never shown)."));
-    return;
-  }
-  state.connectedRoute = route;
-  state.modelIdOverride = override ?? null;
-  state.history = [{ role: "system", content: systemPrompt() }];
-  print(colorize(theme, "green", `Connected: ${route.routeId}${override ? ` (model ${override})` : ""} — ${credential.reason}`));
+
+  const { keptMessages } = applyConnectedRoute(state, route, override ?? null);
+  print(colorize(theme, "green", `Connected: ${route.routeId}${override ? ` (model ${override})` : ""} — ${assessment.reason}`));
   print(dim(theme, "  Type a message to chat. /status for details."));
+  if (keptMessages > 0) {
+    print(dim(theme, `  kept ${keptMessages} message(s) of conversation — /new for a clean slate`));
+  }
 }
 
 /** Persist the current conversation transcript durably (create on first turn, update after). */
@@ -988,6 +1200,10 @@ function switchToSession(state: GuruState, session: ReconstructedSession, lineag
   state.compaction.noopEstimate = null;
   state.lineage = lineage;
   state.turnsThisBranch = 0;
+  // Drop the bound turn engine: AgentSession captured the previous session's route +
+  // session at construction. The lazy ??= in chatTurn would otherwise reuse the stale
+  // engine, sending the resumed session's first turn through the OLD route.
+  resetTurnEngine(state);
   if (session.legacy) {
     // Migrate the flat record into the append-only log on first resume so new
     // turns chain onto the FULL history (load() prefers the jsonl once it exists).
@@ -997,6 +1213,15 @@ function switchToSession(state: GuruState, session: ReconstructedSession, lineag
     state.lastCompactionCount = state.compaction.last?.count ?? 0;
   }
   injectBranchMemory(state);
+  // Rebuild the system head with the LIVE boot memory block (review 2026-07-08):
+  // the replayed history[0] is the system prompt from when the session was SAVED,
+  // so facts remembered after that point are invisible to the model until the
+  // first submitted message triggers the per-turn rebuild. Refresh + replace the
+  // head now so a resumed session starts with current memory, not a stale snapshot.
+  refreshBootMemoryBlock();
+  if (state.history[0]?.role === "system") {
+    state.history[0] = { role: "system", content: systemPrompt() };
+  }
 }
 
 /** Leaving a branch with new turns: fold it to a branch summary via the compaction summarizer. */
@@ -1056,10 +1281,14 @@ function cmdSessions(state: GuruState): void {
 
 async function cmdResume(state: GuruState, selector: string): Promise<void> {
   const sessions = state.store.list();
-  const index = Number.parseInt(selector, 10);
+  // Reject non-canonical numeric input BEFORE letting Number.parseInt truncate it.
+  // `Number.parseInt("1.5", 10)` returns 1, which would silently resume the
+  // wrong session. Require a clean positive integer OR a literal session id.
+  const isNumeric = /^[1-9][0-9]*$/u.test(selector);
+  const index = isNumeric ? Number.parseInt(selector, 10) : NaN;
   const summary =
     sessions.find((item) => item.id === selector) ??
-    (Number.isInteger(index) && index >= 1 && index <= sessions.length ? sessions[index - 1] : undefined);
+    (isNumeric && index >= 1 && index <= sessions.length ? sessions[index - 1] : undefined);
   if (!summary) {
     print(colorize(theme, "red", `No saved conversation matches '${selector}'. Try /sessions.`));
     return;
@@ -1098,6 +1327,9 @@ async function cmdNew(state: GuruState): Promise<void> {
   state.compaction.noopEstimate = null;
   state.lineage = null;
   state.turnsThisBranch = 0;
+  // /new resets the conversation; the bound engine from the prior session must drop
+  // so the next turn constructs a fresh AgentSession wired to the current route.
+  resetTurnEngine(state);
   seedLog(state);
   print(colorize(theme, "green", "Started a fresh conversation.") + dim(theme, ` (${state.conversationId.slice(0, 8)})`));
 }
@@ -1132,11 +1364,23 @@ async function cmdFork(state: GuruState, args: readonly string[]): Promise<void>
     return;
   }
   const model = buildSessionTree(session, state.store.children(state.conversationId), {});
-  const requested = Number.parseInt(args[0] ?? "", 10);
-  const target = Number.isInteger(requested) ? model.forkTargets.get(requested) : undefined;
+  // Require the operator to type a clean positive integer — `Number.parseInt`
+  // silently truncates "1.5" to 1 and accepts "0" / negatives, which would
+  // surprise the operator (silent off-by-one) or address a non-existent target.
+  const rawArg = args[0] ?? "";
+  if (!/^[1-9][0-9]*$/u.test(rawArg)) {
+    print(colorize(theme, "yellow", `Usage: /fork <#> — pick a user turn number (1..${model.forkTargets.size}). Run /tree to see them.`));
+    return;
+  }
+  const requested = Number.parseInt(rawArg, 10);
+  const target = model.forkTargets.get(requested);
   if (!target) {
-    print(colorize(theme, "yellow", `Usage: /fork <#> — pick a user turn number (1..${model.forkTargets.size}).`));
-    cmdTree(state, []);
+    // The number parsed cleanly but is out of range — surface the actual ceiling.
+    // One-line usage only (review 2026-07-08): the old code called cmdTree here,
+    // reprinting the WHOLE tree and clobbering the operator's screen for a typo
+    // like `/fork 99` or `/fork abc`. The range is already in the usage line;
+    // /tree is one keystroke away if they want to see the numbers again.
+    print(colorize(theme, "yellow", `Usage: /fork <#> — pick a user turn number (1..${model.forkTargets.size}). Run /tree to see them.`));
     return;
   }
   await maybeSummarizeBranch(state);
@@ -1263,25 +1507,30 @@ function cmdMemory(args: readonly string[]): void {
     refreshBootMemoryBlock();
     return;
   }
-  const facts = guruMemoryStore.list();
-  print(bold(theme, `memory — ${facts.length} fact(s)`) + dim(theme, `  (${guruMemoryStore.directory})`));
-  // Per-scope breakdown (§7): global is always shown; space/role when bound.
-  for (const { scope, store } of scopedMemory.activeStores()) {
-    if (scope === "global") {
-      continue;
-    }
-    print(dim(theme, `  ${scope.padEnd(6)} ${store.list().length} fact(s)  (${store.directory})`));
+  // Headline counts the OPERATOR'S view across every ACTIVE scope, not just
+  // global — the per-scope breakdown below adds space/role, so showing only
+  // global here made the total look wrong (e.g. "memory — 5 fact(s)" next to
+  // "space 12 fact(s)" with no total).
+  const scopedFacts = scopedMemory.activeStores();
+  const totalFacts = scopedFacts.reduce((sum, { store }) => sum + store.list().length, 0);
+  print(bold(theme, `memory — ${totalFacts} fact(s) across ${scopedFacts.length} scope(s)`));
+  for (const { scope, store } of scopedFacts) {
+    const count = store.list().length;
+    print(dim(theme, `  ${scope.padEnd(6)} ${count} fact(s)  (${store.directory})`));
   }
+  // The list preview sticks to global so the operator sees the *familiar* short
+  // list; use `/recall <query>` (or memory_search) to scan the other scopes.
+  const facts = guruMemoryStore.list();
   for (const { fact } of facts.slice(0, 15)) {
     print(`  ${colorize(theme, "cyan", fact.name.padEnd(34))} ${dim(theme, `${fact.type} · updated ${fact.updatedAt.slice(0, 10)}`)}`);
   }
   if (facts.length > 15) {
-    print(dim(theme, `  ...and ${facts.length - 15} more (memory_search)`));
+    print(dim(theme, `  ...and ${facts.length - 15} more in global (memory_search)`));
   }
-  if (facts.length === 0) {
+  if (totalFacts === 0) {
     print(dim(theme, "  Nothing remembered yet — /remember [global|space|role] <fact> or the memory_remember tool."));
   }
-  print(dim(theme, "  Obsidian-compatible vault: open the directory above as a vault to browse/graph it."));
+  print(dim(theme, "  Obsidian-compatible vault: open a scope directory above as a vault to browse/graph it."));
 }
 
 /**
@@ -1579,14 +1828,19 @@ function cmdMandate(state: GuruState, args: readonly string[]): void {
 
   if (sub === "grant") {
     const scope = (args[1] ?? "").toLowerCase();
-    const preset = (args[2] ?? "work").toLowerCase();
-    const verbs = MANDATE_VERB_PRESETS[preset];
+    // Require an explicit preset (review 2026-07-08): the old default "work"
+    // meant `/mandate grant machine` (a typo-short command) silently granted
+    // read+write+exec machine-wide. Unlike /yolo's strict "/yolo on" ritual,
+    // this path had no confirmation. Forcing an explicit preset closes the footgun.
+    const preset = (args[2] ?? "").toLowerCase();
+    const verbs = preset ? MANDATE_VERB_PRESETS[preset] : undefined;
     if (scope !== "space" && scope !== "machine") {
-      print(dim(theme, "Usage: /mandate grant <space|machine> [read|write|work|all]"));
+      print(dim(theme, "Usage: /mandate grant <space|machine> <read|write|work|all>"));
       return;
     }
     if (!verbs) {
-      print(dim(theme, `Unknown verb preset '${preset}'. One of: ${Object.keys(MANDATE_VERB_PRESETS).join(", ")}.`));
+      print(dim(theme, `Specify a verb preset for ${scope}: one of ${Object.keys(MANDATE_VERB_PRESETS).join(", ")}.`));
+      print(dim(theme, `  e.g. /mandate grant ${scope} work   -> read+write+exec for ${scope === "machine" ? "this computer" : "this repo"}`));
       return;
     }
     const cwd = state.session?.repo?.repoRoot ?? process.cwd();
@@ -2114,11 +2368,18 @@ function cmdTools(state: GuruState): void {
 }
 
 function cmdHelp(): void {
+  // Keep the displayed names matched to SLASH_COMMANDS so /help never advertises
+  // a command that no longer exists. Review 2026-07-08 added /tree /fork /clone
+  // (session tree) and /recall (BM25 over memory) and /compact (durable history
+  // fold) and /quit (exit alias) — they were missing from the old static lists.
   const groups: ReadonlyArray<{ title: string; names: readonly string[] }> = [
-    { title: "work", names: ["/model", "/models", "/role", "/mandate", "/yolo", "/lookahead", "/tools", "/skills", "/remember", "/memory"] },
-    { title: "sessions", names: ["/sessions", "/resume", "/new", "/clear"] },
-    { title: "info", names: ["/status", "/login", "/accounts", "/logout", "/settings", "/help"] },
-    { title: "leave", names: ["/exit"] }
+    {
+      title: "work",
+      names: ["/model", "/models", "/role", "/mandate", "/yolo", "/lookahead", "/tools", "/skills", "/remember", "/memory", "/recall", "/compact"]
+    },
+    { title: "sessions", names: ["/sessions", "/resume", "/new", "/clear", "/tree", "/fork", "/clone"] },
+    { title: "info", names: ["/status", "/login", "/accounts", "/logout", "/keys", "/settings", "/help"] },
+    { title: "leave", names: ["/exit", "/quit"] }
   ];
   for (const group of groups) {
     print(paint.bold(paint.fg("fgBright", group.title)));
@@ -2138,9 +2399,30 @@ function cmdHelp(): void {
 }
 
 function cmdMenu(): void {
-  print(bold(theme, "/ command menu") + dim(theme, "  (type a command, e.g. /model — Tab completes)"));
-  for (const command of SLASH_COMMANDS) {
-    print(`  ${colorize(theme, "cyan", command.name.padEnd(16))} ${dim(theme, command.description)}`);
+  print(bold(theme, "/ command menu") + dim(theme, "  (type / then ↑↓ · → drill · ⇥ accept · ⏎ run)"));
+  const groups: ReadonlyArray<{ title: string; names: readonly string[] }> = [
+    { title: "work", names: ["/model", "/models", "/role", "/mandate", "/yolo", "/lookahead", "/tools", "/skills", "/remember", "/memory", "/recall"] },
+    { title: "sessions", names: ["/sessions", "/resume", "/new", "/tree", "/fork", "/clone", "/clear"] },
+    { title: "info", names: ["/status", "/login", "/accounts", "/keys", "/logout", "/settings", "/help"] },
+    { title: "leave", names: ["/exit"] }
+  ];
+  const listed = new Set<string>();
+  for (const group of groups) {
+    print(paint.bold(paint.fg("fgBright", group.title)));
+    for (const name of group.names) {
+      const command = SLASH_COMMANDS.find((candidate) => candidate.name === name);
+      if (command) {
+        listed.add(command.name);
+        print(`  ${paint.fg("accent", command.name.padEnd(14))} ${paint.fg("muted", command.description)}`);
+      }
+    }
+  }
+  const rest = SLASH_COMMANDS.filter((command) => !listed.has(command.name));
+  if (rest.length > 0) {
+    print(paint.bold(paint.fg("fgBright", "more")));
+    for (const command of rest) {
+      print(`  ${paint.fg("accent", command.name.padEnd(14))} ${paint.fg("muted", command.description)}`);
+    }
   }
 }
 
@@ -2182,6 +2464,26 @@ export function completeSlashCommand(line: string): [string[], string] {
  *   model may pass includeContents=true explicitly, and the read tool covers
  *   targeted full-text needs).
  */
+/**
+ * Operator-facing line after a turn that produced no streamed tokens.
+ * Empty provider replies used to look like "guru does nothing" — name the cause.
+ */
+export function formatTurnResultLine(text: string, toolCallCount: number): string {
+  const trimmed = text.trim();
+  if (trimmed.length > 0) {
+    return `${paint.fg("accent2", GLYPHS.agent)} ${trimmed}`;
+  }
+  return paint.fg("warning", emptyTurnMessage(toolCallCount));
+}
+
+/** Operator-facing lines after a failed or aborted turn. */
+export function formatTurnFailureLines(message: string, aborted: boolean): readonly string[] {
+  if (aborted) {
+    return [dim(theme, `  ${abortTurnMessage()}`)];
+  }
+  return [colorize(theme, "red", `Turn failed: ${message}`), dim(theme, `  tip: ${turnFailureTip(message)}`)];
+}
+
 export function injectRepoRoot(toolId: string, input: unknown, session: HarnessSession): unknown {
   const record = typeof input === "object" && input !== null ? (input as Record<string, unknown>) : {};
 
@@ -2223,6 +2525,19 @@ export interface ComposerDeps {
    */
   chromeRows?(): string[];
   isBusy(): boolean;
+  /**
+   * Mid-run steer: operator typed a line WHILE a turn is streaming. Injected into
+   * the running agent loop between tool rounds. Absent → keys still accumulate
+   * but are discarded on Enter (never silently drop keystrokes without a path).
+   */
+  onBusySteer?(text: string): void;
+  /** Mid-run follow-up: queued to run when the current turn stops (Alt+Enter). */
+  onBusyFollowUp?(text: string): void;
+  /**
+   * When false during a busy turn, keystrokes are not captured as steer drafts
+   * (used while the per-call approval prompt owns the next key).
+   */
+  allowBusySteer?(): boolean;
   commandItems(buffer: string): MenuItem[];
   drillItems(parentId: string): MenuItem[];
   /** @ picker candidates for a query — injectable; defaults to the bounded repo scan. */
@@ -2231,31 +2546,122 @@ export interface ComposerDeps {
   completePath?(token: string, cwd: string): PathCompletion;
 }
 
+/** Visible page size for slash / @ pickers (keeps the overlay under the composer). */
+export const MENU_PAGE_SIZE = 7;
+
 /**
- * Pure builder for the menu overlay lines (testable). Given the visible state,
- * returns the rows drawn BELOW the input. Kept side-effect-free so the render
- * math (highlight, windowing, crumb) is unit-tested without a terminal.
+ * Clamp a plain string to a display-column budget (ANSI-free). Wide CJK/emoji
+ * count as 2 so the terminal hard-wrap doesn't blow relative-move accounting.
  */
-export function buildMenuOverlayRows(paintApi: Painter, menu: MenuState): string[] {
+export function clampMenuText(text: string, maxCols: number): string {
+  if (maxCols <= 0 || text.length === 0) {
+    return "";
+  }
+  if (stringDisplayWidth(text) <= maxCols) {
+    return text;
+  }
+  if (maxCols <= 1) {
+    return "…";
+  }
+  let out = "";
+  let width = 0;
+  for (const char of text) {
+    const cells = charDisplayWidth(char.codePointAt(0) ?? 0);
+    if (width + cells > maxCols - 1) {
+      break;
+    }
+    out += char;
+    width += cells;
+  }
+  return `${out}…`;
+}
+
+/** Short, operator-facing route status for the /model drill. */
+export function formatRouteMenuHint(status: string, options: { readonly connected?: boolean; readonly usable?: boolean } = {}): string {
+  const raw = status.toLowerCase().replace(/_/g, "-");
+  let core = status;
+  if (raw.includes("active") || raw === "ready" || raw.includes("ready-unverified")) {
+    core = options.usable === false ? "needs key" : "ready";
+  } else if (raw.includes("missing") || raw.includes("login") || raw.includes("needs")) {
+    core = "needs login";
+  } else if (raw.includes("error") || raw.includes("fail")) {
+    core = "error";
+  }
+  if (options.connected) {
+    return `← connected · ${core}`;
+  }
+  return core;
+}
+
+/**
+ * Pure builder for the menu overlay lines (testable). Windowed list + empty
+ * state + scroll cue + width-clamped hints so the slash menu stays readable.
+ */
+export function buildMenuOverlayRows(
+  paintApi: Painter,
+  menu: MenuState,
+  options: { readonly columns?: number } = {}
+): string[] {
+  const columns = Math.max(40, options.columns ?? 80);
+  if (menu.items.length === 0) {
+    const empty =
+      menu.mode === "drill"
+        ? "    (empty) — nothing to pick · ‹ back · esc close"
+        : "    no matching commands — keep typing or esc to close";
+    return [paintApi.fg("fgFaint", empty)];
+  }
+
+  const page = MENU_PAGE_SIZE;
+  const start = Math.max(0, Math.min(menu.selected - 3, Math.max(0, menu.items.length - page)));
+  const view = menu.items.slice(start, start + page);
+  const end = start + view.length;
   const needle = menu.mode === "commands" ? menu.buffer.slice(1).toLowerCase() : "";
   const highlight = (name: string): string => {
-    const at = needle.length > 0 ? name.toLowerCase().indexOf(needle, 1) : -1;
-    if (at < 0) return name;
+    if (needle.length === 0) {
+      return name;
+    }
+    const at = name.toLowerCase().indexOf(needle);
+    if (at < 0) {
+      return name;
+    }
     return `${name.slice(0, at)}${paintApi.bold(paintApi.fg("accent2", name.slice(at, at + needle.length)))}${name.slice(at + needle.length)}`;
   };
-  const start = Math.max(0, Math.min(menu.selected - 3, menu.items.length - 7));
-  const view = menu.items.slice(start, start + 7);
-  const labelWidth = Math.max(15, ...view.map((v) => v.label.length));
+
+  // Budget: indent + chevron + drill marker + gaps leave the rest for label/hint.
+  const usable = Math.max(24, columns - 8);
+  const maxLabel = Math.min(36, Math.floor(usable * 0.45));
+  const labelWidth = Math.min(
+    maxLabel,
+    Math.max(12, ...view.map((item) => Math.min(maxLabel, stringDisplayWidth(item.label))))
+  );
+  const hintBudget = Math.max(8, usable - labelWidth - 6);
+
   const rows = view.map((item, offset) => {
     const index = start + offset;
-    const label = highlight(item.label.padEnd(labelWidth));
+    const plainLabel = clampMenuText(item.label, labelWidth);
+    const pad = Math.max(0, labelWidth - stringDisplayWidth(plainLabel));
+    const label = highlight(plainLabel) + " ".repeat(pad);
     const drill = item.drillable ? paintApi.fg("fgFaint", " ›") : "  ";
+    const hint = item.hint && item.hint.length > 0 ? clampMenuText(item.hint, hintBudget) : "";
+    const hintPaint = paintApi.fg("muted", hint);
     return index === menu.selected
-      ? paintApi.bg("bgSelect", `  ${paintApi.fg("accent", "▸")} ${label}${drill} ${paintApi.fg("muted", item.hint ?? "")} `)
-      : `    ${paintApi.fg("fg", label)}${drill} ${paintApi.fg("muted", item.hint ?? "")}`;
+      ? paintApi.bg("bgSelect", `  ${paintApi.fg("accent", "▸")} ${label}${drill} ${hintPaint} `)
+      : `    ${paintApi.fg("fg", label)}${drill} ${hintPaint}`;
   });
-  const crumb = menu.mode === "drill" ? `${menu.parentId} › ` : "";
-  rows.push(paintApi.fg("fgFaint", `    ${crumb}↑↓ move · › drill · ‹ back · ⇥ accept · ⏎ run · esc close`));
+
+  const crumb = menu.mode === "drill" ? `${menu.parentId ?? ""} › ` : "";
+  const scroll =
+    menu.items.length > page
+      ? paintApi.fg("fgFaint", `    ${start + 1}–${end} of ${menu.items.length}${start > 0 ? " · ↑ more" : ""}${end < menu.items.length ? " · ↓ more" : ""}`)
+      : null;
+  if (scroll) {
+    rows.push(scroll);
+  }
+  const footer =
+    menu.mode === "drill"
+      ? `    ${crumb}↑↓ · ‹ back · ⇥ accept · ⏎ run · esc close`
+      : `    ${crumb}↑↓ move · › drill · ⇥ accept · ⏎ run · esc close`;
+  rows.push(paintApi.fg("fgFaint", footer));
   return rows;
 }
 
@@ -2275,6 +2681,13 @@ export function attachComposer(deps: ComposerDeps): {
   isClosed(): boolean;
   bufferText(): string;
   refresh(): void;
+  /**
+   * Force a redraw even while a turn is busy (resize reflow). Resize during a
+   * streamed answer is common; the old render() early-returned on isBusy() and
+   * left lastCursorRow stale, so the next frame's relative cursor move was
+   * wrong. forceRefresh drops the stale anchor and repaints at the new width.
+   */
+  forceRefresh(): void;
   clear(): void;
   beginPrompt(): void;
   /** Abandon the current prompt frame cleanly (Ctrl+C hint path). */
@@ -2322,15 +2735,29 @@ export function attachComposer(deps: ComposerDeps): {
   /** Visual cursor row within the last-rendered editor frame (for relative moves). */
   let lastCursorRow = 0;
   let rendered = false;
+  /**
+   * Mid-turn draft: keys typed while a turn is streaming. Esc/Ctrl+C aborts the
+   * turn; Enter injects the draft as a steer. Without this, every keystroke
+   * during a turn was silently dropped — the #1 "UI is dead" feel.
+   */
+  let busyDraft = "";
 
   const overlayRows = (): string[] => {
+    const width = columns();
     const menuState = picker ? picker.menu : menu;
-    let menuRows = menuState && menuState.items.length > 0 ? buildMenuOverlayRows(paint, menuState) : [];
-    if (picker && picker.menu.items.length === 0) {
+    let menuRows: string[] = [];
+    if (picker) {
       // NEVER an invisible open picker (adversarial finding: it ate Enter).
-      menuRows = [paint.fg("fgFaint", "    @ no matching files — esc to dismiss")];
-    } else if (picker && pickerScan?.truncated) {
-      menuRows = [...menuRows, paint.fg("fgFaint", "    (file list truncated — keep typing to narrow)")];
+      menuRows =
+        picker.menu.items.length > 0
+          ? buildMenuOverlayRows(paint, picker.menu, { columns: width })
+          : [paint.fg("fgFaint", "    @ no matching files — esc to dismiss")];
+      if (picker.menu.items.length > 0 && pickerScan?.truncated) {
+        menuRows = [...menuRows, paint.fg("fgFaint", "    (file list truncated — keep typing to narrow)")];
+      }
+    } else if (menuState) {
+      // Empty filter must still show a row — silent close felt like the menu died.
+      menuRows = buildMenuOverlayRows(paint, menuState, { columns: width });
     }
     const chrome = deps.chromeRows ? deps.chromeRows() : [];
     return menuRows.length > 0 && chrome.length > 0 ? [...menuRows, "", ...chrome] : [...menuRows, ...chrome];
@@ -2372,13 +2799,11 @@ export function attachComposer(deps: ComposerDeps): {
   };
 
   /**
-   * Full-block redraw: [editor rows] + [overlay] as one region. Relative moves
-   * only: up to the block's first row, clear below, rewrite, reposition.
+   * Paint the editor frame + overlay at the current width. No busy guard — the
+   * caller decides whether to paint. Relative moves only: up to the block's first
+   * row, clear below, rewrite, reposition.
    */
-  const render = (): void => {
-    if (!deps.interactive || deps.isBusy() || closed) {
-      return;
-    }
+  const paintFrame = (): void => {
     const width = columns();
     const frame = renderEditorFrame(paint, editor, { text: promptText, width: promptCols }, width);
     const below = overlayRows().map((row) => clampToWidth(row, width));
@@ -2398,6 +2823,43 @@ export function attachComposer(deps: ComposerDeps): {
     deps.output.write(`\x1b[${frame.cursorCol}G`);
     lastCursorRow = frame.cursorRow;
     rendered = true;
+  };
+
+  /**
+   * Full-block redraw: [editor rows] + [overlay] as one region. Skipped while a
+   * turn is busy (the cursor is hidden and the input is frozen mid-turn).
+   */
+  const render = (): void => {
+    if (!deps.interactive || closed) {
+      return;
+    }
+    if (deps.isBusy()) {
+      // During streaming, paint the steer draft so the operator sees
+      // what they're typing — the #1 "UI is dead" fix.
+      if (busyDraft.length > 0) {
+        process.stdout.write(`\r\x1b[K  ${paint.fg("fgFaint", `steering… ${busyDraft}`)}`);
+      }
+      return;
+    }
+    paintFrame();
+  };
+
+  /**
+   * Forced redraw for resize while busy (review 2026-07-08). The normal render()
+   * early-returns on isBusy(), so a resize during a streamed turn was dropped and
+   * the stale lastCursorRow powered a wrong relative-move on the next frame. Here
+   * we drop the stale anchor first (treat the screen as not-yet-rendered) so no
+   * bogus `\x1b[NA` is emitted, then repaint at the new width. The cursor itself
+   * is hidden during a turn, so the only on-screen effect is the chrome/input
+   * reflowing to the new width instead of staying at the old layout.
+   */
+  const forceRender = (): void => {
+    if (!deps.interactive || closed) {
+      return;
+    }
+    lastCursorRow = 0;
+    rendered = false;
+    paintFrame();
   };
 
   /** Finalize a submission: echo the buffer as scrollback, cursor below it. */
@@ -2513,17 +2975,72 @@ export function attachComposer(deps: ComposerDeps): {
     }
   };
 
+  /** Dim one-line feedback under a live turn (steer draft / abort). Never fights the spinner. */
+  const writeBusyLine = (text: string): void => {
+    if (!deps.interactive) {
+      return;
+    }
+    deps.output.write(`\r\x1b[K  ${paint.fg("fgFaint", text)}\n`);
+  };
+
   const onKey = (key: EditorKey): void => {
     if (closed) {
       return;
     }
     const name = key?.name ?? "";
     if (deps.isBusy()) {
-      if (key?.ctrl === true && name === "c") {
+      // Approval prompt owns the next key — don't steal y/N/a into a steer draft,
+      // and don't let Esc/Ctrl+C double as turn-abort while [n/enter/esc]=deny.
+      const steerOk = deps.allowBusySteer?.() ?? true;
+      // Mid-turn: Esc OR Ctrl+C abort the running agent (hint promises "esc interrupt")
+      // only when the approval prompt is not the one that owns Esc/Ctrl+C right now.
+      if (steerOk && ((key?.ctrl === true && name === "c") || name === "escape")) {
+        busyDraft = "";
         interruptHandler();
+        return;
       }
-      return; // a streaming turn owns the screen
+      if (!steerOk) {
+        return;
+      }
+      // Alt+Enter → queue follow-up; Enter → mid-run steer (between tool rounds).
+      if (name === "return" || name === "enter") {
+        const text = busyDraft.trim();
+        busyDraft = "";
+        if (text.length > 0) {
+          const preview = text.length > 72 ? `${text.slice(0, 71)}…` : text;
+          if (key?.meta === true) {
+            deps.onBusyFollowUp?.(text);
+            writeBusyLine(`↳ follow-up queued: ${preview}`);
+          } else {
+            deps.onBusySteer?.(text);
+            writeBusyLine(`↳ steered: ${preview}`);
+          }
+        }
+        return;
+      }
+      if (name === "backspace") {
+        if (busyDraft.length > 0) {
+          // Drop whole code point when possible (simple BMP-first; fine for steer draft).
+          busyDraft = busyDraft.slice(0, -1);
+          writeBusyLine(busyDraft.length > 0 ? `steering… ${busyDraft}` : "steering… (empty)");
+        }
+        return;
+      }
+      const sequence = key?.sequence ?? "";
+      if (sequence.length > 0 && !key?.ctrl && !key?.meta && !/^[\x00-\x1f\x7f]/u.test(sequence) && name !== "paste") {
+        busyDraft += sequence;
+        writeBusyLine(`steering… ${busyDraft}`);
+        return;
+      }
+      if (name === "paste" && sequence.length > 0) {
+        busyDraft += sequence.replace(/\r\n?/gu, "\n").replace(/\n/gu, " ");
+        writeBusyLine(`steering… ${busyDraft}`);
+        return;
+      }
+      return; // other keys (arrows etc.) ignored mid-turn
     }
+    // Idle again — drop any leftover mid-turn draft.
+    busyDraft = "";
 
     // --- @ picker interception (arrows/enter/esc/tab; typing falls through) ---
     if (picker) {
@@ -2546,7 +3063,13 @@ export function attachComposer(deps: ComposerDeps): {
         render();
         return;
       } else if (name === "tab") {
-        picker = null; // fall through to path completion below
+        // Empty picker + Tab: close the picker and STOP. Falling through would
+        // hit the path-completion branch below and try to complete the "@token"
+        // as a filesystem path (review 2026-07-08) — e.g. "@zzz" + Tab ran
+        // completePath("@zzz"). The operator's Tab was consumed by the picker.
+        picker = null;
+        render();
+        return;
       }
     }
 
@@ -2692,6 +3215,8 @@ export function attachComposer(deps: ComposerDeps): {
     bufferText: () => editorText(editor),
     /** Redraw the whole composer block (after prompt / turn / resize). */
     refresh: render,
+    /** Redraw even while busy (resize reflow during a streamed turn). */
+    forceRefresh: forceRender,
     /** Erase the below-region (before printing transcript output). */
     clear: () => {
       if (rendered) {
@@ -2915,9 +3440,11 @@ const TOOL_BADGE: Readonly<Record<string, string>> = {
 
 function renderToolEvent(event: AgentToolEvent): void {
   const verb = TOOL_BADGE[event.toolId] ?? "TOOL";
-  const kind = event.status === "succeeded" ? "brand" : event.status === "blocked" ? "warning" : "error";
-  const glyph =
-    event.status === "succeeded"
+  const dryRun = event.detail?.includes("DRY RUN") ?? false;
+  const kind = dryRun ? "warning" : event.status === "succeeded" ? "brand" : event.status === "blocked" ? "warning" : "error";
+  const glyph = dryRun
+    ? paint.fg("warning", GLYPHS.warn)
+    : event.status === "succeeded"
       ? paint.fg("success", GLYPHS.ok)
       : event.status === "blocked"
         ? paint.fg("warning", GLYPHS.warn)
@@ -2936,43 +3463,132 @@ function renderToolEvent(event: AgentToolEvent): void {
 }
 
 /**
- * Read a single keypress from stdin. Raw mode is already on (the composer set it),
- * and the composer's own handler ignores input while `isBusy()` — so this one-shot
- * read during a turn has no conflict.
+ * Read the operator's approval answer from an injectable stream (defaults to
+ * `process.stdin`). Uses the hand-rolled key decoder so multi-byte sequences
+ * (arrows, bracketed paste) don't split and fire a false deny.
+ *
+ * Resolves:
+ *  - `y` / `Y` → once
+ *  - `a` / `A` → always (caller may map to deny when hard-edge)
+ *  - `n` / `N` / Enter / Esc / Ctrl+C → deny (fail-safe)
+ * Ignores: backspace, arrows, other printables (prompt stays open).
  */
-function readOneKey(): Promise<string> {
+export function readApprovalAnswer(
+  input: NodeJS.ReadableStream = process.stdin
+): Promise<"y" | "a" | "n"> {
   return new Promise((resolve) => {
-    const onData = (chunk: Buffer): void => {
-      process.stdin.off("data", onData);
-      resolve(chunk.toString("utf8").slice(0, 1));
+    let cleaned = false;
+    const cleanup = (): void => {
+      if (cleaned) {
+        return;
+      }
+      cleaned = true;
+      input.off("data", onData);
+      decoder.dispose();
     };
-    process.stdin.on("data", onData);
+    const decoder = createKeyDecoder((key) => {
+      const name = (key.name ?? "").toLowerCase();
+      // Bracketed paste mid-prompt is harmless — ignore it.
+      if (name === "paste") {
+        return;
+      }
+      // Fail-safe deny: Ctrl+C, Esc, Enter (hint promises enter = deny).
+      if (
+        (key.ctrl === true && name === "c") ||
+        name === "escape" ||
+        name === "return" ||
+        name === "enter"
+      ) {
+        cleanup();
+        resolve("n");
+        return;
+      }
+      if (key.sequence && key.sequence.length === 1) {
+        const ch = key.sequence.toLowerCase();
+        if (ch === "y" || ch === "a" || ch === "n") {
+          cleanup();
+          resolve(ch);
+          return;
+        }
+      }
+    });
+    const utf8 = new StringDecoder("utf8");
+    const onData = (chunk: Buffer | string): void => {
+      decoder.feed(typeof chunk === "string" ? chunk : utf8.write(chunk));
+    };
+    input.on("data", onData);
   });
 }
 
-/**
- * The interactive per-call approval prompt (v0.22). TTY only — a non-TTY caller
- * has no channel to answer, so it DENIES (fail-safe). Default (Enter / N / Ctrl+C /
- * anything else) is deny; the operator must actively type `y`, or `a` for always.
- */
-async function promptApproval(request: ApprovalRequest, stopSpinner: () => void): Promise<ApprovalChoice> {
-  if (!process.stdout.isTTY) {
-    return "deny";
-  }
-  stopSpinner();
-  const edge = request.hardEdge ? paint.fg("error", " HARD EDGE") : "";
-  print(
-    `  ${badge(paint, "APPROVE?", "warning")} ${paint.fg("fgBright", request.toolId)} ${paint.fg("muted", request.verbs.join("+"))}${edge} ${paint.fg("fgFaint", `— ${request.reason}`)}`
-  );
-  print(dim(theme, request.allowAlways ? "  [y] once · [a] always this session · [enter/N] deny" : "  [y] approve · [enter/N] deny  (hard edge — no 'always')"));
-  const key = (await readOneKey()).toLowerCase();
-  if (key === "y") {
+/** Pure: map a key answer to the mandate approval choice. */
+export function approvalChoiceFromAnswer(answer: "y" | "a" | "n", allowAlways: boolean): ApprovalChoice {
+  if (answer === "y") {
     return "once";
   }
-  if (key === "a" && request.allowAlways) {
+  if (answer === "a" && allowAlways) {
     return "always";
   }
   return "deny";
+}
+
+/** Pure: one-line outcome so the operator sees the gate closed. */
+export function formatApprovalOutcome(choice: ApprovalChoice, toolId: string): string {
+  if (choice === "once") {
+    return `  → allowed once: ${toolId}`;
+  }
+  if (choice === "always") {
+    return `  → allowed always this session: ${toolId}`;
+  }
+  return `  → denied: ${toolId}`;
+}
+
+/**
+ * Interactive per-call approval. TTY only — non-TTY DENIES (fail-safe).
+ * Stops the spinner, prints a high-contrast banner, waits for y/a/n, echoes outcome.
+ */
+async function promptApproval(
+  request: ApprovalRequest,
+  stopSpinner: () => void,
+  state?: Pick<GuruState, "awaitingApproval">
+): Promise<ApprovalChoice> {
+  if (!process.stdout.isTTY) {
+    return "deny";
+  }
+  // Clear spinner FIRST so the banner never sits under "working…" on the same line.
+  stopSpinner();
+  // Hard break from any mid-stream tokens so the gate is impossible to miss.
+  process.stdout.write("\n");
+  const edge = request.hardEdge ? paint.fg("error", "  HARD EDGE") : "";
+  print(paint.fg("warning", "  ────────────────────────────────────────"));
+  print(
+    `  ${badge(paint, "APPROVE?", "warning")} ${paint.fg("fgBright", request.toolId)} ${paint.fg("muted", request.verbs.join("+"))}${edge}`
+  );
+  if (request.reason.trim().length > 0) {
+    print(paint.fg("fgFaint", `  ${request.reason}`));
+  }
+  print(
+    dim(
+      theme,
+      request.allowAlways
+        ? "  [y] once · [a] always this session · [n/enter/esc] deny"
+        : "  [y] approve · [n/enter/esc] deny  (hard edge — no 'always')"
+    )
+  );
+  print(paint.fg("warning", "  ────────────────────────────────────────"));
+  if (state) {
+    state.awaitingApproval = true;
+  }
+  try {
+    const answer = await readApprovalAnswer();
+    const choice = approvalChoiceFromAnswer(answer, request.allowAlways);
+    const outcome = formatApprovalOutcome(choice, request.toolId);
+    print(choice === "deny" ? paint.fg("error", outcome) : paint.fg("success", outcome));
+    return choice;
+  } finally {
+    if (state) {
+      state.awaitingApproval = false;
+    }
+  }
 }
 
 /** Refresh a guru-native OAuth token that's near expiry, persisting the rotated token. */
@@ -3005,7 +3621,13 @@ async function refreshCodexTokenIfNeeded(state: GuruState, route: ProviderRouteD
 
 async function chatTurn(state: GuruState, text: string): Promise<void> {
   if (!state.connectedRoute) {
-    print(colorize(theme, "yellow", "No model connected. Use /model to browse and connect (e.g. /model 1)."));
+    const firstReady = sortedRoutes(state.routes).findIndex(
+      (r) => isChatCapableFamily(r.apiFamily) && resolveRouteCredential(r).usable
+    );
+    const hint = firstReady >= 0
+      ? ` — the first ready route is /model ${firstReady + 1}`
+      : " — no routes have a usable credential (check env vars or /login)";
+    print(colorize(theme, "yellow", `No model connected. Use /model to browse${hint}.`));
     return;
   }
   // Keep a guru-native OAuth token fresh: refresh (rotating token persisted) BEFORE the
@@ -3053,10 +3675,17 @@ async function chatTurn(state: GuruState, text: string): Promise<void> {
   // Auto-compaction (P0): pre-turn check of BOTH signals — the provider-reported
   // context size of the last turn and the estimator over what we're about to send.
   state.compaction.sendLegacyWindowThisTurn = false;
+  // One-time warning: compaction disabled → context silently limited to 13 msgs.
+  if (!state.compaction.config.enabled && !state.shownTruncationWarning) {
+    state.shownTruncationWarning = true;
+    print(dim(theme, "  ⚠ compaction disabled — context limited to last 13 messages per turn. Enable in guruharness.config.json (compaction.enabled=true) for full-history chat."));
+  }
   await maybeAutoCompact(state);
   const startedAt = Date.now();
-  // Working indicator (§6): braille spinner breathing through the brand ramp until
-  // the first token or tool event arrives. TTY only.
+  // Working indicator (§6): braille spinner on a SINGLE status line until the
+  // first token/tool/approval. Cleared with \r\x1b[K so it never leaves a
+  // stuck "working…" under streamed text. Restarted as "thinking…" after tools
+  // while the model prepares the next chunk.
   let spinTick = 0;
   let spinnerShown = false;
   let spinnerTimer: NodeJS.Timeout | undefined;
@@ -3070,15 +3699,25 @@ async function chatTurn(state: GuruState, text: string): Promise<void> {
       spinnerShown = false;
     }
   };
-  if (process.stdout.isTTY) {
+  const startSpinner = (label: string): void => {
+    if (!process.stdout.isTTY) {
+      return;
+    }
+    stopSpinner();
     spinnerTimer = setInterval(() => {
       spinnerShown = true;
-      process.stdout.write(`\r  ${spinnerFrame(paint, spinTick++)} ${paint.fg("muted", "working…")}`);
+      process.stdout.write(`\r  ${spinnerFrame(paint, spinTick++)} ${paint.fg("muted", label)}`);
     }, 80);
-  }
+  };
+  startSpinner("working…");
   const session = state.session;
   let directStreamed = false;
   if (state.lookahead.enabled) { state.lookahead.reset(); }
+  // Per-turn abort signal (§17 S13 / daily-driver Ctrl+C): one controller per turn,
+  // reset between turns. The composer interrupt handler trips it, which fires the
+  // delegated CLI's SIGKILL and propagates through the AgentSession's own signal.
+  const turnAbort = new AbortController();
+  state.turnAbortController = turnAbort;
   // Direct-ready plan lanes (Phase B: baseUrl + resolver-found credential) take the
   // REAL agentic tool-loop; the CLI delegate is only for routes with no endpoint.
   const turnDirectReady =
@@ -3087,14 +3726,18 @@ async function chatTurn(state: GuruState, text: string): Promise<void> {
     resolveRouteCredential(state.connectedRoute).usable;
   try {
     if (isOperatorAuthRoute(state.connectedRoute) && !turnDirectReady) {
-      // A plan/OAuth lane with no resolvable token = not signed in. guru NO LONGER
-      // delegates any turn to a provider CLI (removed 2026-07): sign in through guru's
-      // OWN /login (loopback OAuth → vaulted token) and the turn then runs NATIVELY,
-      // exactly like every API-key model.
+      // Plan/OAuth lane with no resolvable token = not signed in. No CLI delegate
+      // (v1.3.0): /login through guru, then the turn runs natively.
       stopSpinner();
       print("");
       const loginName = state.connectedRoute.providerId.replace(/-direct$/u, "");
-      print(colorize(theme, "yellow", `  Not signed in to ${state.connectedRoute.providerId}. Run /login ${loginName} to sign in through guru, then send your message again.`));
+      print(
+        colorize(
+          theme,
+          "yellow",
+          `  Not signed in to ${state.connectedRoute.providerId}. Run /login ${loginName} to sign in through guru, then send your message again.`
+        )
+      );
       // Drop the just-pushed user turn so it isn't replayed on the next (signed-in) turn.
       if (state.history.at(-1)?.role === "user") {
         state.history.pop();
@@ -3126,7 +3769,7 @@ async function chatTurn(state: GuruState, text: string): Promise<void> {
           ? []
           : state.sessionTools.filter((tool) => activeChatToolIds(state).has(tool.id)),
       prepareMessages: (history) => sendableHistory(history, state.compaction.config.enabled && !state.compaction.sendLegacyWindowThisTurn),
-      executeTool: (toolId, input) => {
+      executeTool: (toolId, input, signal) => {
         if (!session) {
           return Promise.resolve({
             toolId,
@@ -3139,7 +3782,7 @@ async function chatTurn(state: GuruState, text: string): Promise<void> {
         }
         // Cumulative file tracking for compaction details (read/write/edit paths).
         trackCompactionFileOp(state.compaction.files, toolId, input);
-        return state.runtime.executeTool(session.id, toolId, injectRepoRoot(toolId, input, session));
+        return state.runtime.executeTool(session.id, toolId, injectRepoRoot(toolId, input, session), signal);
       },
       approveTool: async (toolId, input) => {
         if (READ_ONLY_TOOL_IDS.has(toolId) || MANDATE_READ_ONLY_TOOLS.has(toolId)) {
@@ -3155,7 +3798,7 @@ async function chatTurn(state: GuruState, text: string): Promise<void> {
         // every time regardless of a session grant.
         return resolveApproval(toolId, decision, {
           sessionApprovals: state.sessionApprovals,
-          prompt: (request) => promptApproval(request, stopSpinner)
+          prompt: (request) => promptApproval(request, stopSpinner, state)
         });
       },
       onToolPending: (toolId) => {
@@ -3185,11 +3828,14 @@ async function chatTurn(state: GuruState, text: string): Promise<void> {
           directStreamed = false;
         }
         renderToolEvent(event);
+        // Model is about to continue (or finish) — show a quiet wait, not a blank freeze.
+        startSpinner("thinking…");
       },
       onToken: (chunk) => {
         stopSpinner();
         if (!directStreamed) {
-          // Agent message prefix per §5: ▲ accent2.
+          // Agent message prefix per §5: ▲ accent2. Leading newline separates
+          // from tool traces / approval banners so stream never glues to them.
           process.stdout.write(`\n${paint.fg("accent2", GLYPHS.agent)} `);
           directStreamed = true;
         }
@@ -3220,25 +3866,43 @@ async function chatTurn(state: GuruState, text: string): Promise<void> {
       process.stdout.write("\n");
     } else {
       print("");
-      print(
-        result.text.trim().length > 0
-          ? `${paint.fg("accent2", GLYPHS.agent)} ${result.text.trim()}`
-          : paint.fg("muted", "(empty response)")
-      );
+      print(formatTurnResultLine(result.text, result.toolCallCount));
+      const followUp = emptyTurnFollowUpTip(result.toolCallCount);
+      if (result.text.trim().length === 0 && followUp) {
+        print(paint.fg("fgFaint", `  ${followUp}`));
+      }
     }
     print("");
     const toolNote = result.toolCallCount > 0 ? ` · ${result.toolCallCount} tool call(s)` : "";
     print(paint.fg("fgFaint", `${result.routeId} · ${Date.now() - startedAt}ms · ${result.usage?.inputTokens ?? "?"} in / ${result.usage?.outputTokens ?? "?"} out${toolNote}`));
   } catch (error) {
-    state.history.pop();
-    if (error instanceof DirectChatError) {
-      print(colorize(theme, "red", `Turn failed: ${error.message}`));
-    } else {
-      print(colorize(theme, "red", `Turn failed: ${error instanceof Error ? error.message : String(error)}`));
+    // Keep the user message on failure — the operator should not have to retype.
+    // Aborts also keep history (partial assistant output may already be present).
+    const message = error instanceof Error ? error.message : String(error);
+    const aborted = /abort/iu.test(message);
+    for (const line of formatTurnFailureLines(message, aborted)) {
+      print(line);
     }
   } finally {
     stopSpinner();
     state.busy = false;
+    if (state.turnAbortController === turnAbort) {
+      state.turnAbortController = null;
+    }
+    await drainFollowUpQueue(state);
+  }
+}
+
+/** Run queued follow-ups (Alt+Enter mid-turn, RPC followUp) as fresh turns. */
+async function drainFollowUpQueue(state: GuruState): Promise<void> {
+  while (state.agentSession) {
+    const queued = state.agentSession.takeFollowUps();
+    if (queued.length === 0) {
+      break;
+    }
+    for (const text of queued) {
+      await chatTurn(state, text);
+    }
   }
 }
 
@@ -3378,11 +4042,23 @@ async function handleLine(state: GuruState, line: string, rl: { close(): void })
         await chatTurn(state, expanded.text);
         return;
       }
-      // Enter runs the top guess: "/mo" → /model, "/res 1" → /resume 1.
-      const guess = filterSlashCommands(slash.command)[0];
-      if (guess && guess.name !== slash.command) {
-        print(dim(theme, `→ ${guess.name}`));
-        await handleLine(state, [guess.name, ...slash.args].join(" "), rl);
+      // Enter with no exact match runs the top guess IF it's a confident prefix hit AND
+      // not in the no-guess-run blocklist. The pure decision lives in
+      // evaluateSlashGuess (testable); this block just dispatches the verdict.
+      const verdict = evaluateSlashGuess(slash);
+      if (verdict.kind === "exact" || verdict.kind === "auto-run") {
+        if (verdict.kind === "auto-run") {
+          print(dim(theme, `→ ${verdict.command}`));
+        }
+        await handleLine(state, [verdict.command, ...slash.args].join(" "), rl);
+        return;
+      }
+      if (verdict.kind === "blocked") {
+        print(colorize(theme, "yellow", `Did you mean ${verdict.command}? Type it in full to run it (not auto-run from a guess).`));
+        return;
+      }
+      if (verdict.kind === "weak-match") {
+        print(colorize(theme, "yellow", `Closest match "${verdict.command}" isn't a confident prefix hit — type it in full (or press / and use ↑↓).`));
         return;
       }
       print(colorize(theme, "red", `Unknown command: ${slash.command} — /help lists commands.`));
@@ -3454,7 +4130,19 @@ export async function runGuru(): Promise<void> {
     oauthPresent: (providerId) => oauthProviderPresent(vault, providerId)
   });
   const mandateStore = createMandateStore();
-  const harnessConfig = loadHarnessConfig({}).config;
+  const harnessConfigLoad = loadHarnessConfig({});
+  const harnessConfig = harnessConfigLoad.config;
+  // Surface invalid-config at boot instead of silently reverting to defaults
+  // (review 2026-07-08): a single bad key used to wipe the operator's ENTIRE
+  // config with no indication. Print a RED banner + the diagnostics so the
+  // operator knows their tuning isn't active and exactly which key failed.
+  if (harnessConfigLoad.status === "invalid") {
+    print(colorize(theme, "red", `⚠ Config invalid — using safe defaults: ${harnessConfigLoad.path}`));
+    for (const diagnostic of harnessConfigLoad.diagnostics.slice(0, 6)) {
+      print(colorize(theme, "yellow", `  ${diagnostic}`));
+    }
+    print(dim(theme, "  Fix the key(s) above and restart. /settings shows the active config."));
+  }
   const swarmManager = getSharedSwarmManager(harnessConfig.swarm);
   const lookahead = createLookAheadEngine({
     config: harnessConfig.lookahead,
@@ -3494,6 +4182,7 @@ export async function runGuru(): Promise<void> {
     toolsUsed: new Set<string>(),
     lookahead,
     busy: false,
+    awaitingApproval: false,
     vault,
     store: createSessionLogStore(),
     conversationId: randomUUID(),
@@ -3516,16 +4205,28 @@ export async function runGuru(): Promise<void> {
     // flywheel's real decay clock.
     sessionNumber: incrementSessionCounter(),
     // Engine Extraction v0.18b: created lazily on the first direct turn (needs a route).
-    agentSession: null
+    agentSession: null,
+    turnAbortController: null,
+    shownTruncationWarning: false,
+    shownDelegateTruncationWarning: false
   };
 
   try {
+    // Network shares can make git status take many seconds — never leave the
+    // operator staring at a blank screen with no feedback.
+    print(dim(theme, "starting session… (resolving repo / git)"));
+    const sessionStartedAt = Date.now();
     state.session = await runtime.startSession({});
     state.sessionTools = runtime.getSessionTools(state.session.id);
     // Bind the space scope (§7): the session repo's .guru/memory travels with it.
     scopedMemory.setRepoRoot(state.session.repo?.repoRoot ?? null);
     refreshBootMemoryBlock();
-    print(dim(theme, `session ${state.session.id.slice(0, 8)} ready · ${state.session.tools.length} tools (agentic) · ${routes.length} routes in catalog`));
+    const sessionMs = Date.now() - sessionStartedAt;
+    const slowNote = sessionMs >= 1_500 ? paint.fg("warning", ` · ${sessionMs}ms (slow disk/share?)`) : dim(theme, ` · ${sessionMs}ms`);
+    print(
+      dim(theme, `session ${state.session.id.slice(0, 8)} ready · ${state.session.tools.length} tools (agentic) · ${routes.length} routes in catalog`) +
+        slowNote
+    );
 
     // Bridge loading (§14/§16): every discovered bridge skill is an ATTACH, so it
     // must ride a tracked parity gap — never a silent DEPEND (§S4). Record one gap
@@ -3582,7 +4283,7 @@ export async function runGuru(): Promise<void> {
         ],
         {
           tools: offered,
-          executeTool: (toolId, input) => state.runtime.executeTool(session.id, toolId, injectRepoRoot(toolId, input, session)),
+          executeTool: (toolId, input, signal) => state.runtime.executeTool(session.id, toolId, injectRepoRoot(toolId, input, session), signal),
           approveTool: (toolId, input) => {
             if (READ_ONLY_TOOL_IDS.has(toolId) || MANDATE_READ_ONLY_TOOLS.has(toolId)) {
               return true;
@@ -3610,23 +4311,36 @@ export async function runGuru(): Promise<void> {
           maxTokens: request.tokenBudget,
           timeoutMs: request.timeoutMs,
           retry: state.retryConfig,
+          // Forward kill_task's abort signal into the agent turn (review 2026-07-08):
+          // the manager trips this when kill_task is called, and directAgentTurn
+          // honors it at every loop iteration + the fetch level. The worker stops
+          // hitting the model instead of running to its timeout.
+          ...(request.signal ? { signal: request.signal } : {}),
           ...(state.modelIdOverride ? { modelIdOverride: state.modelIdOverride } : {})
         }
       );
-      return { text: result.text, toolCallCount: result.toolCallCount, budgetExceeded: result.toolCallCount >= request.toolCallBudget };
+      // A clean return from directAgentTurn means the loop reached a terminal
+      // turn (no more tool calls) — that is NOT budget exhaustion, even when the
+      // call count equals the budget. True budget exhaustion throws the
+      // "exceeded the iteration cap" DirectChatError (caught by the swarm runner),
+      // which is the only path that should flag budgetExceeded (review 2026-07-08).
+      return { text: result.text, toolCallCount: result.toolCallCount, budgetExceeded: false };
     });
   } catch (error) {
     print(colorize(theme, "yellow", `Session start degraded: ${error instanceof Error ? error.message : String(error)}`));
   }
 
-  // Auto-connect (2026-07 — DIRECT-READY FIRST): the highest-ranked chat-capable route
-  // guru can call DIRECTLY — one with a baseUrl AND a credential the resolver resolves
-  // (an API key OR a plan/OAuth token in the encrypted vault). This covers API-key lanes
-  // AND native plan lanes (ChatGPT/Grok/Z.AI) identically. There is no CLI delegate; the
-  // only fallback is planRoute's choice, and only when it is directly credential-usable.
+  // Auto-connect (v1.3.0 — DIRECT-READY FIRST): highest-ranked chat-capable route
+  // with baseUrl + resolver credential (API key OR vaulted OAuth). Exclude
+  // credentialSource "none" (e.g. ollama) so a fresh machine does not auto-stick
+  // to a local service that ECONNREFUSEs. Explicit /model still works.
   const plan = planRoute({}, routes);
   const directReady = sortedRoutes(routes).filter(
-    (route) => route.baseUrl !== undefined && isChatCapableFamily(route.apiFamily) && resolveRouteCredential(route).usable
+    (route) =>
+      route.baseUrl !== undefined &&
+      isChatCapableFamily(route.apiFamily) &&
+      route.credentialSource.type !== "none" &&
+      resolveRouteCredential(route).usable
   );
   const auto = directReady[0] ?? (plan.verdict === "selected" && plan.choice && isChatCapableFamily(plan.choice.apiFamily) && resolveRouteCredential(plan.choice).usable
     ? plan.choice
@@ -3692,14 +4406,15 @@ export async function runGuru(): Promise<void> {
   };
   const drillItems = (parentId: string): MenuItem[] => {
     if (parentId === "/model" || parentId === "/models") {
-      return sortedRoutes(state.routes).map((route, index) => {
-        const availability = state.availability.find((row) => row.routeId === route.routeId);
-        const status = availability?.status ?? route.status;
-        return { id: `/model ${index + 1}`, label: route.routeId, hint: status };
-      });
+      return buildModelDrillMenuItems(state.routes, { ...(state.connectedRoute ? { connectedRouteId: state.connectedRoute.routeId } : {}) });
     }
     if (parentId === "/resume" || parentId === "/sessions") {
-      return state.store.list().slice(0, 12).map((item, index) => ({
+      // Cap at 50 as a sanity guard; overlay scrolls with "N of M" cues.
+      const sessions = state.store.list().slice(0, 50);
+      if (sessions.length === 0) {
+        return [{ id: "/sessions", label: "(no saved sessions yet)", hint: "chat once — then resume from here" }];
+      }
+      return sessions.map((item, index) => ({
         id: `/resume ${index + 1}`,
         label: item.title.length > 34 ? `${item.title.slice(0, 33)}…` : item.title,
         hint: `${item.routeId ?? "no route"} · ${item.turnCount} turn(s)`
@@ -3718,17 +4433,68 @@ export async function runGuru(): Promise<void> {
     // --- TTY: the composer OWNS the input (ADR 2026-07-05-composer-editor):
     // multi-line editor (Ctrl+J newline), slash menu, @ file picker, Tab paths,
     // pinned chrome — readline's line management is fully replaced here.
-    const composer = attachComposer({
+    // Declared before attach so busy handlers can forceRefresh chrome (queue depth)
+    // once the controller exists — object is assigned immediately below.
+    let composer!: ReturnType<typeof attachComposer>;
+    composer = attachComposer({
       input: process.stdin,
       output: process.stdout,
       interactive: true,
       isBusy: () => state.busy,
+      // Don't capture y/N/a while the per-call approval prompt owns the key.
+      allowBusySteer: () => state.busy && !state.awaitingApproval,
+      // Mid-run steer: typed+Enter during a streaming turn injects into the agent loop.
+      onBusySteer: (text) => {
+        if (state.agentSession) {
+          state.agentSession.steer(text);
+          queueMicrotask(() => composer.forceRefresh());
+        } else {
+          print(dim(theme, "  (no active agent session to steer)"));
+        }
+      },
+      onBusyFollowUp: (text) => {
+        if (!state.connectedRoute) {
+          print(dim(theme, "  (no model connected — follow-up not queued)"));
+          return;
+        }
+        state.agentSession ??= new AgentSession({
+          runtime: state.runtime,
+          route: state.connectedRoute,
+          ...(state.session ? { session: state.session } : {}),
+          sessionTools: state.sessionTools,
+          mandate: state.mandate,
+          now: () => new Date()
+        });
+        state.agentSession.followUp(text);
+        // Surface q:N on the status bar under a live turn (not only after idle repaint).
+        queueMicrotask(() => composer.forceRefresh());
+      },
       commandItems,
       drillItems,
-      chromeRows: () => [buildStatusBar(state, process.stdout.columns ?? 80), composerHintLine(paint, ["ctrl+j newline", "@ files", "tab paths"])]
+      chromeRows: () => {
+        const q = state.agentSession?.queueDepth() ?? 0;
+        const extras = ["ctrl+j newline", "@ files", "tab paths", "type+↵ steer", "alt+↵ follow-up"];
+        if (q > 0) {
+          extras.push(`q:${q} waiting`);
+        }
+        return [buildStatusBar(state, process.stdout.columns ?? 80), composerHintLine(paint, extras)];
+      }
     });
     let sigints = 0;
     composer.onInterrupt(() => {
+      // Mid-turn: first Esc/Ctrl+C aborts the RUNNING agent — the #1 interactive
+      // promise ("esc interrupt"). Double-tap quit only applies when IDLE.
+      if (state.busy) {
+        // Trip the per-turn signal so the delegated CLI's child process is SIGKILL'd
+        // (the delegated path doesn't run through AgentSession, so we can't rely on
+        // its internal controller alone).
+        state.turnAbortController?.abort();
+        const aborted = state.agentSession?.abort() ?? false;
+        if (aborted) {
+          print(dim(theme, "  ⊘ turn interrupted — partial kept where available"));
+        }
+        return;
+      }
       sigints += 1;
       if (sigints >= 2) {
         composer.close();
@@ -3743,11 +4509,11 @@ export async function runGuru(): Promise<void> {
 
     // Resize reflow: repaint the whole composer block at the new width. Named
     // + removed in the finally below — an orphaned listener would keep the
-    // closed composer closure alive (CodeRabbit round 2).
+    // closed composer closure alive (CodeRabbit round 2). Uses forceRefresh so
+    // a resize DURING a streamed turn still reflows (render() would early-return
+    // on isBusy() and leave the cursor anchor stale).
     const onResize = (): void => {
-      if (!state.busy) {
-        composer.refresh();
-      }
+      composer.forceRefresh();
     };
     process.stdout.on("resize", onResize);
 

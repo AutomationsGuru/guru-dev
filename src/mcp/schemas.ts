@@ -1,16 +1,15 @@
 import { z } from "zod";
 
-export const McpServerIdSchema = z.enum([
-  "beeper",
-  "context7",
-  "pixellab",
-  "playwright",
-  "remotion-documentation",
-  "scenario",
-  "supabase",
-  "openai-developer-docs",
-  "perplexity-docs"
-]);
+/**
+ * Server ids are open slugs, not a closed enum — the ATTACH move means grafting
+ * onto WHATEVER MCP server the environment offers, including ones this codebase
+ * has never heard of. (Widened 2026-07-09 from the original nine-server enum;
+ * the schema module had zero consumers, so no call sites changed shape.)
+ */
+export const McpServerIdSchema = z
+  .string()
+  .trim()
+  .regex(/^[a-z][a-z0-9._-]{0,63}$/u, "Expected a lowercase slug (a-z, 0-9, dot, dash, underscore; max 64 chars).");
 export type McpServerId = z.infer<typeof McpServerIdSchema>;
 
 export const McpTransportSchema = z.enum(["stdio", "http", "sse"]);

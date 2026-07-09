@@ -63,3 +63,52 @@ describe("scenario 9 — a `cat .env` cannot leak through the render sanitizer (
     expect(text).toContain("LOG_LEVEL=debug"); // non-secret config untouched
   });
 });
+
+/**
+ * C1 regression (critic-bench 2026-07-06): the assignment scanner's value class
+ * stopped at the first space, so a QUOTED value with spaces leaked everything
+ * after the first word — `PASSWORD="long secret tail"` kept ` secret tail"`.
+ * The quoted branches must run to the closing quote, and the same scanner gates
+ * memory writes (containsSecretValue), so the leak also poisoned memory files.
+ */
+describe("C1 — quoted assignment values with spaces are fully redacted", () => {
+  beforeEach(() => clearRegisteredSecretValues());
+
+  it("redacts a double-quoted multi-word value to the closing quote", () => {
+    const { text, matched } = scrubSecretValuesReport('export DB_PASSWORD="hunter two three"');
+    expect(text).not.toContain("hunter");
+    expect(text).not.toContain("two three");
+    expect(text).toContain('DB_PASSWORD="[redacted:credential]"');
+    expect(matched).toContain("secret-assignment");
+  });
+
+  it("redacts a single-quoted multi-word value to the closing quote", () => {
+    const text = scrubSecretValues("api_token='alpha beta gamma'");
+    expect(text).not.toContain("alpha");
+    expect(text).not.toContain("beta gamma");
+    expect(text).toContain("api_token='[redacted:credential]'");
+  });
+
+  it("redacts JSON/YAML-style quoted keys with spaced values", () => {
+    const json = scrubSecretValues('{ "client_secret": "abc def ghi" }');
+    expect(json).not.toContain("abc def ghi");
+    const yaml = scrubSecretValues('password: "spaced value here"');
+    expect(yaml).not.toContain("spaced value here");
+  });
+
+  it("still redacts bare unquoted values (group renumbering guard)", () => {
+    const text = scrubSecretValues("password=actualsecretvalue123");
+    expect(text).not.toContain("actualsecretvalue123");
+    expect(text).toContain("password=[redacted:credential]");
+  });
+
+  it("gates memory writes: containsSecretValue sees the quoted multi-word leak", () => {
+    expect(containsSecretValue('PASSWORD="long secret tail"')).toBe(true);
+    expect(containsSecretValue("token: 'multi word secret'")).toBe(true);
+  });
+
+  it("does NOT redact multi-word values under non-secret keys", () => {
+    const text = scrubSecretValues('GREETING="hello there world"');
+    expect(text).toContain('GREETING="hello there world"');
+  });
+});

@@ -22,6 +22,13 @@ export interface MenuState {
   readonly selected: number;
   /** The user's typed input line (commands mode filters against this). */
   readonly buffer: string;
+  /**
+   * The commands-mode selection saved when drilling into a submenu, restored on
+   * `left`/back-out (review 2026-07-08): without this, drilling `→` then backing
+   * out `←` left the cursor on whatever index the drill happened to be on, so
+   * the operator landed on a different command than the one they drilled from.
+   */
+  readonly parentSelected?: number;
 }
 
 export type MenuKey =
@@ -48,15 +55,20 @@ export function createMenuState(items: readonly MenuItem[], buffer: string): Men
 }
 
 export function enterDrill(state: MenuState, parentId: string, items: readonly MenuItem[]): MenuState {
-  return { mode: "drill", parentId, items, selected: 0, buffer: state.buffer };
+  // Save the commands-mode cursor so `left` restores it (no jump to row 0).
+  return { mode: "drill", parentId, items, selected: 0, buffer: state.buffer, parentSelected: state.selected };
 }
 
 /** Re-filter (commands mode) after typing; keeps selection on the same item when possible. */
 export function refilter(state: MenuState, items: readonly MenuItem[], buffer: string): MenuState {
-  const previous = state.items[state.selected]?.id;
+  // After a drill back-out, state.items is still the drill list — anchor on the
+  // parent command id (parentId) instead of the stale drill selection, so the
+  // cursor lands on the command the operator drilled from (review 2026-07-08).
+  const previous = state.parentId ?? state.items[state.selected]?.id;
   const kept = items.findIndex((item) => item.id === previous);
+  const { parentId: _pi, parentSelected: _ps, ...rest } = state;
 
-  return { ...state, mode: "commands", items, selected: kept >= 0 ? kept : 0, buffer };
+  return { ...rest, mode: "commands", items, selected: kept >= 0 ? kept : 0, buffer };
 }
 
 export function selectedItem(state: MenuState): MenuItem | undefined {
@@ -79,7 +91,12 @@ export function menuReduce(state: MenuState, key: MenuKey): MenuStep {
     }
     case "left":
       if (state.mode === "drill") {
-        return { state: { ...state, mode: "commands" }, effect: { kind: "drill", parentId: "" } };
+        // Restore the commands-mode cursor saved at enterDrill so the operator
+        // lands back on the command they drilled from (review 2026-07-08). Keep
+        // parentId so the host's refilter can anchor on the drilled command even
+        // though state.items is still the drill list at this instant.
+        const { parentSelected: _ps, ...rest } = state;
+        return { state: { ...rest, mode: "commands", selected: state.parentSelected ?? 0 }, effect: { kind: "drill", parentId: "" } };
       }
       return { state, effect: { kind: "render" } };
     case "escape":

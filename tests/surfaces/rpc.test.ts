@@ -1,3 +1,4 @@
+import { PassThrough } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -5,7 +6,7 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { dispatchRpc, frameChunk, wireRpcEvents, RpcRequestSchema, type RpcContext } from "../../src/surfaces/rpc.js";
+import { dispatchRpc, frameChunk, runRpcMode, wireRpcEvents, RpcRequestSchema, type RpcContext } from "../../src/surfaces/rpc.js";
 import { AgentSession, type TurnRunner } from "../../src/session/agentSession.js";
 import { sanitizeToolOutput } from "../../src/safety/outputSanitizer.js";
 import { clearRegisteredSecretValues } from "../../src/safety/secretSafety.js";
@@ -69,6 +70,27 @@ describe("RPC dispatch — on the unified AgentSession engine", () => {
     expect(res).toMatchObject({ id: 1, ok: true, result: { text: "engine reply" } });
   });
 
+  it("prompt drains queued follow-ups as fresh turns when the primary turn stops", async () => {
+    const submitted: string[] = [];
+    const runner = (async (_r, messages) => {
+      const text = messages.at(-1)?.content ?? "";
+      submitted.push(text);
+      return {
+        text: `ok:${text}`,
+        modelId: "m",
+        routeId: "stub/model",
+        apiFamily: "openai-chat-completions",
+        toolCallCount: 0,
+        toolEvents: []
+      } satisfies AgentTurnResult;
+    }) as TurnRunner;
+    const session = makeSession(runner);
+    session.followUp("then write tests");
+    const res = await dispatchRpc(RpcRequestSchema.parse({ id: 2, method: "prompt", params: { text: "ship it" } }), ctx(session));
+    expect(submitted).toEqual(["ship it", "then write tests"]);
+    expect(res).toMatchObject({ id: 2, ok: true, result: { text: "ok:then write tests" } });
+  });
+
   it("steer / state / models / unknown method", async () => {
     const s = makeSession();
     expect(await dispatchRpc(RpcRequestSchema.parse({ method: "steer", params: { text: "focus" } }), ctx(s))).toMatchObject({ ok: true, result: { queued: 1 } });
@@ -87,6 +109,48 @@ describe("RPC dispatch — on the unified AgentSession engine", () => {
     expect(worn).toMatchObject({ ok: true, result: { created: true, suit: "finance-work" } });
     const parked = await dispatchRpc(RpcRequestSchema.parse({ method: "park" }), ctx(s));
     expect(parked).toMatchObject({ ok: true });
+  });
+});
+
+describe("runRpcMode — request ordering", () => {
+  it("processes follow_up immediately while a prompt is still running", async () => {
+    let releasePrompt: (() => void) | undefined;
+    const promptGate = new Promise<void>((resolve) => {
+      releasePrompt = resolve;
+    });
+    const runner = (async (_r, messages) => {
+      const text = messages.at(-1)?.content ?? "";
+      if (text === "slow") {
+        await promptGate;
+      }
+      return {
+        text: `ok:${text}`,
+        modelId: "m",
+        routeId: "stub/model",
+        apiFamily: "openai-chat-completions",
+        toolCallCount: 0,
+        toolEvents: []
+      } satisfies AgentTurnResult;
+    }) as TurnRunner;
+    const session = makeSession(runner);
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const lines: string[] = [];
+    output.on("data", (chunk) => {
+      lines.push(String(chunk));
+    });
+    const run = runRpcMode({ session, input, output });
+    input.write(`${JSON.stringify({ id: 1, method: "prompt", params: { text: "slow" } })}\n`);
+    input.write(`${JSON.stringify({ id: 2, method: "follow_up", params: { text: "after stop" } })}\n`);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(lines.some((line) => line.includes('"queued"'))).toBe(true);
+    releasePrompt?.();
+    input.end();
+    await run;
+    const responses = lines.map((line) => JSON.parse(line.trim()) as { id?: number; ok?: boolean });
+    expect(responses.find((response) => response.id === 2)).toMatchObject({ ok: true });
+    const finalPrompt = responses.find((response) => response.id === 1);
+    expect(finalPrompt).toMatchObject({ ok: true, result: { text: "ok:after stop" } });
   });
 });
 

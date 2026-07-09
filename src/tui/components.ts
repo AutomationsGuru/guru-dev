@@ -13,10 +13,51 @@ export const GLYPHS = {
   agent: "▲"
 } as const;
 
-/** Visible width of a string with ANSI escapes stripped. */
+/**
+ * Display width of one code point: 0 for combining/zero-width, 2 for wide
+ * (CJK/emoji), else 1. Mirrors editor.ts charDisplayWidth — kept local to avoid a
+ * circular import (editor.ts imports visibleWidth from here).
+ */
+function charDisplayWidth(codePoint: number): number {
+  if (
+    (codePoint >= 0x0300 && codePoint <= 0x036f) || // combining diacritics
+    (codePoint >= 0x200b && codePoint <= 0x200f) || // zero-width space/joiners/marks
+    (codePoint >= 0xfe00 && codePoint <= 0xfe0f) || // variation selectors
+    codePoint === 0xfeff // zero-width no-break space (BOM)
+  ) {
+    return 0;
+  }
+  if (
+    (codePoint >= 0x1100 && codePoint <= 0x115f) || // Hangul Jamo
+    (codePoint >= 0x2e80 && codePoint <= 0xa4cf) || // CJK radicals … Yi
+    (codePoint >= 0xac00 && codePoint <= 0xd7a3) || // Hangul syllables
+    (codePoint >= 0xf900 && codePoint <= 0xfaff) || // CJK compat ideographs
+    (codePoint >= 0xfe30 && codePoint <= 0xfe4f) || // CJK compat forms
+    (codePoint >= 0xff00 && codePoint <= 0xff60) || // fullwidth forms
+    (codePoint >= 0xffe0 && codePoint <= 0xffe6) ||
+    (codePoint >= 0x1f300 && codePoint <= 0x1faff) || // emoji blocks
+    (codePoint >= 0x20000 && codePoint <= 0x3fffd) // CJK ext B+
+  ) {
+    return 2;
+  }
+  return 1;
+}
+
+/**
+ * Visible width of a string with ANSI escapes stripped, counted in DISPLAY
+ * cells (CJK/emoji = 2) — not UTF-16 code units. The status bar gap math, box
+ * padding, and table column widths all depend on this matching what the
+ * terminal actually draws (review 2026-07-08: the old `.length` overflowed the
+ * edge by one cell per wide char and wrapped the pinned status bar).
+ */
 export function visibleWidth(text: string): number {
   // eslint-disable-next-line no-control-regex
-  return text.replace(/\x1b\[[0-9;]*m/gu, "").length;
+  const stripped = text.replace(/\x1b\[[0-9;]*m/gu, "");
+  let width = 0;
+  for (const char of stripped) {
+    width += charDisplayWidth(char.codePointAt(0) ?? 0);
+  }
+  return width;
 }
 
 export type BadgeKind = "brand" | "success" | "warning" | "error" | "ghost";
@@ -40,12 +81,12 @@ export function badge(painter: Painter, label: string, kind: BadgeKind = "brand"
 
 /** Rounded box (§5): `╭─╮ │ ╰─╯` in border; optional inline title, muted bold. */
 export function roundedBox(painter: Painter, lines: readonly string[], options: { title?: string; width?: number; focused?: boolean } = {}): string[] {
-  const contentWidth = Math.max(options.width ?? 0, ...lines.map(visibleWidth), options.title ? options.title.length + 4 : 0);
+  const contentWidth = Math.max(options.width ?? 0, ...lines.map(visibleWidth), options.title ? visibleWidth(options.title) + 4 : 0);
   const borderToken: keyof ThemeTokens = options.focused ? "accent" : "border";
   const edge = (text: string): string => painter.fg(borderToken, text);
   // Title row chrome: "╭─ " + title + " " + dashes + "╮" must total contentWidth + 4.
   const title = options.title
-    ? `${edge("╭─ ")}${painter.bold(painter.fg("muted", options.title))}${edge(` ${"─".repeat(Math.max(0, contentWidth - options.title.length - 1))}╮`)}`
+    ? `${edge("╭─ ")}${painter.bold(painter.fg("muted", options.title))}${edge(` ${"─".repeat(Math.max(0, contentWidth - visibleWidth(options.title) - 1))}╮`)}`
     : edge(`╭${"─".repeat(contentWidth + 2)}╮`);
 
   return [

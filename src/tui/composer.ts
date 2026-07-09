@@ -25,6 +25,7 @@ export function composerTopRule(painter: Painter, columns: number, modeLabel?: s
 
 /** The hint line under the composer: available keys, muted. Full-width, left-aligned. */
 export function composerHintLine(painter: Painter, extras: readonly string[] = []): string {
-  const hints = ["/ commands", "↵ run", "esc interrupt", "ctrl+d exit", ...extras];
+  // esc interrupt is LIVE: mid-turn Esc/Ctrl+C abort the running agentSession.
+  const hints = ["/ commands", "↵ run", "esc/ctrl+c interrupt", "ctrl+d exit", ...extras];
   return painter.fg("fgFaint", `  ${hints.join(" · ")}`);
 }

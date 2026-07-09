@@ -350,6 +350,40 @@ async function runSelfBuildExecutorWithRuntime(
     );
   }
 
+  // Hardening #4/#6 (spend-safety): a LIVE push/PR from the executor is a deploy
+  // action and must clear the mandate gate like every other spend/deploy edge —
+  // this path previously called runGitPrAutomation directly, bypassing the policy
+  // that makeGatedGitDelivery enforces on the ship path. Dry runs stay ungated.
+  if (options.git?.enabled && options.git.dryRun === false && options.mandatePolicy) {
+    const pushBranch = options.git.branchName ?? `feat/${session.task?.id ?? "self-build"}`;
+    const decision = options.mandatePolicy(
+      "bash",
+      { command: `git push origin ${pushBranch}` },
+      session.repo?.repoRoot ?? cwd
+    );
+    if (decision && decision.outcome !== "allow") {
+      await recordProgressBeacon(sessionPersistenceStore, session.id, "git-pr-mandate", "blocked", `Live git/PR automation gated by mandate policy (${decision.outcome}).`, {
+        outcome: decision.outcome
+      });
+
+      return recordDonePacketAndReturn(
+        await buildBlockedReport({
+          session,
+          planner: planner.report,
+          reviewGates,
+          operationalStore,
+          projectSlug,
+          stage: "git-pr-mandate",
+          plannerFallback: planner.playbook,
+          extraRisks: [
+            `Live git push/PR was gated by the mandate policy (${decision.outcome}: ${decision.reason}) — no unapproved push.`
+          ]
+        }),
+        sessionPersistenceStore
+      );
+    }
+  }
+
   if (options.git?.enabled) {
     await recordProgressBeacon(sessionPersistenceStore, session.id, "git-pr", "started", "Git/PR automation started.", {
       dryRun: options.git.dryRun ?? true

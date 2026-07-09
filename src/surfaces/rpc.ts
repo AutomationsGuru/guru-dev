@@ -61,7 +61,7 @@ export async function dispatchRpc(request: RpcRequest, ctx: RpcContext): Promise
   try {
     switch (request.method) {
       case "prompt": {
-        const result = await ctx.session.prompt(String(params.text ?? ""));
+        const result = await ctx.session.promptDrainingFollowUps(String(params.text ?? ""));
         return { ...idField, ok: true, result: { text: result.text, toolCalls: result.toolCallCount } };
       }
       case "steer": {
@@ -161,7 +161,22 @@ export async function runRpcMode(options: RunRpcOptions = {}): Promise<void> {
   const input = options.input ?? process.stdin;
   const decoder = new StringDecoder("utf8");
   const state = { buffer: "" };
+  // Prompts serialize (each may drain follow-ups); steer/follow_up/abort stay immediate
+  // so they can land mid-turn without waiting behind a long prompt.
+  let promptChain: Promise<void> = Promise.resolve();
+  const dispatchLine = (request: RpcRequest): void => {
+    if (request.method === "prompt") {
+      promptChain = promptChain.then(async () => {
+        emit(await dispatchRpc(request, ctx));
+      });
+      return;
+    }
+    void dispatchRpc(request, ctx).then((response) => emit(response));
+  };
   await new Promise<void>((resolve) => {
+    const finish = (): void => {
+      void promptChain.finally(() => resolve());
+    };
     input.on("data", (chunk: Buffer | string) => {
       for (const line of frameChunk(state, chunk, decoder)) {
         const trimmed = line.trim();
@@ -175,11 +190,11 @@ export async function runRpcMode(options: RunRpcOptions = {}): Promise<void> {
           emit({ ok: false, error: `bad request: ${error instanceof Error ? error.message : String(error)}` });
           continue;
         }
-        void dispatchRpc(request, ctx).then((response) => emit(response));
+        dispatchLine(request);
       }
     });
-    input.on("end", () => resolve());
-    input.on("close", () => resolve());
+    input.on("end", finish);
+    input.on("close", finish);
   });
   unwire();
 }

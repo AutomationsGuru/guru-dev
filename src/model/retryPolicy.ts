@@ -7,12 +7,22 @@ import { z } from "zod";
  * the request points in agentTurn.ts wire it; tests drive it with zero real waits.
  */
 
+/** Default per-request timeout — a blackholed provider must never hang the turn forever.
+ * 60s is the daily-driver ceiling: long enough for slow first-token, short enough that
+ * a stuck connection surfaces a visible error before the operator gives up. Operators
+ * with patience can raise it in guruharness.config.json `retry.provider.timeoutMs`. */
+export const DEFAULT_PROVIDER_TIMEOUT_MS = 60_000;
+
 export const ProviderRetryConfigSchema = z
   .object({
     /** Extra attempts granted ONLY when the provider explicitly requested retry. */
     maxRetries: z.number().int().nonnegative().max(10).default(0),
-    /** Optional per-request timeout (AbortController around the fetch). */
-    timeoutMs: z.number().int().positive().optional(),
+    /**
+     * Per-request timeout (AbortController around the fetch). Defaults to 60s so a
+     * blackholed connection surfaces an error before the operator gives up; raise in
+     * guruharness.config.json for slow first-token providers.
+     */
+    timeoutMs: z.number().int().positive().default(DEFAULT_PROVIDER_TIMEOUT_MS),
     /** A server-requested delay beyond this fails IMMEDIATELY (the ceiling rule). */
     maxRetryDelayMs: z.number().int().positive().default(60_000)
   })
@@ -38,13 +48,27 @@ export interface AttemptFailure {
   readonly networkError?: boolean;
   /** Parsed Retry-After delay in ms, when the provider sent one. */
   readonly retryAfterMs?: number;
+  /**
+   * True when the operator (or session) aborted the turn. Never retry — the user
+   * cancelled; sleeping + re-hitting the network is hostile.
+   */
+  readonly aborted?: boolean;
+  /**
+   * True when our per-request timeout fired. Terminal — retrying only waits out
+   * the same timeout again (multi-minute hang).
+   */
+  readonly timeout?: boolean;
 }
 
 /**
  * The binding classification table (ADR): network failures, 408, 429, and 5xx
- * retry; every other 4xx is a REAL error and fails immediately.
+ * retry; every other 4xx is a REAL error and fails immediately. Operator abort
+ * and per-request timeouts are never retryable.
  */
 export function isRetryableFailure(failure: AttemptFailure): boolean {
+  if (failure.aborted === true || failure.timeout === true) {
+    return false;
+  }
   if (failure.networkError === true) {
     return true;
   }
@@ -128,13 +152,74 @@ export interface RetryHooks {
   readonly random?: () => number;
 }
 
-const defaultSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+const defaultSleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    if (typeof timer === "object" && timer !== null && "unref" in timer) {
+      (timer as NodeJS.Timeout).unref();
+    }
+  });
+
+/**
+ * Sleep that wakes early when `signal` aborts — so cancel during backoff is
+ * immediate instead of waiting out a multi-second exponential delay. Uses the
+ * injectable `sleep` so tests still observe exact delay values.
+ *
+ * When using the default timer path, cancelation clears the timeout so abort
+ * mid-backoff does not pin the event loop until the full delay elapses.
+ */
+export function abortableSleep(ms: number, signal?: AbortSignal, sleep: (ms: number) => Promise<void> = defaultSleep): Promise<void> {
+  if (!signal) {
+    return sleep(ms);
+  }
+  if (signal.aborted) {
+    return Promise.resolve();
+  }
+  // Own the timer when using defaultSleep so abort can clear it immediately.
+  if (sleep === defaultSleep) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        signal.removeEventListener("abort", onAbort);
+        resolve();
+      };
+      const onAbort = (): void => finish();
+      const timer = setTimeout(finish, ms);
+      if (typeof timer === "object" && timer !== null && "unref" in timer) {
+        (timer as NodeJS.Timeout).unref();
+      }
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    };
+    const onAbort = (): void => finish();
+    signal.addEventListener("abort", onAbort, { once: true });
+    void sleep(ms).then(finish);
+  });
+}
 
 /**
  * The generic retry loop. `doAttempt` performs one request; on failure it must
  * throw an Error carrying the AttemptFailure via `describeFailure`. Budget:
  * `maxRetries` retries, plus `provider.maxRetries` extra ONLY for
  * provider-requested (Retry-After) failures. `enabled: false` = one attempt.
+ *
+ * When `signal` is provided: pre-attempt abort short-circuits, and backoff sleep
+ * is interruptible so cancel mid-retry does not wait out the full delay.
  */
 export async function runWithRetryPolicy<T>(
   doAttempt: () => Promise<T>,
@@ -142,6 +227,8 @@ export async function runWithRetryPolicy<T>(
     readonly config: RetryConfig;
     readonly describeFailure: (error: unknown) => AttemptFailure;
     readonly hooks?: RetryHooks;
+    /** Operator/session abort — never retry after cancel; interrupt backoff sleep. */
+    readonly signal?: AbortSignal;
   }
 ): Promise<T> {
   const { config } = options;
@@ -151,6 +238,9 @@ export async function runWithRetryPolicy<T>(
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
+    if (options.signal?.aborted) {
+      throw Object.assign(new Error("Request aborted."), { aborted: true });
+    }
     try {
       return await doAttempt();
     } catch (error) {
@@ -158,6 +248,9 @@ export async function runWithRetryPolicy<T>(
         throw error;
       }
       const failure = options.describeFailure(error);
+      if (options.signal?.aborted || failure.aborted === true) {
+        throw error;
+      }
       if (!isRetryableFailure(failure)) {
         throw error;
       }
@@ -195,7 +288,15 @@ export async function runWithRetryPolicy<T>(
               ? `HTTP ${failure.status}`
               : "transient failure"
       });
-      await sleep(delayMs);
+      // Interruptible backoff: cancel mid-sleep must not wait out the full delay.
+      if (options.signal) {
+        await abortableSleep(delayMs, options.signal, sleep);
+        if (options.signal.aborted) {
+          throw error;
+        }
+      } else {
+        await sleep(delayMs);
+      }
     }
   }
 }

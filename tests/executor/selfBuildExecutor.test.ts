@@ -657,6 +657,80 @@ describe("runSelfBuildExecutor runtime hardening", () => {
     }
   });
 
+  it("blocks a live git push the mandate policy does not allow (hardening #4 — no unapproved push)", async () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), "guruharness-mandate-git-"));
+
+    try {
+      const configPath = join(tempRoot, "guruharness.config.json");
+      writeFileSync(configPath, JSON.stringify({ approvalPolicy: { autoCommitPushPr: true } }));
+      const model = new FixedPlannerModel({
+        objective: "Execute task.",
+        summary: "No tools needed.",
+        steps: []
+      });
+      const evaluated: string[] = [];
+
+      const report = await runSelfBuildExecutor({
+        cwd: repoRoot,
+        configPath,
+        taskId: "self-build-executor",
+        allowDirtyWorkspace: true,
+        allowRiskyPaths: true,
+        plannerModel: model,
+        commandExecutor: createCommandExecutor([]),
+        mandatePolicy: (toolId, input) => {
+          evaluated.push(`${toolId}:${JSON.stringify(input)}`);
+          return { outcome: "escalate", reason: "spend hard-edge: live push requires an explicit grant", verbs: [] };
+        },
+        git: {
+          enabled: true,
+          dryRun: false,
+          paths: ["src/executor/selfBuildExecutor.ts"]
+        }
+      });
+
+      expect(report.verdict).toBe("RED");
+      expect(report.summary).toContain("git-pr-mandate");
+      expect(report.gitPr).toBeNull();
+      expect(report.blocker?.stateSnapshot.body).toContain("mandate policy");
+      // The push itself was evaluated as a deploy action — mirroring makeGatedGitDelivery.
+      expect(evaluated.join("\n")).toContain("git push origin");
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("does NOT consult the mandate policy for dry-run git automation (dry runs stay ungated)", async () => {
+    const model = new FixedPlannerModel({
+      objective: "Execute task.",
+      summary: "No tools needed.",
+      steps: []
+    });
+    const evaluated: string[] = [];
+
+    const report = await runSelfBuildExecutor({
+      cwd: repoRoot,
+      taskId: "self-build-executor",
+      allowDirtyWorkspace: true,
+      allowRiskyPaths: true,
+      plannerModel: model,
+      commandExecutor: createCommandExecutor([]),
+      mandatePolicy: (toolId, input) => {
+        evaluated.push(`${toolId}:${JSON.stringify(input)}`);
+        return { outcome: "escalate", reason: "should never gate a dry run", verbs: [] };
+      },
+      git: {
+        enabled: true,
+        dryRun: true,
+        paths: ["src/executor/selfBuildExecutor.ts"]
+      }
+    });
+
+    expect(report.summary).not.toContain("git-pr-mandate");
+    expect(report.gitPr?.dryRun).toBe(true);
+    expect(evaluated.join("\n")).not.toContain("git push origin");
+  });
+
   it("should report missing-model configuration when no model candidates resolve", async () => {
     const tempRoot = mkdtempSync(join(tmpdir(), "guruharness-no-model-"));
     try {

@@ -3,7 +3,9 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { findGitRoot, readAgentsChain, resolveRepositoryContext } from "../../src/repo/context.js";
+import { afterEach, describe, expect, it } from "vitest";
+
+import { findGitRoot, GIT_STATUS_TIMEOUT_MS, readAgentsChain, readGitStatus, resolveRepositoryContext } from "../../src/repo/context.js";
 import { expectSamePath } from "../helpers/paths.js";
 
 const tempDirectories: string[] = [];
@@ -64,6 +66,16 @@ describe("findGitRoot", () => {
     const root = makeTempDirectory();
 
     expect(findGitRoot(root)).toBeUndefined();
+  });
+});
+
+describe("readGitStatus", () => {
+  it("returns a status line for a real repo and documents the timeout bound", () => {
+    expect(GIT_STATUS_TIMEOUT_MS).toBe(8_000);
+    const root = makeTempDirectory();
+    execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
+    const status = readGitStatus(root);
+    expect(status).toContain("##");
   });
 });
 

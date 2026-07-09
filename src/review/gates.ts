@@ -47,6 +47,9 @@ export type CommandExecutor = (
   context: CommandExecutionContext
 ) => Promise<CommandExecutionResult>;
 
+/** Default TEST-gate timeout — a hung `npm test` must not stall the self-build loop forever. */
+export const DEFAULT_GATE_TIMEOUT_MS = 600_000;
+
 export interface CommandGate {
   readonly kind: GateKind;
   readonly name: string;
@@ -54,6 +57,8 @@ export interface CommandGate {
   readonly required: boolean;
   /** The native critic panel (P1): run via an injected model reviewer, NOT a shell command. */
   readonly native?: boolean;
+  /** Kill the gate subprocess after this many ms (default applied for discovered validation gates). */
+  readonly timeoutMs?: number;
 }
 
 /** Runs guru's OWN model-powered review for a native gate (no external tool). Injected by the caller. */
@@ -278,7 +283,9 @@ function toValidationGate(command: ValidationCommand): CommandGate {
     kind: "validation",
     name: command.name,
     command: command.command,
-    required: command.required
+    required: command.required,
+    // Bound every discovered gate so a hung suite cannot stall the loop forever.
+    timeoutMs: DEFAULT_GATE_TIMEOUT_MS
   };
 }
 
@@ -301,7 +308,11 @@ async function executeGateCommand(
   cwd: string | undefined
 ): Promise<CommandExecutionResult> {
   try {
-    return await executor(gate.command, cwd ? { cwd, gate } : { gate });
+    const base = {
+      gate,
+      ...(gate.timeoutMs !== undefined ? { timeoutMs: gate.timeoutMs } : {})
+    };
+    return await executor(gate.command, cwd ? { ...base, cwd } : base);
   } catch (error) {
     return {
       exitCode: null,

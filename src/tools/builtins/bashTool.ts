@@ -53,7 +53,7 @@ export function createPiBashTool(options: PiBashToolOptions = { shellAllowlist: 
       "Bounded command runner (cwd containment, allowlist, timeout, truncation). Pass the full command line in `command` (e.g. \"npm test\") or executable + args separately.",
     inputSchema: PiBashToolInputSchema,
     outputSchema: PiBashToolOutputSchema,
-    async execute(input) {
+    async execute(input, context) {
       const repoRoot = resolve(input.repoRoot);
       const cwd = resolve(repoRoot, input.cwd ?? ".");
       // Models routinely pass the whole command line in `command` ("npm test").
@@ -80,7 +80,7 @@ export function createPiBashTool(options: PiBashToolOptions = { shellAllowlist: 
       // a cancelled-shaped result (never rejects): the cancelled contract holds
       // even against a hung executor (adversarial review 2026-07-05).
       const result = await runWithTimeout(
-        executor(command, { cwd, timeoutMs: input.timeoutMs, gate: { kind: "validation", name: "bash", command, required: true } }),
+        executor(command, { cwd, timeoutMs: input.timeoutMs, gate: { kind: "validation", name: "bash", command, required: true }, ...(context?.signal ? { signal: context.signal } : {}) }),
         input.timeoutMs + 5_000
       ).catch((error: unknown) => ({
         exitCode: null,
@@ -161,7 +161,26 @@ async function runWithTimeout<T>(promise: Promise<T>, timeoutMs: number): Promis
 function truncate(value: string, maxBytes: number): { readonly value: string; readonly truncated: boolean } {
   const buffer = Buffer.from(value, "utf8");
   if (buffer.length <= maxBytes) return { value, truncated: false };
-  return { value: buffer.subarray(0, maxBytes).toString("utf8"), truncated: true };
+  // Walk back to the last complete UTF-8 char boundary (review 2026-07-08): a raw
+  // subarray cut mid-multibyte sequence left orphaned lead/continuation bytes,
+  // which decode to U+FFFD and corrupt the tail of non-ASCII (CJK/emoji) output.
+  let cut = maxBytes;
+  // A continuation byte has the high bits 10xxxxxx (0x80–0xBF). The byte AT the
+  // cut must be a lead byte (start of a char); back up while it's a continuation.
+  while (cut > 0 && (buffer[cut]! & 0xc0) === 0x80) {
+    cut -= 1;
+  }
+  // If we backed onto a LEAD byte of a multibyte char whose full sequence wouldn't
+  // fit in maxBytes, drop that partial char too (its lead byte is 11xxxxxx).
+  if (cut > 0 && (buffer[cut - 1]! & 0xc0) === 0xc0) {
+    // Check the lead byte's declared length vs remaining room.
+    const lead = buffer[cut - 1]!;
+    const seqLen = lead >= 0xf0 ? 4 : lead >= 0xe0 ? 3 : lead >= 0xc0 ? 2 : 1;
+    if (cut - 1 + seqLen > maxBytes) {
+      cut -= 1;
+    }
+  }
+  return { value: buffer.subarray(0, cut).toString("utf8"), truncated: true };
 }
 
 /** Quote-aware whitespace tokenizer for full command lines ("npm test", 'git commit -m "x y"'). */

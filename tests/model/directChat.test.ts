@@ -136,6 +136,30 @@ describe("directChat", () => {
       return true;
     });
   });
+
+  it("honors the caller's abort signal (review 2026-07-08)", async () => {
+    // Old behavior: the one-shot directChat path built its own private
+    // AbortController linked only to the timeout — an operator abort was
+    // ignored and the request ran until the timeoutMs ceiling. Now a caller
+    // signal fires the fetch's abort immediately.
+    let fetchCalled = false;
+    const controller = new AbortController();
+    controller.abort(); // pre-aborted
+    await expect(
+      directChat(chatRoute, messages, {
+        env,
+        signal: controller.signal,
+        timeoutMs: 30_000,
+        fetchImpl: (async (_url: unknown, init: { signal?: AbortSignal }) => {
+          fetchCalled = true;
+          expect(init.signal?.aborted).toBe(true);
+          // The fetch observes the abort and rejects.
+          throw new DOMException("aborted", "AbortError");
+        }) as typeof fetch
+      })
+    ).rejects.toThrow();
+    expect(fetchCalled).toBe(true);
+  });
 });
 
 describe("isChatCapableFamily", () => {

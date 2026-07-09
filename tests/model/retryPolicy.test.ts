@@ -10,6 +10,8 @@ import {
   runWithRetryPolicy
 } from "../../src/model/retryPolicy.js";
 
+// Re-export assertion surface: default timeout is part of the public contract.
+
 const config = (overrides: object = {}) => RetryConfigSchema.parse(overrides);
 
 describe("classification — the binding table (ADR 2026-07-05)", () => {
@@ -26,6 +28,22 @@ describe("classification — the binding table (ADR 2026-07-05)", () => {
       expect(isRetryableFailure({ status }), `status ${status}`).toBe(false);
     }
     expect(isRetryableFailure({})).toBe(false);
+  });
+
+  it("NEVER retries operator abort", () => {
+    expect(isRetryableFailure({ aborted: true })).toBe(false);
+    expect(isRetryableFailure({ aborted: true, networkError: true })).toBe(false);
+  });
+
+  it("NEVER retries per-request timeout (explicit, not status-undefined accident)", () => {
+    expect(isRetryableFailure({ timeout: true })).toBe(false);
+    expect(isRetryableFailure({ timeout: true, networkError: true })).toBe(false);
+  });
+});
+
+describe("default provider timeout", () => {
+  it("ships a 60s default so blackholed providers surface an error before the operator gives up", () => {
+    expect(DEFAULT_RETRY_CONFIG.provider.timeoutMs).toBe(60_000);
   });
 });
 

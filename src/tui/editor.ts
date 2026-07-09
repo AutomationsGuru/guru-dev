@@ -171,7 +171,17 @@ function insertPaste(state: EditorState, text: string): EditorState {
   if (!normalized.includes("\n")) {
     return insertText(state, normalized);
   }
-  const segments = normalized.split("\n");
+  // Drop a SINGLE trailing newline (review 2026-07-08): selecting a whole line
+  // in most editors copies its trailing \n, so pasting "abc\n" produced an extra
+  // blank buffer line and left the cursor on it. Only one is stripped — two+
+  // trailing newlines are intentional (a pasted code block's spacing) and stay.
+  const trimmed = normalized.endsWith("\n") && !normalized.endsWith("\n\n") ? normalized.slice(0, -1) : normalized;
+  const segments = trimmed.split("\n");
+  // After stripping one trailing newline, a "line copy" is a single segment — merge
+  // inline (the multi-line splice would duplicate it into first+last rows).
+  if (segments.length === 1) {
+    return insertText(state, segments[0] ?? "");
+  }
   const line = currentLine(state);
   const before = line.slice(0, state.col);
   const after = line.slice(state.col);
@@ -239,9 +249,19 @@ function deleteWordBack(state: EditorState): EditorState {
   if (state.col === 0) {
     return backspace(state); // join lines, readline-compatible enough
   }
+  // Step back whole code points (never split a surrogate pair — adversarial
+  // review 2026-07-08 found the old `cut -= 1` corrupted emoji/CJK mid-word).
   let cut = state.col;
-  while (cut > 0 && /\s/u.test(line[cut - 1] ?? "")) cut -= 1;
-  while (cut > 0 && !/\s/u.test(line[cut - 1] ?? "")) cut -= 1;
+  while (cut > 0) {
+    const step = prevCharLength(line, cut);
+    if (!/\s/u.test(line.slice(cut - step, cut) ?? "")) break;
+    cut -= step;
+  }
+  while (cut > 0) {
+    const step = prevCharLength(line, cut);
+    if (/\s/u.test(line.slice(cut - step, cut) ?? "")) break;
+    cut -= step;
+  }
   return { ...state, lines: replaceLine(state.lines, state.row, line.slice(0, cut) + line.slice(state.col)), col: cut };
 }
 

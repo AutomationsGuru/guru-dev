@@ -1,21 +1,22 @@
 /**
  * GuruHarness TUI runtime state — pure reducer + UX contract (Dev 4 / D4.0).
  *
+ * ⚠ NOT THE LIVE REPL. The operator-facing interactive surface is
+ * `src/guru.ts` + `attachComposer` (multi-line editor, slash menu, @ picker,
+ * mid-turn abort/steer). This module is a **fixture / future pane-TUI design
+ * contract** exercised by `tests/tui/state.test.ts`. Features here
+ * (abort-turn keymap, composer-queue, multi-pane focus, palette) are NOT
+ * automatically live in `guru` until a renderer host dispatches into this
+ * reducer. Do not treat a green state.test as proof that the interactive REPL
+ * has that behavior — verify in guru.ts / attachComposer instead.
+ *
  * Design:
  *  - `reduceTuiState(state, action)` is a PURE function. No I/O, no TTY, no timers.
- *    This makes the entire TUI behavior unit-testable (see tests/tui/state.test.ts)
- *    and lets any renderer backend (D4.1) consume the same projected render model.
- *  - The host owns side effects (model calls, discovery, file reads). It dispatches
- *    actions that carry already-resolved, secret-safe data INTO the state. This
- *    honors the mock-first/interface-freeze rule (build-plan §2.0): tests build
- *    state from fixtures, never real discovery.
- *  - Secret-safety (FR-21): state never holds credential values. Providers carry
- *    env-var NAMES + presence booleans only. `assertSecretSafeState` enforces the
- *    invariant and is called from tests.
+ *  - The host owns side effects; tests build state from fixtures.
+ *  - Secret-safety: state never holds credential values.
  *
- * Renderer extension seam (FR-07): `MessageRenderer`, `TuiRenderer`, and the
- * register-* actions let extensions contribute message renderers, commands,
- * keybindings, and widgets without editing core TUI files.
+ * Status: QUARANTINED-AS-CONTRACT (2026-07-09). Safe to keep for design tests;
+ * not a second live input path.
  */
 
 import type {

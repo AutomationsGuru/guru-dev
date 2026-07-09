@@ -29,7 +29,13 @@ export function createSwarmTools(options: SwarmToolFactoryOptions): readonly Too
     inputSchema: SpawnAgentInputSchema,
     outputSchema: SpawnAgentResultSchema,
     execute: (input) => {
-      const record = manager.spawn(input.prompt, input.mode, input.label);
+      // depth threads the recursion cap through the swarm: a worker spawning a
+      // worker passes its own depth + 1. The harness's depth comes from the parent
+      // turn context; when absent (parent session spawning top-level) we default 0.
+      // manager.spawn fires SwarmDepthExceededError past maxSpawnDepth.
+      const record = manager.spawn(input.prompt, input.mode, input.label, {
+        ...(input.depth !== undefined ? { depth: input.depth } : {})
+      });
       return {
         taskId: record.id,
         state: record.state,

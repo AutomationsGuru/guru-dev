@@ -51,6 +51,42 @@ function rig(fetchImpl: (url: unknown, init: unknown) => Promise<Response>) {
 }
 
 describe("directAgentTurn retry policy (fake fetch, injected sleep)", () => {
+  it("operator abort mid-fetch does NOT retry — zero sleeps after cancel", async () => {
+    const controller = new AbortController();
+    let calls = 0;
+    const { slept, options } = rig(async (_url, init) => {
+      calls += 1;
+      controller.abort();
+      const signal = (init as { signal?: AbortSignal } | undefined)?.signal;
+      // Simulate fetch honouring the composed abort signal.
+      if (signal?.aborted) {
+        const err = new Error("The operation was aborted");
+        err.name = "AbortError";
+        throw err;
+      }
+      return okResponse();
+    });
+    await expect(
+      directAgentTurn(route, [{ role: "user", content: "hi" }], {
+        ...options,
+        signal: controller.signal,
+        retry: RetryConfigSchema.parse({ maxRetries: 3, baseDelayMs: 2_000 })
+      })
+    ).rejects.toThrow(/abort/iu);
+    expect(calls).toBe(1);
+    expect(slept).toEqual([]);
+  });
+
+  it("fetch receives a signal even when no operator abort is set (default timeout)", async () => {
+    let sawSignal = false;
+    const { options } = rig(async (_url, init) => {
+      sawSignal = (init as { signal?: AbortSignal } | undefined)?.signal instanceof AbortSignal;
+      return okResponse();
+    });
+    await directAgentTurn(route, [{ role: "user", content: "hi" }], options);
+    expect(sawSignal).toBe(true);
+  });
+
   it("429 twice then 200: the turn completes with exponential delays and indicator calls", async () => {
     let calls = 0;
     const { slept, retries, options } = rig(() => {

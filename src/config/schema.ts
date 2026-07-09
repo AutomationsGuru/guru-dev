@@ -5,6 +5,7 @@ import { LookAheadConfigSchema } from "../lookahead/schema.js";
 import { CompactionConfigSchema } from "../compaction/schemas.js";
 import { RetryConfigSchema } from "../model/retryPolicy.js";
 import { BashOptimizerConfigSchema } from "../tools/bashOptimizer.js";
+import { McpServerConfigSchema } from "../mcp/schemas.js";
 
 import { PlannerModelConfigSchema } from "../model/schemas.js";
 
@@ -156,7 +157,9 @@ export const HarnessConfigSchema = z
     /** Bash token optimizer (every-session-dividends wave): OFF by default (pilot). */
     bashOptimizer: BashOptimizerConfigSchema.default(() => BashOptimizerConfigSchema.parse({})),
     /** Boot ritual Phase 5 (TTFV): a fast baseline command run at boot; empty = skip. */
-    baselineHealth: BaselineHealthConfigSchema.default(() => BaselineHealthConfigSchema.parse({}))
+    baselineHealth: BaselineHealthConfigSchema.default(() => BaselineHealthConfigSchema.parse({})),
+    /** MCP servers to ATTACH (never-stuck resolver): stdio JSON-RPC; empty = none. */
+    mcpServers: z.array(McpServerConfigSchema).default([])
   })
   .strict();
 export type HarnessConfig = z.infer<typeof HarnessConfigSchema>;

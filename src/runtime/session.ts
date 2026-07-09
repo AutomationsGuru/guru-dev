@@ -68,7 +68,12 @@ export interface HarnessRuntimeDependencies {
 export interface HarnessRuntime {
   startSession(options?: StartHarnessSessionOptions): Promise<HarnessSession>;
   resumeSession(sessionId: string, options?: StartHarnessSessionOptions): Promise<HarnessSession | undefined>;
-  executeTool(sessionId: string, toolId: string, input: unknown): Promise<ToolObservation>;
+  /**
+   * Execute a tool for a session. The optional signal (review 2026-07-08) carries
+   * the turn's abort so a long-running tool (bash) can kill its child on operator
+   * cancel; absent for callers that don't track cancellation.
+   */
+  executeTool(sessionId: string, toolId: string, input: unknown, signal?: AbortSignal): Promise<ToolObservation>;
   /** Full tool definitions (with schemas) registered for a session — for model tool-calling. */
   getSessionTools(sessionId: string): readonly import("../tools/registry.js").ToolDefinition[];
   runPlanner(sessionId: string, options: PlannerRunOptions): Promise<PlannerRunReport>;
@@ -138,7 +143,7 @@ export function createHarnessRuntime(dependencies: HarnessRuntimeDependencies = 
 
       return rebuiltSession.session;
     },
-    async executeTool(sessionId, toolId, input) {
+    async executeTool(sessionId, toolId, input, signal) {
       const builtSession = sessions.get(sessionId);
 
       if (!builtSession) {
@@ -165,7 +170,9 @@ export function createHarnessRuntime(dependencies: HarnessRuntimeDependencies = 
         metadata: {
           ...(builtSession.session.task ? { taskId: builtSession.session.task.id } : {}),
           runtimeName: builtSession.session.runtimeName
-        }
+        },
+        // Forward the turn abort so bash can kill its child on operator cancel.
+        ...(signal ? { signal } : {})
       });
       await sessionPersistenceStore.recordToolObservation(sessionId, observation);
 

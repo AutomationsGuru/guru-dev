@@ -42,6 +42,28 @@ describe("slash menu state machine", () => {
     expect(back.state.mode).toBe("commands");
   });
 
+  it("drill → left restores the cursor to the drilled command (review 2026-07-08)", () => {
+    // Old bug: drilling → then ← left the cursor on whatever index the drill
+    // happened to be on, so the operator landed on a different command than the
+    // one they drilled from. Start on /model (index 1), drill, move in the
+    // submenu, back out — cursor must be back on /model.
+    let state = createMenuState(items, "/");
+    state = menuReduce(state, { name: "down" }).state; // /model (index 1)
+    expect(selectedItem(state)?.id).toBe("/model");
+    const routes: MenuItem[] = [
+      { id: "/model 1", label: "zai/glm-5-turbo" },
+      { id: "/model 2", label: "sakana/fugu-ultra" }
+    ];
+    state = enterDrill(state, "/model", routes);
+    state = menuReduce(state, { name: "down" }).state; // move within drill
+    const back = menuReduce(state, { name: "left" });
+    expect(back.state.mode).toBe("commands");
+    // After refilter against the commands list, the cursor is on /model again,
+    // not /help (row 0) and not whatever the drill selected.
+    const restored = refilter(back.state, items, "/");
+    expect(selectedItem(restored)?.id).toBe("/model");
+  });
+
   it("tab accepts the selected item's id", () => {
     let state = createMenuState(items, "/mo");
     state = menuReduce(state, { name: "down" }).state;

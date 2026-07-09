@@ -1,8 +1,15 @@
 import { directAgentTurn, type AgentTurnOptions } from "../model/agentTurn.js";
+import { DEFAULT_RETRY_CONFIG, type RetryConfig } from "../model/retryPolicy.js";
 import type { PlannerModelConfig } from "../model/schemas.js";
 import { defineProviderRoute } from "../providers/registry.js";
 import type { ProviderRouteDescriptor } from "../providers/schemas.js";
 import type { AskModel } from "../review/nativeCriticPanel.js";
+
+/** REVIEW model calls are bounded — a blackholed critic must not hang the cycle. */
+const REVIEW_RETRY: RetryConfig = {
+  ...DEFAULT_RETRY_CONFIG,
+  provider: { ...DEFAULT_RETRY_CONFIG.provider, timeoutMs: 120_000 }
+};
 
 /** A chat route for the configured model — reuses the planner's provider/base/key for critics. */
 export function routeFromPlannerConfig(model: PlannerModelConfig): ProviderRouteDescriptor {
@@ -30,6 +37,8 @@ export function makeAskModelFromRoute(route: ProviderRouteDescriptor, options: P
   return async (prompt) => {
     const result = await directAgentTurn(route, [{ role: "user", content: prompt }], {
       ...options,
+      // Bound the critic call so a blackholed provider cannot hang the cycle forever.
+      retry: options.retry ?? REVIEW_RETRY,
       // Read-only by construction: no tools, no tool calls, so the no-op executor/approver never run.
       tools: [],
       maxToolCalls: 0,
