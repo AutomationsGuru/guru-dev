@@ -34,6 +34,11 @@ describe("classification — the binding table (ADR 2026-07-05)", () => {
     expect(isRetryableFailure({ aborted: true })).toBe(false);
     expect(isRetryableFailure({ aborted: true, networkError: true })).toBe(false);
   });
+
+  it("NEVER retries per-request timeout (explicit, not status-undefined accident)", () => {
+    expect(isRetryableFailure({ timeout: true })).toBe(false);
+    expect(isRetryableFailure({ timeout: true, networkError: true })).toBe(false);
+  });
 });
 
 describe("default provider timeout", () => {

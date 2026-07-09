@@ -53,15 +53,20 @@ export interface AttemptFailure {
    * cancelled; sleeping + re-hitting the network is hostile.
    */
   readonly aborted?: boolean;
+  /**
+   * True when our per-request timeout fired. Terminal — retrying only waits out
+   * the same timeout again (multi-minute hang).
+   */
+  readonly timeout?: boolean;
 }
 
 /**
  * The binding classification table (ADR): network failures, 408, 429, and 5xx
  * retry; every other 4xx is a REAL error and fails immediately. Operator abort
- * is never retryable.
+ * and per-request timeouts are never retryable.
  */
 export function isRetryableFailure(failure: AttemptFailure): boolean {
-  if (failure.aborted === true) {
+  if (failure.aborted === true || failure.timeout === true) {
     return false;
   }
   if (failure.networkError === true) {

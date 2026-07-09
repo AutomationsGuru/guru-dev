@@ -1220,18 +1220,31 @@ function annotateForRetry(error: DirectChatError, annotation: RetryAnnotated): D
 }
 
 /** Maps a thrown request error onto the retry policy's failure shape. */
-function describeRequestFailure(error: unknown): { status?: number; networkError?: boolean; retryAfterMs?: number; aborted?: boolean } {
+function describeRequestFailure(error: unknown): {
+  status?: number;
+  networkError?: boolean;
+  retryAfterMs?: number;
+  aborted?: boolean;
+  timeout?: boolean;
+} {
   if (error instanceof DirectChatError) {
     const annotated = error as DirectChatError & RetryAnnotated;
     return {
       ...(error.details.status !== undefined ? { status: error.details.status } : {}),
       ...(annotated.networkFailure === true ? { networkError: true } : {}),
       ...(annotated.retryAfterMs !== undefined ? { retryAfterMs: annotated.retryAfterMs } : {}),
-      ...(annotated.aborted === true ? { aborted: true } : {})
+      ...(annotated.aborted === true ? { aborted: true } : {}),
+      ...(annotated.timeout === true ? { timeout: true } : {})
     };
   }
-  if (error && typeof error === "object" && (error as { aborted?: boolean }).aborted === true) {
-    return { aborted: true };
+  if (error && typeof error === "object") {
+    const e = error as { aborted?: boolean; timeout?: boolean };
+    if (e.aborted === true) {
+      return { aborted: true };
+    }
+    if (e.timeout === true) {
+      return { timeout: true };
+    }
   }
   return {};
 }

@@ -53,7 +53,7 @@ export function createShellExecTool(
     description: "Run an allowlisted command with shell:false, repository cwd containment, secret checks, and dry-run by default.",
     inputSchema: ShellExecToolInputSchema,
     outputSchema: ShellExecToolOutputSchema,
-    async execute(input) {
+    async execute(input, context) {
       const repoRoot = resolve(input.repoRoot);
       const cwd = resolve(repoRoot, input.cwd ?? ".");
       const blockers = buildShellBlockers(input, cwd, repoRoot, options);
@@ -82,7 +82,7 @@ export function createShellExecTool(
 
       // Executor owns timeout (kills child + cancelled + partial). Outer race is a
       // backstop for custom executors that ignore the contract — resolves cancelled,
-      // never rejects (parity with bash).
+      // never rejects (parity with bash). Forward operator abort so cancel is immediate.
       const timeoutResult = await runWithTimeout(
         executor(input.command, {
           cwd,
@@ -92,7 +92,8 @@ export function createShellExecTool(
             name: "shell.command.run",
             command: input.command,
             required: true
-          }
+          },
+          ...(context?.signal ? { signal: context.signal } : {})
         }),
         input.timeoutMs + 5_000
       ).catch((error: unknown) => ({

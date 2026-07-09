@@ -32,9 +32,12 @@ export async function defaultSmokeSelfCall(signal: AbortSignal, cwd?: string): P
   if (signal.aborted) {
     throw new Error("aborted during smoke self-call");
   }
-  const observation = await runtime.executeTool(session.id, "repo.context.resolve", {
-    includeContents: false
-  });
+  const observation = await runtime.executeTool(
+    session.id,
+    "repo.context.resolve",
+    { includeContents: false },
+    signal
+  );
   if (observation.status === "failed") {
     throw new Error(observation.error ?? "smoke self-call tool failed");
   }
