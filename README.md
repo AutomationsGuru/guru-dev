@@ -47,25 +47,25 @@ And it survives its own turns: near the context window, older history folds into
 
 ## Install
 
+Published on npm as [`guruharness`](https://www.npmjs.com/package/guruharness) (v1.4.0+).
+
 ```bash
-# Global — from a release tarball (avoids the npm prepare/devDependencies quirk)
-gh release download v1.4.0 --repo AutomationsGuru/guru-dev --pattern "*.tgz"
-npm install -g ./guruharness-1.4.0.tgz
+# Global CLI (recommended)
+npm install -g guruharness
+guru --version
 
-# As a project dependency (builds via prepare)
-npm install github:AutomationsGuru/guru-dev
+# As a project dependency
+npm install guruharness
 
-# Development
+# Development (from source)
 git clone https://github.com/AutomationsGuru/guru-dev.git && cd guru-dev
 npm install && npm run build && npm link
 ```
 
-> Global install directly from the git URL (`npm i -g github:...`) hits an npm quirk
-> (devDependencies are skipped during `prepare`) — use the release tarball for global installs.
+> Prefer the npm package. A GitHub release tarball (`gh release download v1.4.0 …`)
+> still works as a fallback if you need an offline/air-gapped install.
 
-The package is **publish-ready** (`private: false`, an `exports` map, typed `.d.ts`,
-proven with `npm publish --dry-run` and a tarball install). Installing it exposes the
-`guru` CLI/RPC bin **and** the in-process SDK:
+Installing it exposes the `guru` CLI/RPC bin **and** the in-process SDK:
 
 ```ts
 import { AgentSession } from "guruharness/session"; // or from "guruharness"
