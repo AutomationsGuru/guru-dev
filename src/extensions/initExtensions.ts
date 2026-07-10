@@ -11,6 +11,7 @@ import { createSwarmTools } from "../swarm/tools.js";
 import { createResolverTools } from "../selfbuild/resolverTool.js";
 import { createTodoTools } from "../tools/builtins/todoTools.js";
 import { createWebFetchTools } from "../tools/builtins/webFetchTool.js";
+import { createWebSearchTools } from "../tools/builtins/webSearchTool.js";
 import { createProviderCliTools } from "../tools/builtins/providerCliTools.js";
 import type { SwarmConfig } from "../swarm/schema.js";
 
@@ -68,6 +69,7 @@ export function initExtensions(options: InitExtensionsOptions = {}): HarnessExte
     // Session task board + bounded web fetch (harness baseline parity, 2026-07-10).
     api.registerTool({ factory: () => createTodoTools() });
     api.registerTool({ factory: () => createWebFetchTools() });
+    api.registerTool({ factory: () => createWebSearchTools() });
     // Provider CLI status + dry-run-first delegated run (parity RED → GREEN, 2026-07-10).
     api.registerTool({ factory: () => createProviderCliTools() });
   });

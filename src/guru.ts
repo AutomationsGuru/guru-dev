@@ -429,6 +429,7 @@ export const GURU_CHAT_TOOL_IDS: ReadonlySet<string> = new Set([
   "todo_write",
   "todo_list",
   "web_fetch",
+  "web_search",
   "provider_cli_status",
   "provider_cli_run"
 ]);

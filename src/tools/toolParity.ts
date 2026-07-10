@@ -182,7 +182,18 @@ export const TOOL_PARITY_ROWS: readonly ToolParityRow[] = [
     verdict: "YELLOW",
     ownerModule: "src/tools/builtins/webFetchTool.ts",
     notes: "Bounded http(s) GET with size/timeout/redirect caps and net mandate verb. Not a full research agent (no citations engine).",
-    nextAction: "Optional: Perplexity-style research adapter later; web_fetch covers open-page baseline."
+    nextAction: "Optional: HTML→markdown polish; pair with web_search for discovery."
+  },
+  {
+    toolId: "web_search",
+    category: "research",
+    requirementIds: ["FR-09", "TR-20", "TR-36"],
+    currentGuruHarnessToolIds: ["web_search"],
+    status: "native-equivalent",
+    verdict: "GREEN",
+    ownerModule: "src/tools/builtins/webSearchTool.ts",
+    notes: "DuckDuckGo HTML search (no API key): title/url/snippet hits with size/timeout caps and net mandate.",
+    nextAction: "Maintained; optional provider adapters (Brave/Perplexity) behind the same schema later."
   },
   {
     toolId: "todo_write",
@@ -199,12 +210,12 @@ export const TOOL_PARITY_ROWS: readonly ToolParityRow[] = [
     toolId: "perplexity_research",
     category: "research",
     requirementIds: ["FR-09", "TR-20", "TR-36"],
-    currentGuruHarnessToolIds: ["web_fetch"],
+    currentGuruHarnessToolIds: ["web_search", "web_fetch"],
     status: "partial-equivalent",
     verdict: "YELLOW",
-    ownerModule: "src/tools/builtins/webFetchTool.ts",
-    notes: "Full Perplexity Agent API not shipped; web_fetch covers generic URL research.",
-    nextAction: "Add a schema-first research tool adapter if a paid research provider is authorized."
+    ownerModule: "src/tools/builtins/webSearchTool.ts",
+    notes: "Full Perplexity Agent API not shipped; web_search + web_fetch cover discovery + open-page research.",
+    nextAction: "Add a schema-first paid research adapter if authorized."
   },
   {
     toolId: "provider_cli_status",
