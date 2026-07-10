@@ -28,6 +28,8 @@ const WebFetchOutputSchema = z
     contentType: z.string().optional(),
     bytes: z.number().int().nonnegative(),
     truncated: z.boolean(),
+    /** True when HTML was converted to readable text. */
+    convertedFromHtml: z.boolean().default(false),
     text: z.string(),
     summary: z.string()
   })
@@ -48,6 +50,63 @@ function assertHttpUrl(raw: string): URL {
     throw new Error("URLs with embedded credentials are not allowed.");
   }
   return parsed;
+}
+
+function decodeEntities(text: string): string {
+  return text
+    .replace(/&amp;/giu, "&")
+    .replace(/&lt;/giu, "<")
+    .replace(/&gt;/giu, ">")
+    .replace(/&quot;/giu, '"')
+    .replace(/&#39;/giu, "'")
+    .replace(/&nbsp;/giu, " ")
+    .replace(/&#x([0-9a-f]+);/giu, (_, hex: string) => String.fromCodePoint(Number.parseInt(hex, 16)))
+    .replace(/&#(\d+);/gu, (_, dec: string) => String.fromCodePoint(Number.parseInt(dec, 10)));
+}
+
+/**
+ * Best-effort HTML → readable text for agents (no dependency).
+ * Strips scripts/styles, turns headings/links/lists into plain markdown-ish lines.
+ * Exported for unit tests.
+ */
+export function htmlToReadableText(html: string): string {
+  let s = html;
+  // Drop non-content blocks first.
+  s = s.replace(/<script\b[^>]*>[\s\S]*?<\/script>/giu, " ");
+  s = s.replace(/<style\b[^>]*>[\s\S]*?<\/style>/giu, " ");
+  s = s.replace(/<noscript\b[^>]*>[\s\S]*?<\/noscript>/giu, " ");
+  s = s.replace(/<!--[\s\S]*?-->/gu, " ");
+
+  // Structure → newlines / markdown-ish.
+  s = s.replace(/<\/?(h[1-6])\b[^>]*>/giu, "\n\n");
+  s = s.replace(/<\/p>/giu, "\n\n");
+  s = s.replace(/<br\s*\/?>/giu, "\n");
+  s = s.replace(/<\/(div|section|article|li|tr)>/giu, "\n");
+  s = s.replace(/<li\b[^>]*>/giu, "\n- ");
+  s = s.replace(/<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/giu, (_m, href: string, inner: string) => {
+    const label = decodeEntities(inner.replace(/<[^>]+>/gu, " ").replace(/\s+/gu, " ").trim());
+    return label ? `[${label}](${href})` : href;
+  });
+
+  // Remaining tags out.
+  s = s.replace(/<[^>]+>/gu, " ");
+  s = decodeEntities(s);
+  // Collapse whitespace while keeping paragraph breaks.
+  s = s
+    .replace(/[ \t]+\n/gu, "\n")
+    .replace(/\n{3,}/gu, "\n\n")
+    .replace(/[ \t]{2,}/gu, " ")
+    .trim();
+  return s;
+}
+
+function looksLikeHtml(contentType: string | undefined, body: string): boolean {
+  if (contentType && /html/iu.test(contentType)) {
+    return true;
+  }
+  // Sniff when servers lie about content-type.
+  const head = body.slice(0, 512).toLowerCase();
+  return /<!doctype html|<html[\s>]|<head[\s>]|<body[\s>]/u.test(head);
 }
 
 /**
@@ -100,6 +159,12 @@ export async function fetchUrlText(
       const slice = truncated ? buf.subarray(0, input.maxBytes) : buf;
       bodyText = slice.toString("utf8");
       const ok = response.ok;
+      let text = bodyText;
+      let convertedFromHtml = false;
+      if (ok && looksLikeHtml(contentType, bodyText)) {
+        text = htmlToReadableText(bodyText);
+        convertedFromHtml = text.length > 0 && text !== bodyText;
+      }
       return {
         ok,
         url: input.url,
@@ -108,9 +173,10 @@ export async function fetchUrlText(
         ...(contentType ? { contentType } : {}),
         bytes: slice.byteLength,
         truncated,
-        text: bodyText,
+        convertedFromHtml,
+        text,
         summary: ok
-          ? `Fetched ${slice.byteLength} byte(s) from ${current.toString()}${truncated ? " (truncated)" : ""}.`
+          ? `Fetched ${slice.byteLength} byte(s) from ${current.toString()}${truncated ? " (truncated)" : ""}${convertedFromHtml ? "; HTML→text" : ""}.`
           : `HTTP ${status} from ${current.toString()} (${slice.byteLength} byte(s)).`
       };
     } finally {
@@ -126,7 +192,7 @@ export function createWebFetchTools(deps: WebFetchDeps = {}): readonly ToolDefin
     id: "web_fetch",
     title: "Fetch a web page",
     description:
-      "HTTP(S) GET a URL and return text content (bounded size + timeout). Use for docs/API references. Does not run scripts; binary payloads become UTF-8 best-effort. Spend/network edge — treat as net.",
+      "HTTP(S) GET a URL and return text (bounded size + timeout). HTML pages are converted to readable text (scripts/styles stripped, links kept as markdown). Pair with web_search for discovery. Network edge.",
     inputSchema: WebFetchInputSchema,
     outputSchema: WebFetchOutputSchema,
     async execute(input, context) {
@@ -145,6 +211,7 @@ export function createWebFetchTools(deps: WebFetchDeps = {}): readonly ToolDefin
           status: 0,
           bytes: 0,
           truncated: false,
+          convertedFromHtml: false,
           text: "",
           summary: `web_fetch failed: ${message}`
         };

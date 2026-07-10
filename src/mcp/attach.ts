@@ -2,6 +2,7 @@ import type { ToolDefinition } from "../tools/registry.js";
 import { checkMcpReadiness, connectMcpServer, type McpClient } from "./client.js";
 import { discoverMcpTools } from "./toolBridge.js";
 import type { McpServerConfig, McpServerStatus } from "./schemas.js";
+import { recordMcpAttachmentStatuses } from "./statusStore.js";
 
 /**
  * One-call ATTACH: take the config's mcpServers, connect every READY stdio
@@ -73,6 +74,8 @@ export async function attachConfiguredMcpServers(options: AttachMcpOptions): Pro
       });
     }
   }
+
+  recordMcpAttachmentStatuses(statuses);
 
   return {
     clients,

@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { createWebFetchTools, fetchUrlText, type WebFetchOutput } from "../../src/tools/builtins/webFetchTool.js";
+import {
+  createWebFetchTools,
+  fetchUrlText,
+  htmlToReadableText,
+  type WebFetchOutput
+} from "../../src/tools/builtins/webFetchTool.js";
 
 function mockFetch(handlers: Record<string, { status: number; body: string; headers?: Record<string, string>; location?: string }>): typeof fetch {
   return async (input, init) => {
@@ -82,5 +87,37 @@ describe("web_fetch — bounded HTTP GET", () => {
     )) as WebFetchOutput;
     expect(out.ok).toBe(false);
     expect(out.summary).toContain("network down");
+  });
+
+  it("converts HTML bodies to readable text", async () => {
+    const html = `<!doctype html><html><head><style>body{}</style><script>alert(1)</script></head>
+      <body><h1>Title</h1><p>Hello <a href="https://ex.com">world</a>.</p><ul><li>one</li><li>two</li></ul></body></html>`;
+    const result = await fetchUrlText(
+      { url: "https://example.com/page", maxBytes: 50_000, timeoutMs: 5_000 },
+      {
+        fetchImpl: mockFetch({
+          "https://example.com/page": {
+            status: 200,
+            body: html,
+            headers: { "content-type": "text/html; charset=utf-8" }
+          }
+        })
+      }
+    );
+    expect(result.ok).toBe(true);
+    expect(result.convertedFromHtml).toBe(true);
+    expect(result.text).toContain("Title");
+    expect(result.text).toContain("[world](https://ex.com)");
+    expect(result.text).toContain("- one");
+    expect(result.text).not.toContain("alert(1)");
+    expect(result.summary).toMatch(/HTML→text/);
+  });
+});
+
+describe("htmlToReadableText", () => {
+  it("strips scripts and keeps link labels", () => {
+    const text = htmlToReadableText(`<p>See <a href="/x">docs</a></p><script>x</script>`);
+    expect(text).toContain("[docs](/x)");
+    expect(text).not.toContain("script");
   });
 });

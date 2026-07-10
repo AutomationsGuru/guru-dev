@@ -13,6 +13,7 @@ import { createTodoTools } from "../tools/builtins/todoTools.js";
 import { createWebFetchTools } from "../tools/builtins/webFetchTool.js";
 import { createWebSearchTools } from "../tools/builtins/webSearchTool.js";
 import { createAskQuestionTools } from "../tools/builtins/askQuestionTool.js";
+import { createMcpStatusTools } from "../tools/builtins/mcpStatusTool.js";
 import { createProviderCliTools } from "../tools/builtins/providerCliTools.js";
 import type { SwarmConfig } from "../swarm/schema.js";
 
@@ -72,6 +73,7 @@ export function initExtensions(options: InitExtensionsOptions = {}): HarnessExte
     api.registerTool({ factory: () => createWebFetchTools() });
     api.registerTool({ factory: () => createWebSearchTools() });
     api.registerTool({ factory: () => createAskQuestionTools() });
+    api.registerTool({ factory: () => createMcpStatusTools() });
     // Provider CLI status + dry-run-first delegated run (parity RED → GREEN, 2026-07-10).
     api.registerTool({ factory: () => createProviderCliTools() });
   });

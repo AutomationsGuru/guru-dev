@@ -2,6 +2,15 @@
 
 All notable changes to GuruHarness are documented here.
 
+## [1.4.7] - 2026-07-10
+
+### Added
+- **`mcp_bridge_status`** — first-class tool over last MCP attach board (ready/missing-env/error + tool counts).
+
+### Changed
+- **`web_fetch`** converts HTML → readable text (scripts/styles stripped, links as markdown); parity GREEN.
+- Tool parity: **18 GREEN / 2 YELLOW / 4 RED** (desktop still RED; perplexity + repo YELLOW).
+
 ## [1.4.6] - 2026-07-10
 
 ### Added
