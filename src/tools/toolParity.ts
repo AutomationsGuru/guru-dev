@@ -210,23 +210,23 @@ export const TOOL_PARITY_ROWS: readonly ToolParityRow[] = [
     toolId: "provider_cli_status",
     category: "provider-cli",
     requirementIds: ["FR-09", "FR-17", "TR-23"],
-    currentGuruHarnessToolIds: [],
-    status: "absent",
-    verdict: "RED",
-    ownerModule: "src/provider-cli",
-    notes: "No provider CLI status/version/probe matrix exists yet.",
-    nextAction: "Implement provider CLI status schemas for codex, claude, agy, opencode, grok, mavis/minimax, gcloud, gsutil, bq, cursor, and honcho admin."
+    currentGuruHarnessToolIds: ["provider_cli_status"],
+    status: "native-equivalent",
+    verdict: "GREEN",
+    ownerModule: "src/tools/builtins/providerCliTools.ts",
+    notes: "Agent tool wraps getProviderCliStatusMatrix; default executor PATH-probes via which/where and runs --version with timeout.",
+    nextAction: "Maintained; extend inventory when new provider CLIs land."
   },
   {
     toolId: "provider_cli_run",
     category: "provider-cli",
     requirementIds: ["FR-09", "FR-17", "TR-23"],
-    currentGuruHarnessToolIds: [],
-    status: "absent",
-    verdict: "RED",
-    ownerModule: "src/provider-cli",
-    notes: "No explicitly approved delegated provider CLI run contract exists yet.",
-    nextAction: "Implement dry-run-first run schemas with userApproved, timeout, prompt-safety, and no-secret output controls."
+    currentGuruHarnessToolIds: ["provider_cli_run"],
+    status: "native-equivalent",
+    verdict: "GREEN",
+    ownerModule: "src/tools/builtins/providerCliTools.ts",
+    notes: "Dry-run-first delegated run: status-only policy never lives; live runs need policy explicit-run-allowed + dryRun=false + userApproved=true; output redaction on by default.",
+    nextAction: "Optional: CLI-specific argv adapters (stdin prompts, model flags) as dogfood demands."
   },
   {
     toolId: "pyautogui_status",

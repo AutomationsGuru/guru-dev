@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 
+import { commandExists as pathCommandExists } from "../review/gates.js";
 import { ProviderCliConfigSchema, type ProviderCliConfig, type ProviderCliId, type ProviderCliStatusReport } from "./schemas.js";
 
 export const DEFAULT_PROVIDER_CLI_CONFIGS: readonly ProviderCliConfig[] = [
@@ -49,11 +50,24 @@ export async function getProviderCliStatusMatrix(options: ProviderCliStatusOptio
 
 const defaultStatusExecutor: ProviderCliStatusExecutor = {
   commandExists(commandName) {
-    return commandName.includes("/") || commandName.includes("\\") ? existsSync(commandName) : true;
+    // Absolute/relative paths: filesystem presence. Bare names: PATH probe via
+    // which/where — never assume present (the old `return true` hid every gap).
+    if (commandName.includes("/") || commandName.includes("\\") || /^[A-Za-z]:/.test(commandName)) {
+      return existsSync(commandName);
+    }
+    return pathCommandExists(commandName);
   },
   async version(config) {
     const { executeCommand } = await import("../review/gates.js");
-    return await executeCommand([config.commandName, ...config.statusArgs], { gate: { kind: "validation", name: `provider-cli:${config.id}`, command: [config.commandName, ...config.statusArgs], required: false } });
+    return await executeCommand([config.commandName, ...config.statusArgs], {
+      gate: {
+        kind: "validation",
+        name: `provider-cli:${config.id}`,
+        command: [config.commandName, ...config.statusArgs],
+        required: false
+      },
+      timeoutMs: config.timeoutMs
+    });
   }
 };
 

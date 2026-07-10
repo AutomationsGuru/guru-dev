@@ -119,9 +119,19 @@ export function parseKeys(chunk: string): ParsedChunk {
         if (final === "~") {
           const [head = "", mod = ""] = params.split(";");
           // modifyOtherKeys: ESC [ 27 ; <mod> ; 13 ~  → Enter with modifiers.
+          // xterm mod mask: 1=none, then +1 Shift, +2 Alt/Meta, +4 Ctrl.
+          // Old code only set shift for 2/4 — Alt+Enter (mod=3) never got meta,
+          // so mid-turn follow-up was dead on Windows Terminal / xterm.
           const parts = params.split(";");
           if (head === "27" && parts[2] === "13") {
-            keys.push({ name: "return", shift: mod === "2" || mod === "4", sequence });
+            const mask = Math.max(0, (Number(mod) || 1) - 1);
+            keys.push({
+              name: "return",
+              shift: (mask & 1) !== 0,
+              meta: (mask & 2) !== 0,
+              ctrl: (mask & 4) !== 0,
+              sequence
+            });
           } else {
             const name = CSI_TILDE[head];
             if (name) {
@@ -135,7 +145,14 @@ export function parseKeys(chunk: string): ParsedChunk {
           const keycode = head.split(":")[0];
           const modifier = mod.split(":")[0];
           if (keycode === "13") {
-            keys.push({ name: "return", shift: modifier === "2" || modifier === "4", sequence });
+            const mask = Math.max(0, (Number(modifier) || 1) - 1);
+            keys.push({
+              name: "return",
+              shift: (mask & 1) !== 0,
+              meta: (mask & 2) !== 0,
+              ctrl: (mask & 4) !== 0,
+              sequence
+            });
           } else if (keycode === "10") {
             keys.push({ name: "enter", sequence }); // LF keycode
           }

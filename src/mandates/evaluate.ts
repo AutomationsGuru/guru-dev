@@ -40,7 +40,11 @@ const TOOL_VERBS: Readonly<Record<string, readonly MandateVerb[]>> = {
   todo_write: [],
   todo_list: [],
   // Networked research fetch (bounded).
-  web_fetch: ["net"]
+  web_fetch: ["net"],
+  // Provider CLI matrix is a PATH/env-name probe only.
+  provider_cli_status: [],
+  // Live delegated CLI may shell out (and often spend via provider plans).
+  provider_cli_run: ["exec"]
 };
 
 /** Read-only tools: never gated by the mandate (the always-allowed floor). */
@@ -58,6 +62,7 @@ export const MANDATE_READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   "honcho_recall",
   "honcho_context",
   "todo_list",
+  "provider_cli_status",
   "service_readiness_report",
   "operational.project.get",
   "operational.state.list",

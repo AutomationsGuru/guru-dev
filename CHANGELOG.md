@@ -1,5 +1,21 @@
 # Changelog
 
+All notable changes to GuruHarness are documented here.
+
+## [1.4.3] - 2026-07-10
+
+### Added
+- **`provider_cli_status` / `provider_cli_run`** agent tools — matrix probe + dry-run-first delegated run (`userApproved` + policy gates; output redaction).
+- Shared TUI **`width` module** with East-Asian-Width Wide BMP symbols (⚡ YOLO chip, ✅❌⭐ …) so status-bar math matches real terminals.
+
+### Fixed
+- Provider CLI default status executor no longer pretends bare commands always exist — uses `which`/`where` PATH probe.
+- Composer hint line drops whole hints on narrow terminals (no mid-word chop).
+- Rounded boxes clamp to terminal width so deep cwd lines no longer shatter boot panels.
+- Editor: paste tabs → spaces; ↑/↓ snap off surrogate mid-points; Alt+Enter / Ctrl+Enter modifyOtherKeys decode correctly.
+
+### Changed
+- Tool parity: provider CLI family RED → GREEN (desktop PyAutoGUI remains RED).
 
 ## [1.4.2] - 2026-07-10
 
@@ -9,7 +25,6 @@
 
 ### Changed
 - Tool parity map updated for live MCP attach/bridge and the new research/todo surfaces.
-All notable changes to GuruHarness are documented here.
 
 ## [1.4.1] - 2026-07-09
 

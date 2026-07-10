@@ -1,5 +1,6 @@
 import { gradientLine } from "./gradient.js";
 import type { Painter, ThemeTokens } from "./theme.js";
+import { charDisplayWidth } from "./width.js";
 
 /** Component recipes per spec §5. */
 
@@ -12,36 +13,6 @@ export const GLYPHS = {
   user: "▸",
   agent: "▲"
 } as const;
-
-/**
- * Display width of one code point: 0 for combining/zero-width, 2 for wide
- * (CJK/emoji), else 1. Mirrors editor.ts charDisplayWidth — kept local to avoid a
- * circular import (editor.ts imports visibleWidth from here).
- */
-function charDisplayWidth(codePoint: number): number {
-  if (
-    (codePoint >= 0x0300 && codePoint <= 0x036f) || // combining diacritics
-    (codePoint >= 0x200b && codePoint <= 0x200f) || // zero-width space/joiners/marks
-    (codePoint >= 0xfe00 && codePoint <= 0xfe0f) || // variation selectors
-    codePoint === 0xfeff // zero-width no-break space (BOM)
-  ) {
-    return 0;
-  }
-  if (
-    (codePoint >= 0x1100 && codePoint <= 0x115f) || // Hangul Jamo
-    (codePoint >= 0x2e80 && codePoint <= 0xa4cf) || // CJK radicals … Yi
-    (codePoint >= 0xac00 && codePoint <= 0xd7a3) || // Hangul syllables
-    (codePoint >= 0xf900 && codePoint <= 0xfaff) || // CJK compat ideographs
-    (codePoint >= 0xfe30 && codePoint <= 0xfe4f) || // CJK compat forms
-    (codePoint >= 0xff00 && codePoint <= 0xff60) || // fullwidth forms
-    (codePoint >= 0xffe0 && codePoint <= 0xffe6) ||
-    (codePoint >= 0x1f300 && codePoint <= 0x1faff) || // emoji blocks
-    (codePoint >= 0x20000 && codePoint <= 0x3fffd) // CJK ext B+
-  ) {
-    return 2;
-  }
-  return 1;
-}
 
 /**
  * Visible width of a string with ANSI escapes stripped, counted in DISPLAY
@@ -58,6 +29,37 @@ export function visibleWidth(text: string): number {
     width += charDisplayWidth(char.codePointAt(0) ?? 0);
   }
   return width;
+}
+
+/** ANSI-aware clip to a display-cell budget; ellipsis when cut (escapes kept). */
+function clipVisible(text: string, width: number): string {
+  if (visibleWidth(text) <= width) {
+    return text;
+  }
+  let out = "";
+  let used = 0;
+  for (let at = 0; at < text.length; ) {
+    if (text[at] === "\x1b") {
+      const match = /^\x1b\[[0-9;]*m/u.exec(text.slice(at));
+      if (match) {
+        out += match[0];
+        at += match[0].length;
+        continue;
+      }
+    }
+    const codePoint = text.codePointAt(at) ?? 0;
+    const char = String.fromCodePoint(codePoint);
+    const cells = charDisplayWidth(codePoint);
+    if (used + cells > width - 1) {
+      break; // reserve one cell for the ellipsis
+    }
+    out += char;
+    used += cells;
+    at += char.length;
+  }
+  // Re-arm styling only when the clipped text actually used escapes (plain
+  // no-color output must stay escape-free).
+  return `${out}…${out.includes("\x1b[") ? "\x1b[0m" : ""}`;
 }
 
 export type BadgeKind = "brand" | "success" | "warning" | "error" | "ghost";
@@ -80,8 +82,15 @@ export function badge(painter: Painter, label: string, kind: BadgeKind = "brand"
 }
 
 /** Rounded box (§5): `╭─╮ │ ╰─╯` in border; optional inline title, muted bold. */
-export function roundedBox(painter: Painter, lines: readonly string[], options: { title?: string; width?: number; focused?: boolean } = {}): string[] {
-  const contentWidth = Math.max(options.width ?? 0, ...lines.map(visibleWidth), options.title ? visibleWidth(options.title) + 4 : 0);
+export function roundedBox(painter: Painter, lines: readonly string[], options: { title?: string; width?: number; focused?: boolean; maxWidth?: number } = {}): string[] {
+  // Clamp to the live terminal (TTY only): one long content line — a deep cwd in
+  // the BOOT RITUAL panel — used to push the right border past the edge and
+  // hard-wrap, shattering the box on every 80-col boot. Non-TTY callers and
+  // tests see no clamp unless they pass maxWidth.
+  const maxWidth = options.maxWidth ?? (process.stdout.isTTY && process.stdout.columns ? process.stdout.columns - 1 : Number.POSITIVE_INFINITY);
+  const maxContent = Math.max(8, maxWidth - 4);
+  const clipped = Number.isFinite(maxContent) ? lines.map((line) => clipVisible(line, maxContent)) : [...lines];
+  const contentWidth = Math.min(maxContent, Math.max(options.width ?? 0, ...clipped.map(visibleWidth), options.title ? visibleWidth(options.title) + 4 : 0));
   const borderToken: keyof ThemeTokens = options.focused ? "accent" : "border";
   const edge = (text: string): string => painter.fg(borderToken, text);
   // Title row chrome: "╭─ " + title + " " + dashes + "╮" must total contentWidth + 4.
@@ -91,7 +100,7 @@ export function roundedBox(painter: Painter, lines: readonly string[], options: 
 
   return [
     title,
-    ...lines.map((line) => `${edge("│")} ${line}${" ".repeat(Math.max(0, contentWidth - visibleWidth(line)))} ${edge("│")}`),
+    ...clipped.map((line) => `${edge("│")} ${line}${" ".repeat(Math.max(0, contentWidth - visibleWidth(line)))} ${edge("│")}`),
     edge(`╰${"─".repeat(contentWidth + 2)}╯`)
   ];
 }
