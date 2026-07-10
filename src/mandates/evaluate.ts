@@ -39,8 +39,9 @@ const TOOL_VERBS: Readonly<Record<string, readonly MandateVerb[]>> = {
   // Session task board — process memory only, never disk secrets.
   todo_write: [],
   todo_list: [],
-  // Networked research fetch (bounded).
+  // Networked research (bounded).
   web_fetch: ["net"],
+  web_search: ["net"],
   // Provider CLI matrix is a PATH/env-name probe only.
   provider_cli_status: [],
   // Live delegated CLI may shell out (and often spend via provider plans).

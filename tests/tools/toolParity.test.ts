@@ -33,6 +33,7 @@ describe("tool parity map", () => {
         "mcp_list_tools",
         "mcp_call_tool",
         "web_fetch",
+        "web_search",
         "perplexity_research",
         "provider_cli_status",
         "provider_cli_run",
@@ -72,12 +73,13 @@ describe("tool parity map", () => {
     }
   });
 
-  it("should mark MCP list/call, todo board, and provider CLI tools GREEN", () => {
+  it("should mark MCP list/call, todo board, provider CLI, and web_search GREEN", () => {
     expect(findToolParityRow("mcp_list_tools")).toMatchObject({ status: "native-equivalent", verdict: "GREEN" });
     expect(findToolParityRow("mcp_call_tool")).toMatchObject({ status: "native-equivalent", verdict: "GREEN" });
     expect(findToolParityRow("todo_write")).toMatchObject({ status: "native-equivalent", verdict: "GREEN" });
     expect(findToolParityRow("provider_cli_status")).toMatchObject({ status: "native-equivalent", verdict: "GREEN" });
     expect(findToolParityRow("provider_cli_run")).toMatchObject({ status: "native-equivalent", verdict: "GREEN" });
+    expect(findToolParityRow("web_search")).toMatchObject({ status: "native-equivalent", verdict: "GREEN" });
     expect(findToolParityRow("web_fetch")).toMatchObject({ status: "partial-equivalent", verdict: "YELLOW" });
   });
 
@@ -92,7 +94,7 @@ describe("tool parity map", () => {
   });
 
   it("should summarize RED/YELLOW/GREEN counts", () => {
-    // Desktop family (4) still RED; research/MCP status/repo stay YELLOW partials.
-    expect(getToolParityVerdictCounts()).toEqual({ GREEN: 14, YELLOW: 4, RED: 4 });
+    // Desktop family (4) still RED; web_fetch/MCP status/perplexity/repo stay YELLOW.
+    expect(getToolParityVerdictCounts()).toEqual({ GREEN: 15, YELLOW: 4, RED: 4 });
   });
 });

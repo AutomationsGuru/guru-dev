@@ -97,6 +97,7 @@ describe("startHarnessSession", () => {
       "todo_list",
       "todo_write",
       "web_fetch",
+      "web_search",
       "write"
     ]);
     expect(session.blockers).toEqual([]);

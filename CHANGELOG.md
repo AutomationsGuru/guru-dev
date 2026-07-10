@@ -2,6 +2,14 @@
 
 All notable changes to GuruHarness are documented here.
 
+## [1.4.5] - 2026-07-10
+
+### Added
+- **`web_search`** — DuckDuckGo HTML search (no API key): title/url/snippet hits with size/timeout caps; net mandate. Pairs with `web_fetch` for open-page research.
+
+### Changed
+- Tool parity: `web_search` GREEN; Perplexity row notes discovery pair (`web_search` + `web_fetch`).
+
 ## [1.4.4] - 2026-07-10
 
 ### Fixed
