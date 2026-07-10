@@ -92,6 +92,9 @@ describe("startHarnessSession", () => {
       "skill.document.load",
       "skills.catalog.list",
       "spawn_agent",
+      "todo_list",
+      "todo_write",
+      "web_fetch",
       "write"
     ]);
     expect(session.blockers).toEqual([]);
