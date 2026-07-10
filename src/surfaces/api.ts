@@ -598,10 +598,9 @@ async function routeRequest(
 
     return writeJson(response, 404, { error: "Not found", route, method });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-
+    // Public client surface: never echo stacks (CodeQL js/stack-trace-exposure).
     const statusCode = error instanceof ApiHttpError ? error.statusCode : 400;
-
+    const message = publicApiErrorMessage(error);
     return writeJson(response, statusCode, { error: message, route, method });
   }
 }
@@ -641,10 +640,8 @@ async function parseJsonBody(request: IncomingMessage): Promise<unknown> {
 
   try {
     return JSON.parse(raw) as unknown;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-
-    throw new Error(`Invalid JSON request body: ${message}`);
+  } catch {
+    throw new Error("Invalid JSON request body.");
   }
 }
 
@@ -1039,6 +1036,18 @@ function writeJson(response: ServerResponse, status: number, payload: unknown): 
   response.statusCode = status;
   response.setHeader("content-type", "application/json");
   response.end(body);
+}
+
+/** Single-line operator-facing error text — never `error.stack` or multi-line dumps. */
+function publicApiErrorMessage(error: unknown): string {
+  if (error instanceof ApiHttpError) {
+    return error.message.slice(0, 500);
+  }
+  if (error instanceof Error) {
+    const firstLine = error.message.split(/\r?\n/u, 1)[0] ?? "Request failed";
+    return firstLine.slice(0, 500);
+  }
+  return "Request failed";
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
