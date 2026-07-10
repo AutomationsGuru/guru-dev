@@ -2,6 +2,11 @@
 
 All notable changes to GuruHarness are documented here.
 
+## [1.4.4] - 2026-07-10
+
+### Fixed
+- **Windows gate spawn (Node 20+/24):** stop rewriting bare commands to `.cmd` (triggered `spawn EINVAL` for `node` and broke hang/cancel tests). Prefer `.exe` from `where`, rewrite `npm`/`npx` to `node <cli.js>`, never spawn batch shims with `shell:false`.
+
 ## [1.4.3] - 2026-07-10
 
 ### Added

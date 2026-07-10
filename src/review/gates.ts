@@ -1,4 +1,6 @@
 import { execFileSync, spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 import type { HarnessConfig, ReviewGate, ValidationCommand } from "../config/schema.js";
 
@@ -150,25 +152,87 @@ export async function runCommandGate(
 }
 
 /**
- * Windows npm/git/pwsh live as bare names that Node cannot spawn with shell:false
- * unless the `.cmd` extension is explicit. Map bare names → `name.cmd`; leave
- * absolute paths and already-suffixed names unchanged. Never uses `cmd.exe /c`.
+ * Resolve a gate argv for Windows under Node 20+ / 24:
+ * - CVE-2024-27980: Node refuses to spawn `.cmd`/`.bat` with `shell:false` (EINVAL).
+ * - Blindly rewriting bare names to `name.cmd` broke `node` (native `.exe`) and every
+ *   hang/cancel test that spawns `node -e …`.
+ * Strategy: prefer a real `.exe` from `where`; rewrite known package-manager shims to
+ * `node <cli.js>`; otherwise keep the bare name (Node resolves `node`/`git` fine).
+ * Never uses `cmd.exe /c`.
  */
-function resolveWindowsGateExecutable(executable: string): string {
+function listWhereMatches(name: string): string[] {
+  try {
+    const out = execFileSync("where.exe", [name], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: true
+    });
+    return out
+      .split(/\r?\n/u)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+  } catch {
+    return [];
+  }
+}
+
+function packageManagerCliJs(id: "npm" | "npx"): string | undefined {
+  // Sibling of the running node.exe — standard Node for Windows layout.
+  const candidate = join(dirname(process.execPath), "node_modules", "npm", "bin", `${id === "npm" ? "npm" : "npx"}-cli.js`);
+  return existsSync(candidate) ? candidate : undefined;
+}
+
+export function resolveWindowsGateSpawn(command: readonly string[]): { executable: string; args: string[] } {
+  const [executable, ...args] = command;
+  if (!executable) {
+    return { executable: "", args: [] };
+  }
   if (process.platform !== "win32") {
-    return executable;
+    return { executable, args: [...args] };
   }
-  // Path-like (absolute/relative) or already has an extension → spawn as-is.
-  if (executable.includes("/") || executable.includes("\\") || executable.includes(":")) {
-    return executable;
+
+  // Absolute/relative path already chosen by the caller.
+  if (executable.includes("/") || executable.includes("\\") || /^[A-Za-z]:/.test(executable)) {
+    // Refuse bare .cmd/.bat paths under shell:false — rewrite npm-cli if recognizable.
+    if (/\.(?:cmd|bat)$/iu.test(executable)) {
+      const base = executable.replace(/\.(?:cmd|bat)$/iu, "").toLowerCase();
+      if (base.endsWith("npm") || base.endsWith("\\npm") || base.endsWith("/npm")) {
+        const cli = packageManagerCliJs("npm");
+        if (cli) return { executable: process.execPath, args: [cli, ...args] };
+      }
+      if (base.endsWith("npx") || base.endsWith("\\npx") || base.endsWith("/npx")) {
+        const cli = packageManagerCliJs("npx");
+        if (cli) return { executable: process.execPath, args: [cli, ...args] };
+      }
+    }
+    return { executable, args: [...args] };
   }
-  if (/\.(?:exe|cmd|bat|com)$/iu.test(executable)) {
-    return executable;
+
+  if (/\.exe$/iu.test(executable)) {
+    return { executable, args: [...args] };
   }
-  if (!/^[A-Za-z0-9._-]+$/u.test(executable)) {
-    return executable;
+  // Explicit .cmd/.bat bare names — never spawn them shell:false on Node 20+.
+  if (/\.(?:cmd|bat)$/iu.test(executable)) {
+    const bare = executable.replace(/\.(?:cmd|bat)$/iu, "");
+    return resolveWindowsGateSpawn([bare, ...args]);
   }
-  return `${executable}.cmd`;
+
+  const lower = executable.toLowerCase();
+  if (lower === "npm" || lower === "npx") {
+    const cli = packageManagerCliJs(lower);
+    if (cli) {
+      return { executable: process.execPath, args: [cli, ...args] };
+    }
+  }
+
+  const matches = listWhereMatches(executable);
+  const exeMatch = matches.find((m) => /\.exe$/iu.test(m));
+  if (exeMatch) {
+    return { executable: exeMatch, args: [...args] };
+  }
+
+  // Bare name: Node can resolve many PATH .exe entries (node, git, …) without a suffix.
+  return { executable, args: [...args] };
 }
 
 export async function executeCommand(
@@ -176,9 +240,9 @@ export async function executeCommand(
   context: CommandExecutionContext
 ): Promise<CommandExecutionResult> {
   const startedAt = Date.now();
-  const [executable, ...args] = command;
+  const [rawExecutable] = command;
 
-  if (!executable) {
+  if (!rawExecutable) {
     return {
       exitCode: null,
       stdout: "",
@@ -188,9 +252,8 @@ export async function executeCommand(
   }
 
   // Never shell out via `cmd.exe /c <dynamic>` (CodeQL js/shell-command-injection-
-  // from-environment). On Windows, bare npm/git/etc. are `.cmd` shims — spawn the
-  // `.cmd` path directly with shell:false so argv0 is fixed and no `/c` string is built.
-  const resolvedExecutable = resolveWindowsGateExecutable(executable);
+  // from-environment). Resolve to a real PE or node+cli.js — not a batch shim.
+  const { executable: resolvedExecutable, args } = resolveWindowsGateSpawn(command);
 
   return new Promise<CommandExecutionResult>((resolveExecution) => {
     const child = spawn(resolvedExecutable, args, { cwd: context.cwd, shell: false, windowsHide: true });
