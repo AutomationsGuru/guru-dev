@@ -24,6 +24,7 @@ describe("initExtensions", () => {
         "todo_list",
         "web_fetch",
         "web_search",
+        "ask_question",
         "provider_cli_status",
         "provider_cli_run"
       ])
@@ -38,6 +39,7 @@ describe("initExtensions", () => {
     expect(ids).toContain("todo_write");
     expect(ids).toContain("web_fetch");
     expect(ids).toContain("web_search");
+    expect(ids).toContain("ask_question");
     expect(ids).toContain("provider_cli_status");
   });
 });
@@ -53,6 +55,7 @@ describe("extension tools wired into the live runtime", () => {
     expect(ids).toContain("todo_list");
     expect(ids).toContain("web_fetch");
     expect(ids).toContain("web_search");
+    expect(ids).toContain("ask_question");
     expect(ids).toContain("provider_cli_status");
   });
 

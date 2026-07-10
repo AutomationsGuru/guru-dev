@@ -52,6 +52,7 @@ describe("startHarnessSession", () => {
       expect.arrayContaining(["guruharness-self-build"])
     );
     expect(session.tools.map((tool) => tool.id)).toEqual([
+      "ask_question",
       "bash",
       "edit",
       "fs.edit.apply",

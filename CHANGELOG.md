@@ -2,6 +2,11 @@
 
 All notable changes to GuruHarness are documented here.
 
+## [1.4.6] - 2026-07-10
+
+### Added
+- **`ask_question`** — operator multi-choice Q&A (TTY readline; inject `onAsk` for rich TUI). Headless returns `interactive:false` instead of hanging.
+
 ## [1.4.5] - 2026-07-10
 
 ### Added
