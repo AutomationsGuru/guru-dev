@@ -1,0 +1,31 @@
+name: Self-hosted Runner Smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: runner01 storage smoke
+    runs-on: [self-hosted, Linux, X64, agentos, review]
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      - name: Verify runner workspace and Docker
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$RUNNER_NAME" = "runner01"
+          test "$RUNNER_OS" = "Linux"
+          test -w "$GITHUB_WORKSPACE"
+          git rev-parse --is-inside-work-tree
+          printf 'runner01-workspace-ok\n' > .runner01-smoke
+          grep -qx 'runner01-workspace-ok' .runner01-smoke
+          rm .runner01-smoke
+          docker version --format '{{.Server.Version}}'
