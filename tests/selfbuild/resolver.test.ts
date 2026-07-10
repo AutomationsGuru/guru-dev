@@ -67,7 +67,7 @@ describe("never-stuck resolver — the trichotomy (THERE scenario 4 core)", () =
     expect(resolution.statement).toContain("LEARN AND REPLICATE");
     expect(resolution.statement).toContain("Smart Connections");
     expect(resolution.evidence).toContain("PATH: nonexistent-cli absent");
-    expect(resolution.workPlan.join(" ")).toContain("CodeRabbit"); // gated
+    expect(resolution.workPlan.join(" ")).toContain("review"); // gated
   });
 
   it("BUILD: nothing nearby — guru grows it, gated", () => {

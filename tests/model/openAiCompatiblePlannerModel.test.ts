@@ -49,7 +49,7 @@ const request: PlannerModelRequest = {
     memory: { provider: "in-memory-operational-store", status: "available", projectSlug: "guruharness" },
     policy: {
       validationCommands: ["test"],
-      reviewGate: { provider: "coderabbit", required: true },
+      reviewGate: { provider: "native-critic-panel", required: true },
       approvalPolicy: { autoCommitPushPr: true, allowLocalMerge: false, allowForcePush: false }
     },
     tools: [{ id: "repo.context.resolve", title: "Resolve repository context", description: "Resolve repo context." }],

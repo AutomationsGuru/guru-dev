@@ -4,9 +4,9 @@
 
 ## Verification
 
-- [ ] Local verification command(s) passed
-- [ ] GitHub Actions checks passed
-- [ ] CodeRabbit reviewed, or blocker documented
+- [ ] Local verification command(s) passed (`typecheck` / `build` / `test` as relevant)
+- [ ] Peer agent code review completed (before or with this PR)
+- [ ] GitHub Actions checks passed (`repo-hygiene` + CodeQL)
 
 ## Risk
 

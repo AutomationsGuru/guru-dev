@@ -278,7 +278,7 @@ export async function runWithRetryPolicy<T>(
       options.hooks?.onRetry?.({
         attempt,
         // The ceiling actually in force: provider extras exist only for
-        // provider-requested (Retry-After) failures (CodeRabbit 2026-07-05).
+        // provider-requested (Retry-After) failures (review 2026-07-05).
         maxAttempts: providerRequested ? baseBudget + config.provider.maxRetries : baseBudget,
         delayMs,
         reason:

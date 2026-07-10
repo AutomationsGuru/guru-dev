@@ -35,20 +35,20 @@ export type CriticPanelConfig = z.infer<typeof CriticPanelConfigSchema>;
 
 /**
  * The review gate. `native-critic-panel` (default) is guru's OWN model-powered
- * review — it assumes only guru + a model connection (Foundational Law 1). `coderabbit`
- * / `command` run an external CLI and need a `command`; a refine enforces that. Legacy
- * `{provider:"coderabbit", command:[...]}` configs still parse unchanged.
+ * review — it assumes only guru + a model connection (Foundational Law 1).
+ * `command` runs an optional external CLI and needs a `command` argv.
+ * CodeRabbit was removed from the project (2026-07-10) — do not reintroduce.
  */
 export const ReviewGateSchema = z
   .object({
-    provider: z.enum(["native-critic-panel", "coderabbit", "command"]).default("native-critic-panel"),
+    provider: z.enum(["native-critic-panel", "command"]).default("native-critic-panel"),
     required: z.boolean().default(true),
     command: z.array(z.string().trim().min(1)).min(1).optional(),
     panel: CriticPanelConfigSchema.optional()
   })
   .strict()
   .refine((gate) => gate.provider === "native-critic-panel" || (gate.command !== undefined && gate.command.length > 0), {
-    message: "reviewGate.command is required for the coderabbit/command providers.",
+    message: "reviewGate.command is required when provider is command.",
     path: ["command"]
   });
 export type ReviewGate = z.infer<typeof ReviewGateSchema>;
@@ -101,7 +101,7 @@ const DEFAULT_RISKY_PATH_PATTERNS = [
 // Build/runtime tools plus read-only exploration basics — agentic models reach for
 // ls/cat/grep constantly; blocking them burns tool-call budget on no-ops (2026-07-02
 // scale shakedown). Exploration commands stay cwd-contained and content-guarded.
-const DEFAULT_SHELL_ALLOWLIST = ["npm", "node", "git", "pwsh", "coderabbit", "ls", "dir", "cat", "type", "head", "tail", "grep", "findstr", "pwd", "echo", "wc"];
+const DEFAULT_SHELL_ALLOWLIST = ["npm", "node", "git", "pwsh", "ls", "dir", "cat", "type", "head", "tail", "grep", "findstr", "pwd", "echo", "wc"];
 
 export const RuntimeHardeningSchema = z
   .object({
@@ -121,8 +121,7 @@ export const HarnessConfigSchema = z
     referenceRuntime: z.string().trim().min(1).default("a reference agent runtime"),
     skillDirectories: z.array(z.string().trim().min(1)).default([]),
     validationCommands: z.array(ValidationCommandSchema).default([]),
-    // Default review = guru's OWN native critic panel (no external tool assumed). A
-    // config that still declares {provider:"coderabbit", command:[...]} keeps working.
+    // Default review = guru's OWN native critic panel (no external review SaaS).
     reviewGate: ReviewGateSchema.default({
       provider: "native-critic-panel",
       required: true

@@ -40,7 +40,7 @@ describe("startHarnessSession", () => {
       },
       policy: {
         validationCommands: expect.arrayContaining(["test", "typecheck", "build", "repo-hygiene"]),
-        reviewGate: { provider: "coderabbit", required: true },
+        reviewGate: { provider: "native-critic-panel", required: true },
         approvalPolicy: {
           autoCommitPushPr: true,
           allowLocalMerge: false,

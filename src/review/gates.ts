@@ -4,7 +4,7 @@ import type { HarnessConfig, ReviewGate, ValidationCommand } from "../config/sch
 
 /**
  * PATH-probe: is a command present? (P0) — the basis of attach-if-present overlays
- * (e.g. append CodeRabbit/gh only when installed), never assumed. Presence only.
+ * (e.g. append gh only when installed), never assumed. Presence only.
  */
 export function commandExists(name: string): boolean {
   try {
@@ -165,7 +165,7 @@ export async function executeCommand(
     };
   }
 
-  // Windows: bare tool names (npm, coderabbit) resolve to .cmd shims that cannot be
+  // Windows: bare tool names (npm, git) resolve to .cmd shims that cannot be
   // spawned with shell:false — the child dies instantly with a null exit code. Route
   // them through cmd.exe with a fixed argv (no shell-string interpolation), same
   // pattern as the provider-CLI delegate.
@@ -199,13 +199,13 @@ export async function executeCommand(
       stderr = appendLine(stderr, reason);
       if (process.platform === "win32" && child.pid !== undefined) {
         // taskkill failure surfaces via the ChildProcess error EVENT, not a throw
-        // (CodeRabbit 2026-07-05) — fall back to SIGTERM explicitly.
+        // (review 2026-07-05) — fall back to SIGTERM explicitly.
         const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { shell: false, windowsHide: true });
         killer.on("error", () => child.kill("SIGTERM"));
       } else {
         child.kill("SIGTERM");
         // SIGTERM-resistant children would hang the resolve forever — escalate
-        // to SIGKILL after a short grace (CodeRabbit 2026-07-05).
+        // to SIGKILL after a short grace (review 2026-07-05).
         escalateTimer = setTimeout(() => {
           if (!settled) {
             child.kill("SIGKILL");

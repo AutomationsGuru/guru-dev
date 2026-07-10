@@ -45,9 +45,8 @@
     }
   ],
   "reviewGate": {
-    "provider": "coderabbit",
-    "required": true,
-    "command": ["coderabbit", "review", "--agent", "--type", "uncommitted"]
+    "provider": "native-critic-panel",
+    "required": true
   },
   "approvalPolicy": {
     "autoCommitPushPr": true,
@@ -87,8 +86,7 @@
       "npm",
       "node",
       "git",
-      "pwsh",
-      "coderabbit"
+      "pwsh"
     ]
   },
   "selfBuild": {

@@ -11,9 +11,23 @@ import {
   type PlannerModelFetch,
   type PlannerModelRequest
 } from "../../src/index.js";
-import type { CommandExecutor } from "../../src/review/gates.js";
+import type { CommandExecutor, CommandGate, CommandGateResult } from "../../src/review/gates.js";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
+
+/** Native critic panel double — GREEN without calling a model (default reviewGate). */
+async function greenNativeReviewer(gate: CommandGate): Promise<CommandGateResult> {
+  return {
+    ...gate,
+    status: "passed",
+    summary: "native critic panel GREEN (test double)",
+    exitCode: 0,
+    stdout: "",
+    stderr: "",
+    durationMs: 1,
+    verdict: "GREEN"
+  };
+}
 
 class FixedPlannerModel implements PlannerModel {
   readonly requests: PlannerModelRequest[] = [];
@@ -71,6 +85,7 @@ describe("runSelfBuildExecutor", () => {
       plannerModel: model,
       operationalStore: createInMemoryOperationalStore(),
       commandExecutor: createCommandExecutor(executedCommands),
+      nativeReviewer: greenNativeReviewer,
       git: {
         enabled: true,
         dryRun: true,
@@ -114,6 +129,7 @@ describe("runSelfBuildExecutor", () => {
       allowRiskyPaths: true,
       plannerModel: model,
       commandExecutor: createCommandExecutor([]),
+      nativeReviewer: greenNativeReviewer,
       git: {
         enabled: true,
         dryRun: false,

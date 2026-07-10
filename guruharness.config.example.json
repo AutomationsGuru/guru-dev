@@ -60,7 +60,7 @@
       "service-account"
     ],
     "secretAllowList": [],
-    "shellAllowlist": ["npm", "node", "git", "pwsh", "coderabbit"]
+    "shellAllowlist": ["npm", "node", "git", "pwsh"]
   },
   "selfBuild": {
     "maxIterations": 1,

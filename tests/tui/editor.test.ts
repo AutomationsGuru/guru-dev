@@ -175,7 +175,7 @@ describe("renderEditorFrame — wrap-aware rows + cursor math", () => {
     expect(frame.cursorCol).toBe(2 + 6 + 1); // 3 wide chars = 6 display cells
   });
 
-  it("combining marks are ZERO display cells — composed text measures as its base char (CodeRabbit round 2)", () => {
+  it("combining marks are ZERO display cells — composed text measures as its base char (review follow-up)", () => {
     expect(stringDisplayWidth("é")).toBe(1); // e + combining acute
     expect(stringDisplayWidth("a​b")).toBe(2); // zero-width space
     expect(charDisplayWidth(0xfe0f)).toBe(0); // variation selector
@@ -192,7 +192,7 @@ describe("renderEditorFrame — wrap-aware rows + cursor math", () => {
     expect(left.state.col).toBe(2); // stepped over both UTF-16 units
   });
 
-  it("EXACT wrap boundary: cursor at col n×contentWidth gets its own empty visual row (CodeRabbit fix)", () => {
+  it("EXACT wrap boundary: cursor at col n×contentWidth gets its own empty visual row (cursor wrap fix)", () => {
     const state = drive(createEditorState(), type("x".repeat(20))).state; // col 20 = 2×10
     const frame = renderEditorFrame(paint, state, prompt, 12);
     expect(frame.rows).toHaveLength(3); // two full rows + the empty cursor row

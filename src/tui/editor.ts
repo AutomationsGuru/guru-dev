@@ -106,7 +106,7 @@ export function charDisplayWidth(codePoint: number): number {
     (codePoint >= 0xfe00 && codePoint <= 0xfe0f) || // variation selectors
     codePoint === 0xfeff // zero-width no-break space (BOM)
   ) {
-    return 0; // composed text measures as its base char (CodeRabbit round 2)
+    return 0; // composed text measures as its base char (review follow-up)
   }
   if (
     (codePoint >= 0x1100 && codePoint <= 0x115f) || // Hangul Jamo

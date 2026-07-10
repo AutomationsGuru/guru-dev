@@ -15,7 +15,7 @@ export interface ParsedChunk {
   /**
    * Unconsumed trailing bytes (a lone ESC, or a CSI truncated at the chunk
    * edge, e.g. "\x1b[1;2") — the caller holds THE WHOLE TAIL and re-prefixes
-   * it to the next chunk so split sequences decode correctly (CodeRabbit
+   * it to the next chunk so split sequences decode correctly (review
    * 2026-07-05: re-prefixing only "\x1b" dropped the params).
    */
   readonly pending?: string;
@@ -102,7 +102,7 @@ export function parseKeys(chunk: string): ParsedChunk {
       if (next === "[" || next === "O") {
         // CSI / SS3 sequence: params then a final byte. ':' joins subparams
         // (kitty keycode:alternates, modifiers:event-type) — stopping at it
-        // would split the sequence and type the tail as text (CodeRabbit
+        // would split the sequence and type the tail as text (review
         // round 2).
         let end = at + 2;
         while (end < chunk.length && /[\d;:]/u.test(chunk[end] as string)) {

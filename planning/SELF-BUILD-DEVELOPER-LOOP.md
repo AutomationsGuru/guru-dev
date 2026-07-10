@@ -1,3 +1,5 @@
+> **Note (2026-07-10):** CodeRabbit is retired from GuruHarness. Review is peer-agent + native critic panel + CI only. Historical mentions of CodeRabbit below are archival.
+
 # The Self-Build Developer Loop — a plan to make guru replace the builder
 
 > **Goal:** make the self-build loop robust enough to replace the human-driven builder — autonomously SELECT → BUILD → TEST → CALL/SMOKE → DEBUG → REVIEW → SHIP → LEARN.

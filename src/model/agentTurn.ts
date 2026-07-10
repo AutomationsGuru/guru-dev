@@ -1259,7 +1259,7 @@ function describeRequestFailure(error: unknown): {
  *
  * `readBody: true` (non-streaming callers) consumes the body INSIDE the attempt
  * so the timeout covers the whole read — headers-then-hang can't stall the turn
- * (CodeRabbit 2026-07-05). Streaming callers keep the body open; their timer
+ * (review 2026-07-05). Streaming callers keep the body open; their timer
  * disarms at headers (a stream is SUPPOSED to stay open past any timeout).
  */
 async function fetchWithPolicy(

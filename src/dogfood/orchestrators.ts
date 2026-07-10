@@ -27,7 +27,7 @@ export function createCoreDogfoodOrchestrator(): DogfoodOrchestrator {
     getCandidates: () => [
       { label: "guruharness-baseline", orchestratorId: "core-portfolio", tier: "core", relativePath: ".guruharness", signal: "harness" },
       { label: "skills-workflow", orchestratorId: "core-portfolio", tier: "core", relativePath: ".agents/skills", signal: "skills" },
-      { label: "coderabbit-workflow", orchestratorId: "core-portfolio", tier: "core", relativePath: ".agents/knowledge-base", signal: "coderabbit" }
+      { label: "review-gate-config", orchestratorId: "core-portfolio", tier: "core", relativePath: ".agents/knowledge-base", signal: "reviewGate" }
     ]
   };
 }

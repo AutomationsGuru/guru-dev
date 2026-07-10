@@ -45,7 +45,7 @@ describe("scanRepoFiles — bounded walk", () => {
     expect(scan.files).not.toContain(".env.local");
   });
 
-  it("bounds directory-heavy trees too — the walk itself is capped (CodeRabbit round 2)", () => {
+  it("bounds directory-heavy trees too — the walk itself is capped (review follow-up)", () => {
     const dirRoot = join(tmpdir(), `guru-picker-dirs-${process.pid}`);
     for (let index = 0; index < 30; index += 1) {
       mkdirSync(join(dirRoot, `dir-${index}`), { recursive: true });

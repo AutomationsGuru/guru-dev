@@ -207,7 +207,7 @@ function createHealthyConfig() {
       { name: "build", command: ["npm", "run", "build"], required: true },
       { name: "repo-hygiene", command: ["pwsh", "-File", "scripts/verify-repo.ps1"], required: true }
     ],
-    reviewGate: { provider: "coderabbit", command: ["coderabbit", "review", "--agent"], required: true },
+    reviewGate: { provider: "native-critic-panel", required: true },
     approvalPolicy: { autoCommitPushPr: true, allowLocalMerge: false, allowForcePush: false },
     selfBuild: {
       completedTaskIds: [

@@ -19,7 +19,7 @@ const validDonePacket = {
   ],
   review: [
     {
-      reviewer: "CodeRabbit",
+      reviewer: "native-critic-panel",
       status: "passed",
       summary: "no blocking findings"
     }
@@ -47,7 +47,7 @@ describe("createDonePacket", () => {
     expect(packet.verdict).toBe("GREEN");
     expect(packet.changedFiles).toHaveLength(1);
     expect(packet.verification[0]).toMatchObject({ passed: true });
-    expect(packet.review[0]).toMatchObject({ reviewer: "CodeRabbit", status: "passed" });
+    expect(packet.review[0]).toMatchObject({ reviewer: "native-critic-panel", status: "passed" });
   });
 
   it("should reject done packets with invalid verdicts", () => {
@@ -65,7 +65,7 @@ describe("createDonePacket", () => {
     expect(serialized).toContain("VERDICT: GREEN");
     expect(serialized).toContain("Changed files:");
     expect(serialized).toContain("- PASS npm test: all tests passed");
-    expect(serialized).toContain("- CodeRabbit: passed — no blocking findings");
+    expect(serialized).toContain("- native-critic-panel: passed — no blocking findings");
   });
 });
 
