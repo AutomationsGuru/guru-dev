@@ -431,6 +431,7 @@ export const GURU_CHAT_TOOL_IDS: ReadonlySet<string> = new Set([
   "web_fetch",
   "web_search",
   "ask_question",
+  "mcp_bridge_status",
   "provider_cli_status",
   "provider_cli_run"
 ]);
@@ -452,6 +453,7 @@ export const READ_ONLY_TOOL_IDS: ReadonlySet<string> = new Set([
   "resolve_capability_gap",
   "todo_list",
   "ask_question",
+  "mcp_bridge_status",
   "provider_cli_status",
   "service_readiness_report",
   "maintenance.audit.run",

@@ -71,6 +71,7 @@ describe("startHarnessSession", () => {
       "kill_task",
       "ls",
       "maintenance.audit.run",
+      "mcp_bridge_status",
       "memory_doctor",
       "memory_forget",
       "memory_get",

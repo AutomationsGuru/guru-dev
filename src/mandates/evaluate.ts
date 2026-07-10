@@ -41,6 +41,8 @@ const TOOL_VERBS: Readonly<Record<string, readonly MandateVerb[]>> = {
   todo_list: [],
   // Operator Q&A — no mutation.
   ask_question: [],
+  // MCP attach board — read-only snapshot.
+  mcp_bridge_status: [],
   // Networked research (bounded).
   web_fetch: ["net"],
   web_search: ["net"],
@@ -66,6 +68,7 @@ export const MANDATE_READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   "honcho_context",
   "todo_list",
   "ask_question",
+  "mcp_bridge_status",
   "provider_cli_status",
   "service_readiness_report",
   "operational.project.get",

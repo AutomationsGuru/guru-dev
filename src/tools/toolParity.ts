@@ -144,12 +144,12 @@ export const TOOL_PARITY_ROWS: readonly ToolParityRow[] = [
     toolId: "mcp_bridge_status",
     category: "mcp-bridge",
     requirementIds: ["FR-09", "FR-10", "TR-21", "TR-22"],
-    currentGuruHarnessToolIds: ["mcp.* (via attachConfiguredMcpServers)"],
-    status: "partial-equivalent",
-    verdict: "YELLOW",
-    ownerModule: "src/mcp",
-    notes: "stdio MCP attach + toolBridge ships tools as mcp.<server>.<name>; dedicated status tool is still implicit via attach statuses.",
-    nextAction: "Optional: first-class mcp_status tool for operators; bridge is live for configured servers."
+    currentGuruHarnessToolIds: ["mcp_bridge_status"],
+    status: "native-equivalent",
+    verdict: "GREEN",
+    ownerModule: "src/tools/builtins/mcpStatusTool.ts",
+    notes: "First-class tool reads process-local attach statuses (ready/missing-env/error + tool counts) recorded by attachConfiguredMcpServers.",
+    nextAction: "Maintained."
   },
   {
     toolId: "mcp_list_tools",
@@ -178,11 +178,11 @@ export const TOOL_PARITY_ROWS: readonly ToolParityRow[] = [
     category: "research",
     requirementIds: ["FR-09", "TR-20", "TR-36"],
     currentGuruHarnessToolIds: ["web_fetch"],
-    status: "partial-equivalent",
-    verdict: "YELLOW",
+    status: "native-equivalent",
+    verdict: "GREEN",
     ownerModule: "src/tools/builtins/webFetchTool.ts",
-    notes: "Bounded http(s) GET with size/timeout/redirect caps and net mandate verb. Not a full research agent (no citations engine).",
-    nextAction: "Optional: HTML→markdown polish; pair with web_search for discovery."
+    notes: "Bounded http(s) GET with size/timeout/redirect caps, net mandate, and HTML→readable text conversion. Pair with web_search for discovery.",
+    nextAction: "Optional: richer markdown tables/code fences if dogfood needs it."
   },
   {
     toolId: "web_search",
