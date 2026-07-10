@@ -27,7 +27,11 @@ describe("initExtensions", () => {
         "ask_question",
         "mcp_bridge_status",
         "provider_cli_status",
-        "provider_cli_run"
+        "provider_cli_run",
+        "pyautogui_status",
+        "pyautogui_screen",
+        "pyautogui_mouse",
+        "pyautogui_keyboard"
       ])
     );
   });
@@ -43,6 +47,7 @@ describe("initExtensions", () => {
     expect(ids).toContain("ask_question");
     expect(ids).toContain("mcp_bridge_status");
     expect(ids).toContain("provider_cli_status");
+    expect(ids).toContain("pyautogui_status");
   });
 });
 
@@ -60,6 +65,8 @@ describe("extension tools wired into the live runtime", () => {
     expect(ids).toContain("ask_question");
     expect(ids).toContain("mcp_bridge_status");
     expect(ids).toContain("provider_cli_status");
+    expect(ids).toContain("pyautogui_status");
+    expect(ids).toContain("pyautogui_mouse");
   });
 
   it("executes honcho_memory_status through the live runtime", async () => {

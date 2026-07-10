@@ -15,6 +15,7 @@ import { createWebSearchTools } from "../tools/builtins/webSearchTool.js";
 import { createAskQuestionTools } from "../tools/builtins/askQuestionTool.js";
 import { createMcpStatusTools } from "../tools/builtins/mcpStatusTool.js";
 import { createProviderCliTools } from "../tools/builtins/providerCliTools.js";
+import { createDesktopTools } from "../tools/builtins/desktopTools.js";
 import type { SwarmConfig } from "../swarm/schema.js";
 
 /** Env var NAMES (never values) the Honcho runtime requires. */
@@ -76,6 +77,8 @@ export function initExtensions(options: InitExtensionsOptions = {}): HarnessExte
     api.registerTool({ factory: () => createMcpStatusTools() });
     // Provider CLI status + dry-run-first delegated run (parity RED → GREEN, 2026-07-10).
     api.registerTool({ factory: () => createProviderCliTools() });
+    // Desktop / PyAutoGUI-class tools — dry-run-first, failsafe, live gated (2026-07-10).
+    api.registerTool({ factory: () => createDesktopTools() });
   });
 
   host.start();

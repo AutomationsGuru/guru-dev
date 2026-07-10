@@ -2,6 +2,14 @@
 
 All notable changes to GuruHarness are documented here.
 
+## [1.4.8] - 2026-07-10
+
+### Added
+- **Desktop / PyAutoGUI-class tools** (`pyautogui_status`, `pyautogui_screen`, `pyautogui_mouse`, `pyautogui_keyboard`): dry-run-first computer-use surface with failsafe corners, bounds clamp, risky-hotkey denylist, secret-typing block, sidecar screenshots, and live gate (`GURU_DESKTOP_LIVE` + injected backend + `userApproved`).
+
+### Changed
+- Tool parity: **22 GREEN / 2 YELLOW / 0 RED** (only perplexity + repo routing remain YELLOW).
+
 ## [1.4.7] - 2026-07-10
 
 ### Added
