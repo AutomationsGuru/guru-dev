@@ -2577,6 +2577,8 @@ export interface ComposerDeps {
   readonly columns?: () => number;
   /** cwd for Tab path completion; defaults to process.cwd(). */
   readonly cwd?: string;
+  /** Persistent composer chrome drawn ABOVE the input (for example, the mode rule). */
+  headerRows?(): string[];
   /**
    * Persistent composer chrome drawn BELOW the input on every render (status bar +
    * hint line) — pinned under the composer, reflows on resize. Empty = no chrome.
@@ -2792,6 +2794,10 @@ export function attachComposer(deps: ComposerDeps): {
   let closed = false;
   /** Visual cursor row within the last-rendered editor frame (for relative moves). */
   let lastCursorRow = 0;
+  /** Display widths of the last editor rows, used to recover the anchor after resize reflow. */
+  let lastFrameRowWidths: readonly number[] = [];
+  /** One-based terminal column of the cursor in the last editor frame. */
+  let lastCursorCol = 1;
   let rendered = false;
   /**
    * Mid-turn draft: keys typed while a turn is streaming. Esc/Ctrl+C aborts the
@@ -2856,13 +2862,26 @@ export function attachComposer(deps: ComposerDeps): {
     return `${out}\x1b[0m`;
   };
 
+  const headerRows = (width: number): string[] => (deps.headerRows ? deps.headerRows() : []).map((row) => clampToWidth(row, width));
+
   /**
-   * Move from the live cursor (parked on `lastCursorRow` within the block) to
-   * the block's first row so the next clear/rewrite overwrites in place.
+   * Move from the live cursor to the block's first row so the next
+   * clear/rewrite overwrites in place. After a terminal shrink, previously
+   * rendered hard rows may occupy multiple physical rows, so recompute the
+   * distance from their saved display widths instead of trusting the old row
+   * index verbatim.
    */
   const moveToBlockTop = (): void => {
-    if (rendered && lastCursorRow > 0) {
-      deps.output.write(`\x1b[${lastCursorRow}A`);
+    if (!rendered) {
+      return;
+    }
+    const termWidth = Math.max(1, columns());
+    let physicalCursorRow = Math.floor(Math.max(0, lastCursorCol - 1) / termWidth);
+    for (let row = 0; row < lastCursorRow; row += 1) {
+      physicalCursorRow += Math.max(1, Math.ceil((lastFrameRowWidths[row] ?? 0) / termWidth));
+    }
+    if (physicalCursorRow > 0) {
+      deps.output.write(`\x1b[${physicalCursorRow}A`);
     }
   };
 
@@ -2882,20 +2901,21 @@ export function attachComposer(deps: ComposerDeps): {
     const termWidth = Math.max(8, columns());
     const width = Math.max(1, termWidth - 1);
     const frame = renderEditorFrame(paint, editor, { text: promptText, width: promptCols }, width);
+    const above = headerRows(width);
     const below = overlayRows().map((row) => clampToWidth(row, width));
     moveToBlockTop();
     deps.output.write("\x1b[1G\x1b[0J");
-    deps.output.write(frame.rows.join("\n"));
-    if (below.length > 0) {
-      deps.output.write(`\n${below.join("\n")}`);
-    }
-    const totalRows = frame.rows.length + below.length;
-    const upFromBottom = totalRows - 1 - frame.cursorRow;
+    deps.output.write([...above, ...frame.rows, ...below].join("\n"));
+    const totalRows = above.length + frame.rows.length + below.length;
+    const cursorBlockRow = above.length + frame.cursorRow;
+    const upFromBottom = totalRows - 1 - cursorBlockRow;
     if (upFromBottom > 0) {
       deps.output.write(`\x1b[${upFromBottom}A`);
     }
     deps.output.write(`\x1b[${frame.cursorCol}G`);
-    lastCursorRow = frame.cursorRow;
+    lastCursorRow = cursorBlockRow;
+    lastFrameRowWidths = [...above, ...frame.rows].map((row) => stringDisplayWidth(row.replace(/\x1b\[[0-9;]*m/gu, "")));
+    lastCursorCol = frame.cursorCol;
     rendered = true;
   };
 
@@ -2921,18 +2941,19 @@ export function attachComposer(deps: ComposerDeps): {
   /**
    * Forced redraw for resize while busy (review 2026-07-08). The normal render()
    * early-returns on isBusy(), so a resize during a streamed turn was dropped and
-   * the stale lastCursorRow powered a wrong relative-move on the next frame. Here
-   * we drop the stale anchor first (treat the screen as not-yet-rendered) so no
-   * bogus `\x1b[NA` is emitted, then repaint at the new width. The cursor itself
-   * is hidden during a turn, so the only on-screen effect is the chrome/input
-   * reflowing to the new width instead of staying at the old layout.
+   * the stale lastCursorRow powered a wrong relative-move on the next frame.
+   * Idle frames retain their anchor so paintFrame can recompute its physical
+   * row after reflow. During a live turn output may have moved the cursor away
+   * from that anchor, so keep the unanchored repaint fallback for that case.
    */
   const forceRender = (): void => {
     if (!deps.interactive || closed) {
       return;
     }
-    lastCursorRow = 0;
-    rendered = false;
+    if (deps.isBusy()) {
+      lastCursorRow = 0;
+      rendered = false;
+    }
     paintFrame();
   };
 
@@ -2943,8 +2964,10 @@ export function attachComposer(deps: ComposerDeps): {
     }
     moveToBlockTop();
     deps.output.write("\x1b[1G\x1b[0J");
+    const termWidth = Math.max(8, columns());
+    const above = headerRows(Math.max(1, termWidth - 1));
     const echoed = text.split("\n").map((line, index) => (index === 0 ? `${promptText}${line}` : `${" ".repeat(promptCols)}${line}`));
-    deps.output.write(`${echoed.join("\n")}\n`);
+    deps.output.write(`${above.length > 0 ? `${above.join("\n")}\n` : ""}${echoed.join("\n")}\n`);
     rendered = false;
     lastCursorRow = 0;
   };
@@ -3238,6 +3261,11 @@ export function attachComposer(deps: ComposerDeps): {
       if (rendered) {
         moveToBlockTop();
         deps.output.write("\x1b[1G\x1b[0J");
+        const termWidth = Math.max(8, columns());
+        const above = headerRows(Math.max(1, termWidth - 1));
+        if (above.length > 0) {
+          deps.output.write(`${above.join("\n")}\n`);
+        }
         rendered = false;
         lastCursorRow = 0;
       }
@@ -4551,6 +4579,7 @@ export async function runGuru(): Promise<void> {
       },
       commandItems,
       drillItems,
+      headerRows: () => [composerTopRule(paint, process.stdout.columns ?? 80, composerModeLabel())],
       chromeRows: () => {
         const q = state.agentSession?.queueDepth() ?? 0;
         const extras = ["ctrl+j newline", "@ files", "tab paths", "type+↵ steer", "alt+↵ follow-up"];
@@ -4598,7 +4627,6 @@ export async function runGuru(): Promise<void> {
     process.stdout.on("resize", onResize);
 
     const promptComposer = (): void => {
-      print(composerTopRule(paint, process.stdout.columns ?? 80, composerModeLabel()));
       composer.beginPrompt();
     };
 
