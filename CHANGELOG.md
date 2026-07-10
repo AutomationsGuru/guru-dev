@@ -1,5 +1,14 @@
 # Changelog
 
+
+## [1.4.2] - 2026-07-10
+
+### Added
+- **Session task board** (`todo_write` / `todo_list`) + operator `/todo` — multi-step agent work tracking (harness baseline parity).
+- **Bounded `web_fetch`** — http(s) GET with size/timeout/redirect caps; net mandate verb.
+
+### Changed
+- Tool parity map updated for live MCP attach/bridge and the new research/todo surfaces.
 All notable changes to GuruHarness are documented here.
 
 ## [1.4.1] - 2026-07-09

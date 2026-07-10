@@ -23,6 +23,7 @@ describe("tool parity map", () => {
         "bash",
         "edit",
         "write",
+        "todo_write",
         "honcho_memory_status",
         "honcho_remember",
         "honcho_recall",
@@ -31,6 +32,7 @@ describe("tool parity map", () => {
         "mcp_bridge_status",
         "mcp_list_tools",
         "mcp_call_tool",
+        "web_fetch",
         "perplexity_research",
         "provider_cli_status",
         "provider_cli_run",
@@ -58,10 +60,10 @@ describe("tool parity map", () => {
     });
   });
 
-  it("should mark absent integration tools RED with owner modules", () => {
-    // honcho_* rows flipped GREEN 2026-07-04 — the evidence engine (Phase G)
-    // caught the stale self-model: the tools were built 2026-07-01.
-    for (const id of ["mcp_bridge_status", "provider_cli_status", "pyautogui_status", "perplexity_research"]) {
+  it("should mark still-absent integration tools RED with owner modules", () => {
+    // MCP bridge flipped out of pure RED 2026-07-10 (attach + toolBridge live).
+    // Desktop + delegated provider CLI remain RED by design until those waves.
+    for (const id of ["provider_cli_status", "pyautogui_status", "pyautogui_keyboard"]) {
       const row = findToolParityRow(id);
 
       expect(row).toBeDefined();
@@ -69,6 +71,13 @@ describe("tool parity map", () => {
       expect(row?.ownerModule).toMatch(/^src\//);
       expect(row?.currentGuruHarnessToolIds).toEqual([]);
     }
+  });
+
+  it("should mark MCP list/call and todo board GREEN", () => {
+    expect(findToolParityRow("mcp_list_tools")).toMatchObject({ status: "native-equivalent", verdict: "GREEN" });
+    expect(findToolParityRow("mcp_call_tool")).toMatchObject({ status: "native-equivalent", verdict: "GREEN" });
+    expect(findToolParityRow("todo_write")).toMatchObject({ status: "native-equivalent", verdict: "GREEN" });
+    expect(findToolParityRow("web_fetch")).toMatchObject({ status: "partial-equivalent", verdict: "YELLOW" });
   });
 
   it("should keep rows unique and schema-valid", () => {
@@ -82,6 +91,6 @@ describe("tool parity map", () => {
   });
 
   it("should summarize RED/YELLOW/GREEN counts", () => {
-    expect(getToolParityVerdictCounts()).toEqual({ GREEN: 9, YELLOW: 1, RED: 10 });
+    expect(getToolParityVerdictCounts()).toEqual({ GREEN: 12, YELLOW: 4, RED: 6 });
   });
 });

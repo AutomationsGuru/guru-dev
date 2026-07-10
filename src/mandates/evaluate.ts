@@ -35,7 +35,12 @@ const TOOL_VERBS: Readonly<Record<string, readonly MandateVerb[]>> = {
   get_task_output: [],
   kill_task: [],
   // Probe-only (registry lookups + PATH presence): never mutates.
-  resolve_capability_gap: []
+  resolve_capability_gap: [],
+  // Session task board — process memory only, never disk secrets.
+  todo_write: [],
+  todo_list: [],
+  // Networked research fetch (bounded).
+  web_fetch: ["net"]
 };
 
 /** Read-only tools: never gated by the mandate (the always-allowed floor). */
@@ -52,6 +57,7 @@ export const MANDATE_READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   "honcho_memory_status",
   "honcho_recall",
   "honcho_context",
+  "todo_list",
   "service_readiness_report",
   "operational.project.get",
   "operational.state.list",

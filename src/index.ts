@@ -40,6 +40,8 @@ export * from "./skills/schemas.js";
 export * from "./tools/builtins/fileEditTool.js";
 export * from "./tools/builtins/gitPrAutomationTool.js";
 export * from "./tools/builtins/githubPrTools.js";
+export * from "./tools/builtins/todoTools.js";
+export * from "./tools/builtins/webFetchTool.js";
 export * from "./tools/builtins/maintenanceAuditTool.js";
 export * from "./tools/builtins/operationalStoreTools.js";
 export * from "./tools/builtins/repoContextTool.js";
