@@ -31,7 +31,7 @@ describe("provider_cli_status tool", () => {
       env: {},
       executor: readyExecutor
     });
-    const out = (await tool.execute({ id: "codex" })) as {
+    const out = (await tool.execute({ id: "codex" }, {})) as {
       reports: { status: string; version?: string }[];
       summary: string;
     };
@@ -47,7 +47,7 @@ describe("provider_cli_status tool", () => {
       env: {},
       executor: readyExecutor
     });
-    const out = (await tool.execute({})) as { reports: unknown[]; summary: string };
+    const out = (await tool.execute({}, {})) as { reports: unknown[]; summary: string };
     expect(out.reports).toHaveLength(2);
     expect(out.summary).toMatch(/2 provider CLI/);
   });
@@ -65,14 +65,17 @@ describe("provider_cli_run tool", () => {
         return { exitCode: 0, stdout: "hi", stderr: "" };
       }
     });
-    const out = await tool.execute({
-      id: "codex",
-      prompt: "hello world",
-      dryRun: true,
-      userApproved: false,
-      redactOutput: true,
-      timeoutMs: 30_000
-    });
+    const out = await tool.execute(
+      {
+        id: "codex",
+        prompt: "hello world",
+        dryRun: true,
+        userApproved: false,
+        redactOutput: true,
+        timeoutMs: 30_000
+      },
+      {}
+    );
     expect(out.status).toBe("dry-run");
     expect(out.summary).toContain("codex.cmd");
     expect(out.summary).toContain("hello");
@@ -86,14 +89,17 @@ describe("provider_cli_run tool", () => {
       executor: readyExecutor,
       runExecutor: async () => ({ exitCode: 0, stdout: "nope", stderr: "" })
     });
-    const out = await tool.execute({
-      id: "codex",
-      prompt: "x",
-      dryRun: false,
-      userApproved: false,
-      redactOutput: true,
-      timeoutMs: 30_000
-    });
+    const out = await tool.execute(
+      {
+        id: "codex",
+        prompt: "x",
+        dryRun: false,
+        userApproved: false,
+        redactOutput: true,
+        timeoutMs: 30_000
+      },
+      {}
+    );
     expect(out.status).toBe("blocked");
     expect(out.summary).toMatch(/userApproved/i);
   });
@@ -104,14 +110,17 @@ describe("provider_cli_run tool", () => {
       env: {},
       executor: readyExecutor
     });
-    const out = await tool.execute({
-      id: "gcloud",
-      prompt: "list",
-      dryRun: false,
-      userApproved: true,
-      redactOutput: true,
-      timeoutMs: 30_000
-    });
+    const out = await tool.execute(
+      {
+        id: "gcloud",
+        prompt: "list",
+        dryRun: false,
+        userApproved: true,
+        redactOutput: true,
+        timeoutMs: 30_000
+      },
+      {}
+    );
     // status-only path returns dry-run with explanation rather than live execute
     expect(out.status).toBe("dry-run");
     expect(out.summary).toMatch(/status-only/i);
@@ -128,14 +137,17 @@ describe("provider_cli_run tool", () => {
         stderr: ""
       })
     });
-    const out = await tool.execute({
-      id: "codex",
-      prompt: "ship it",
-      dryRun: false,
-      userApproved: true,
-      redactOutput: true,
-      timeoutMs: 30_000
-    });
+    const out = await tool.execute(
+      {
+        id: "codex",
+        prompt: "ship it",
+        dryRun: false,
+        userApproved: true,
+        redactOutput: true,
+        timeoutMs: 30_000
+      },
+      {}
+    );
     expect(out.status).toBe("succeeded");
     expect(out.stdout).toContain("[REDACTED_KEY]");
     expect(out.stdout).not.toContain("sk-abcdefghijklmnopqrstuvwxyz1234");
