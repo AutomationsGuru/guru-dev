@@ -118,7 +118,9 @@ function checkReviewGate(config: HarnessConfig): MaintenanceCheck {
     id: "review-gate",
     title: "Review gate",
     status: passed ? "passed" : "failed",
-    summary: passed ? "Required CodeRabbit review gate is configured." : "Required CodeRabbit review gate is not configured.",
+    summary: passed
+      ? `Required review gate is configured (${config.reviewGate.provider}).`
+      : "Required review gate is not configured.",
     evidence: [config.reviewGate.provider, config.reviewGate.required ? "required" : "optional"]
   };
 }

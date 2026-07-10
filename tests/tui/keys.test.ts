@@ -40,7 +40,7 @@ describe("parseKeys — table-driven decoder branches", () => {
     });
   }
 
-  it("':' subparams stay inside the CSI — no tail typed as text (CodeRabbit round 2)", () => {
+  it("':' subparams stay inside the CSI — no tail typed as text (review follow-up)", () => {
     const parsed = parseKeys("\x1b[13:2u");
     expect(parsed.keys).toHaveLength(1);
     expect(parsed.keys[0]?.name).toBe("return");

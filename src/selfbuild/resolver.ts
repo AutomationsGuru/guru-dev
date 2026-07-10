@@ -15,7 +15,7 @@ import { z } from "zod";
  * its reasons (never silently), and returns a concrete work plan. It only ever
  * PROBES (registry lookups, PATH presence, manifest reads) — execution of the
  * plan stays behind the normal gates, and self-mutations behind the full
- * constitution (validation + CodeRabbit + approval + Done Packet).
+ * constitution (validation + review + approval + Done Packet).
  */
 
 export const NeverStuckMoveSchema = z.enum(["already-have", "attach", "learn-replicate", "build"]);
@@ -159,7 +159,7 @@ export function resolveCapabilityGap(rawGap: CapabilityGap, context: ResolverCon
       workPlan: [
         `Recon (read-only, swarm scouts welcome): study how ${reference} does "${gap.need}" — interface, inputs, outputs.`,
         "Design the guru-native tool/extension (zod schemas, frozen-seam registration).",
-        "Implement + tests; ship through validation + CodeRabbit + approval + Done Packet."
+        "Implement + tests; ship through validation + review + approval + Done Packet."
       ],
       evidence
     };
@@ -173,7 +173,7 @@ export function resolveCapabilityGap(rawGap: CapabilityGap, context: ResolverCon
     workPlan: [
       `Design a minimal tool/extension for "${gap.need}" (zod schemas, registered through the extension host — no core edits).`,
       "Implement + focused tests.",
-      "Ship through validation + CodeRabbit + approval + Done Packet; park the capability in the garage."
+      "Ship through validation + review + approval + Done Packet; park the capability in the garage."
     ],
     evidence
   };

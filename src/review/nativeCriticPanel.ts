@@ -3,7 +3,7 @@ import type { CommandGate, CommandGateResult, NativeReviewer, ReviewGateVerdict 
 
 /**
  * Native adversarial critic panel (self-build P1) — guru's OWN model-powered code
- * review. It REPLACES the hard-coded CodeRabbit gate: it needs nothing but the
+ * review. It is the default review path (no external review SaaS): it needs nothing but the
  * accepted baseline model connection (Foundational Law 1), and it CANNOT rubber-stamp
  * itself — read-only persona critics (a diff in, findings out, NO tools), an independent
  * adversarial VERIFY pass (confirm-with-repro or refute), and a verdict SYNTHESIZED IN

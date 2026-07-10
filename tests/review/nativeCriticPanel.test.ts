@@ -65,7 +65,7 @@ describe("native critic panel (P1) — guru's OWN model-powered review, read-onl
   });
 });
 
-describe("native review wired into runReviewGates (replaces CodeRabbit, zero external calls)", () => {
+describe("native review wired into runReviewGates (replaces review, zero external calls)", () => {
   const config = HarnessConfigSchema.parse({}); // default reviewGate = native-critic-panel, no validation commands
 
   it("default config runs the NATIVE gate through the injected reviewer — the shell executor is never called", async () => {

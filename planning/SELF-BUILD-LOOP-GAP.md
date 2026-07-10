@@ -1,3 +1,5 @@
+> **Note (2026-07-10):** CodeRabbit is retired from GuruHarness. Review is peer-agent + native critic panel + CI only. Historical mentions of CodeRabbit below are archival.
+
 Facts confirmed. The executor builds both runtimes without `mandatePolicy`, `nativeReviewer` is only forwarded (never constructed), review degrades to YELLOW-by-absence, `SelfBuildConfigSchema` is `.strict()` with two fields, and spend detection is bash-string-only. Here is the plan.
 
 ## HERE (current state)

@@ -1133,7 +1133,7 @@ async function runGuruCompaction(
 /**
  * Routes that declare no context window (ollama-local and other local lanes) still
  * receive the full history — bound them by a conservative model default so long sessions on
- * those lanes compact instead of overflowing (CodeRabbit 2026-07-04).
+ * those lanes compact instead of overflowing (review 2026-07-04).
  */
 export const FALLBACK_CONTEXT_WINDOW_TOKENS = 128_000;
 
@@ -2781,7 +2781,7 @@ export function attachComposer(deps: ComposerDeps): {
   let interruptHandler: () => void = () => undefined;
   /**
    * FIFO of pending readLine() resolvers — a second concurrent read must wait
-   * for the NEXT submission, never overwrite (and hang) the first (CodeRabbit
+   * for the NEXT submission, never overwrite (and hang) the first (review
    * round 2).
    */
   const submitResolvers: Array<(line: string | null) => void> = [];
@@ -2832,7 +2832,7 @@ export function attachComposer(deps: ComposerDeps): {
    * wrapped would silently add physical rows the relative-move accounting
    * doesn't know about, stacking stale frames (adversarial finding). Measures
    * DISPLAY cells (CJK/emoji are 2) — a UTF-16 count would let wide rows slip
-   * past the clamp and hard-wrap anyway (CodeRabbit round 2).
+   * past the clamp and hard-wrap anyway (review follow-up).
    */
   const clampToWidth = (row: string, width: number): string => {
     if (stringDisplayWidth(row.replace(/\x1b\[[0-9;]*m/gu, "")) <= width) {
@@ -4618,7 +4618,7 @@ export async function runGuru(): Promise<void> {
 
     // Resize reflow: repaint the whole composer block at the new width. Named
     // + removed in the finally below — an orphaned listener would keep the
-    // closed composer closure alive (CodeRabbit round 2). Uses forceRefresh so
+    // closed composer closure alive (review follow-up). Uses forceRefresh so
     // a resize DURING a streamed turn still reflows (render() would early-return
     // on isBusy() and leave the cursor anchor stale).
     const onResize = (): void => {

@@ -472,7 +472,7 @@ function buildNextActions(blockers: readonly string[], task: SelfBuildTask | nul
   return [
     task ? `Use the assembled runtime context to work on ${task.id}.` : "Select a task before executing harness work.",
     "Dispatch typed tools through the session registry as needed.",
-    "Run validation and CodeRabbit before repository handoff."
+    "Run validation and peer/native review before repository handoff."
   ];
 }
 

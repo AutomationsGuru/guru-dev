@@ -26,7 +26,7 @@ describe("createCommandGates", () => {
   it("should include validation gates and the configured review gate", () => {
     const gates = createCommandGates(createConfig(), true);
 
-    expect(gates.map((gate) => `${gate.kind}:${gate.name}`)).toEqual(["validation:test", "review:coderabbit"]);
+    expect(gates.map((gate) => `${gate.kind}:${gate.name}`)).toEqual(["validation:test", "review:command"]);
   });
 
   it("should omit the review gate when requested", () => {
@@ -113,7 +113,7 @@ describe("createReviewGatesTool", () => {
       configPath,
       JSON.stringify({
         validationCommands: [{ name: "unit", command: ["pass"], required: true }],
-        reviewGate: { provider: "coderabbit", command: ["pass"], required: true }
+        reviewGate: { provider: "command", command: ["pass"], required: true }
       })
     );
     const registry = createToolRegistry([createReviewGatesTool(createFakeExecutor())]);
@@ -157,7 +157,7 @@ function createConfig(
     validationCommands: [
       { name: "test", command: options.validationCommand ?? ["pass"], required: options.validationRequired ?? true }
     ],
-    reviewGate: { provider: "coderabbit", command: ["pass"], required: true }
+    reviewGate: { provider: "command", command: ["pass"], required: true }
   });
 }
 

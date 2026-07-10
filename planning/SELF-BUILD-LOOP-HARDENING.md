@@ -1,3 +1,5 @@
+> **Note (2026-07-10):** CodeRabbit is retired from GuruHarness. Review is peer-agent + native critic panel + CI only. Historical mentions of CodeRabbit below are archival.
+
 CONFIRMED 23 | PLAUSIBLE 3 | REFUTED 5
 
 ### [1] HIGH — src/selfbuild/gitDelivery.ts (correctness)

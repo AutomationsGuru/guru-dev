@@ -22,7 +22,7 @@ export interface RepoFileScan {
 export function scanRepoFiles(root: string, options: { readonly cap?: number } = {}): RepoFileScan {
   const cap = options.cap ?? 2_000;
   // Bound the WALK, not just the file list — a directory-heavy tree (few
-  // files, thousands of dirs) must stay instant too (CodeRabbit round 2).
+  // files, thousands of dirs) must stay instant too (review follow-up).
   const entryCap = cap * 25;
   let visited = 0;
   const files: string[] = [];

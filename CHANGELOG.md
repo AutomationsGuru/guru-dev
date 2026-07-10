@@ -29,7 +29,7 @@ YOLO-by-default agency + preserve-don't-replace — guru acts like a model harne
 
 ### Validation
 
-typecheck / build / **1187 tests** / CI (repo-hygiene + CodeQL + CodeRabbit) green on main.
+typecheck / build / **1187 tests** / CI (repo-hygiene + CodeQL + review) green on main.
 
 ## [1.3.0] - 2026-07-07
 
@@ -58,7 +58,7 @@ Release-prep status: artifacts prepared only; no tag or release has been cut.
 - Bounded self-build loop with HERE/THERE direction checks and task dependency ordering.
 - Schema-first configuration loading, typed tool registry, and runtime skill loading.
 - Repo context and AGENTS.md chain discovery for target repositories.
-- Validation, CodeRabbit, git/PR automation, and repository hygiene gates.
+- Validation, review, git/PR automation, and repository hygiene gates.
 - Supabase-backed operational store for projects, state snapshots, decisions, backlog, implementations, configurations, and endpoints.
 - Harness runtime sessions with planner execution, resumable persistence, CLI `run`, API, and TUI surfaces.
 - OpenAI-compatible planner model adapter with credential lookup by environment variable name only.

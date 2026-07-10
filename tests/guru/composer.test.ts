@@ -283,7 +283,7 @@ describe("composer — adversarial-review regressions (2026-07-05)", () => {
     expect(await r.composer.readLine()).toBe("third");
   });
 
-  it("concurrent readLine() calls queue FIFO — the first reader is never overwritten (CodeRabbit round 2)", async () => {
+  it("concurrent readLine() calls queue FIFO — the first reader is never overwritten (review follow-up)", async () => {
     const r = rig();
     const first = r.composer.readLine();
     const second = r.composer.readLine();

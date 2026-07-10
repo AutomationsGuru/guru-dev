@@ -61,7 +61,7 @@ export function createSelfBuildState(): SelfBuildState {
     objective:
       "Build GuruHarness into an independent agent harness with self-building capability; use the self-build loop only as a bounded construction/dogfood mechanism.",
     here:
-      "GuruHarness is a validated harness substrate with governance, config loading, typed tool registry, repo/AGENTS context, validation and CodeRabbit gates, git/PR automation, Supabase operational memory, runtime skill loading, maintenance audit, a resumable session runtime nucleus, planner runtime, self-build executor, OpenAI-compatible model adapter, operational-store-backed session persistence, run CLI lifecycle, API/TUI surfaces, strict runtime hardening, provider fallback playbooks, long-running observability beacons, operator recovery workflows, first-class bounded file/shell execution tools, GitHub PR review/comment/status helpers, broader operational runtime tools, API-side resumable tool sessions, API session event reads, CLI/API session inspection, persisted timeline inspection after API restarts, session listing, guided session continuation suggestions, bounded list-inspect-continue dogfood proof, concise operator continuity playbook guidance, API startup guidance, and verified end-to-end dogfood coverage across runtime, CLI, API, persistence, and recovery paths. It is not yet fully polished for daily use because the startup playbook still needs a bounded dogfood proof from API launch through health evidence into recovery-command readiness.",
+      "GuruHarness is a validated harness substrate with governance, config loading, typed tool registry, repo/AGENTS context, validation and review gates, git/PR automation, Supabase operational memory, runtime skill loading, maintenance audit, a resumable session runtime nucleus, planner runtime, self-build executor, OpenAI-compatible model adapter, operational-store-backed session persistence, run CLI lifecycle, API/TUI surfaces, strict runtime hardening, provider fallback playbooks, long-running observability beacons, operator recovery workflows, first-class bounded file/shell execution tools, GitHub PR review/comment/status helpers, broader operational runtime tools, API-side resumable tool sessions, API session event reads, CLI/API session inspection, persisted timeline inspection after API restarts, session listing, guided session continuation suggestions, bounded list-inspect-continue dogfood proof, concise operator continuity playbook guidance, API startup guidance, and verified end-to-end dogfood coverage across runtime, CLI, API, persistence, and recovery paths. It is not yet fully polished for daily use because the startup playbook still needs a bounded dogfood proof from API launch through health evidence into recovery-command readiness.",
     there:
       "GuruHarness is a working independent agent harness with self-building capability: a harness runtime that can start and resume agent sessions, assemble context from repo/AGENTS/skills/memory/config, dispatch typed tools safely, enforce review and capture policy, expose practical CLI/API/TUI surfaces, persist operational memory, and support build-time self-improvement without mistaking the self-build loop for the product.",
     referenceRuntime: "a reference agent runtime",
@@ -69,7 +69,7 @@ export function createSelfBuildState(): SelfBuildState {
       "Every new task starts by reading HERE and THERE and proving the task moves GuruHarness toward THERE.",
       "Keep self-build loops bounded; never treat the loop itself as the finished product.",
       "Load AGENTS.md and relevant skills before repository mutation.",
-      "Validate locally and run CodeRabbit before GREEN handoff.",
+      "Validate locally and run review before GREEN handoff.",
       "Commit, push, and open PRs automatically after validation passes.",
       "Never store Supabase credentials, raw environment values, or runtime .temp state in git."
     ],
@@ -132,8 +132,8 @@ export function createSelfBuildState(): SelfBuildState {
       createTask(
         "review-gates",
         "Add validation and review gates",
-        "Run configured validation, CodeRabbit, and safety checks before done packets or PRs.",
-        "Adds harness policy enforcement for validation and CodeRabbit-backed review gates.",
+        "Run configured validation, review, and safety checks before done packets or PRs.",
+        "Adds harness policy enforcement for validation and review gates.",
         "next",
         ["repo-context-layer"]
       ),
@@ -196,7 +196,7 @@ export function createSelfBuildState(): SelfBuildState {
       createTask(
         "self-build-executor",
         "Add self-build executor dogfood mode",
-        "Execute bounded self-build tasks through the harness runtime, repo, validation, CodeRabbit, git/PR, done-packet, and Supabase tools.",
+        "Execute bounded self-build tasks through the harness runtime, repo, validation, review, git/PR, done-packet, and Supabase tools.",
         "Dogfoods the harness runtime for construction work while keeping self-build as an internal mode, not the product target.",
         "later",
         ["harness-runtime-nucleus", "planner-runtime"]

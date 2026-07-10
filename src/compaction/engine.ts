@@ -89,7 +89,7 @@ export const MAX_SUMMARY_BLOCK_CHARS = 240_000;
 export function renderTranscriptBlock(entries: readonly TranscriptEntry[]): string {
   const lines = entries.map((entry) => `${entry.kind}: ${entry.content}`);
   // A RESOLVED credential value never goes to the summary lane either — scrub the
-  // input block, not just the output summary (CodeRabbit 2026-07-04, defense in depth).
+  // input block, not just the output summary (review 2026-07-04, defense in depth).
   const block = scrubSecretValues(lines.join("\n"));
   if (block.length <= MAX_SUMMARY_BLOCK_CHARS) {
     return block;
