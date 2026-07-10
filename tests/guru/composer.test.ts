@@ -45,7 +45,8 @@ function rig(options: {
   allowBusySteer?: () => boolean;
   steers?: string[];
   followUps?: string[];
-  columns?: number;
+  columns?: number | (() => number);
+  headerRows?: () => string[];
 } = {}): Rig {
   const input = new PassThrough();
   const frames: string[] = [];
@@ -67,7 +68,7 @@ function rig(options: {
     },
     interactive: true,
     promptText: "> ",
-    columns: () => options.columns ?? 100,
+    columns: () => (typeof options.columns === "function" ? options.columns() : (options.columns ?? 100)),
     isBusy: options.busy ?? (() => false),
     ...(options.allowBusySteer ? { allowBusySteer: options.allowBusySteer } : {}),
     onBusySteer: (text) => {
@@ -78,6 +79,7 @@ function rig(options: {
     },
     commandItems: (buffer) => commands.filter((c) => c.id.startsWith(buffer.trim()) || buffer.trim() === "/"),
     drillItems: (parentId) => options.drills?.[parentId] ?? [],
+    ...(options.headerRows ? { headerRows: options.headerRows } : {}),
     ...(options.chromeRows ? { chromeRows: options.chromeRows } : {}),
     ...(options.pickFiles ? { pickFiles: options.pickFiles } : {}),
     ...(options.completePath ? { completePath: options.completePath } : {})
@@ -380,15 +382,39 @@ describe("composer — adversarial-review regressions (2026-07-05)", () => {
     expect(calls).toContain("pause");
   });
 
-  it("resize reflow: refresh() re-renders at the new width", async () => {
+  it("resize reflow: forceRefresh() clears from the reflowed block top at the new width", async () => {
     let width = 100;
-    const r = rig({ chromeRows: () => ["CHROME"] });
-    // rig's columns is fixed at 100; drive refresh and assert a frame appears
-    await r.type("resize me");
-    const before = r.frames.length;
-    void width;
-    r.composer.refresh();
-    expect(r.frames.length).toBeGreaterThan(before);
+    const r = rig({ columns: () => width, chromeRows: () => ["CHROME"] });
+    r.composer.beginPrompt();
+    await r.type("x".repeat(120));
+
+    r.frames.length = 0;
+    width = 40;
+    r.composer.forceRefresh();
+
+    // The old 99-cell first editor row reflows into three 40-column rows.
+    // Repaint must move above all three before clearing or stale prompt rows stack.
+    expect(r.frames[0]).toBe("\x1b[3A");
+    expect(r.frames[1]).toBe("\x1b[1G\x1b[0J");
+  });
+
+  it("resize reflow: forceRefresh() redraws header chrome with the managed block", async () => {
+    let width = 100;
+    const r = rig({
+      columns: () => width,
+      headerRows: () => ["R".repeat(width - 1)],
+      chromeRows: () => ["CHROME"]
+    });
+    r.composer.beginPrompt();
+    await r.type("x".repeat(120));
+
+    r.frames.length = 0;
+    width = 40;
+    r.composer.forceRefresh();
+
+    // Both the old 99-cell header and first editor row reflow to three rows.
+    expect(r.frames[0]).toBe("\x1b[6A");
+    expect(stripAnsi(r.frames.join(""))).toContain("R".repeat(39));
   });
 });
 
