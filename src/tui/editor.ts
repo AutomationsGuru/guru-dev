@@ -1,5 +1,6 @@
 import { visibleWidth } from "./components.js";
 import type { Painter } from "./theme.js";
+import { charDisplayWidth } from "./width.js";
 
 /**
  * The composer editor (P1 wave, ADR 2026-07-05-composer-editor): a pure
@@ -67,6 +68,22 @@ function clamp(value: number, low: number, high: number): number {
   return Math.max(low, Math.min(high, value));
 }
 
+/**
+ * Snap a UTF-16 offset to a code-point boundary. The ↑/↓ column clamp can land
+ * between a surrogate pair (the previous line's col falls mid-emoji on the next
+ * line); the next insert/backspace there corrupted the character into U+FFFD.
+ */
+function snapToCharBoundary(line: string, col: number): number {
+  if (col > 0 && col < line.length) {
+    const high = line.charCodeAt(col - 1);
+    const low = line.charCodeAt(col);
+    if (high >= 0xd800 && high <= 0xdbff && low >= 0xdc00 && low <= 0xdfff) {
+      return col - 1;
+    }
+  }
+  return col;
+}
+
 // ---------------------------------------------------------------------------
 // Code-point + display-width helpers (adversarial review 2026-07-05): editing
 // steps whole code points (never splits a surrogate pair), and wrapping counts
@@ -97,32 +114,8 @@ function nextCharLength(line: string, col: number): number {
   }
   return col < line.length ? 1 : 0;
 }
-
-/** Display width of one code point: 0 for combining/zero-width, 2 for wide (CJK/emoji), else 1. */
-export function charDisplayWidth(codePoint: number): number {
-  if (
-    (codePoint >= 0x0300 && codePoint <= 0x036f) || // combining diacritics
-    (codePoint >= 0x200b && codePoint <= 0x200f) || // zero-width space/joiners/marks
-    (codePoint >= 0xfe00 && codePoint <= 0xfe0f) || // variation selectors
-    codePoint === 0xfeff // zero-width no-break space (BOM)
-  ) {
-    return 0; // composed text measures as its base char (review follow-up)
-  }
-  if (
-    (codePoint >= 0x1100 && codePoint <= 0x115f) || // Hangul Jamo
-    (codePoint >= 0x2e80 && codePoint <= 0xa4cf) || // CJK radicals … Yi
-    (codePoint >= 0xac00 && codePoint <= 0xd7a3) || // Hangul syllables
-    (codePoint >= 0xf900 && codePoint <= 0xfaff) || // CJK compat ideographs
-    (codePoint >= 0xfe30 && codePoint <= 0xfe4f) || // CJK compat forms
-    (codePoint >= 0xff00 && codePoint <= 0xff60) || // fullwidth forms
-    (codePoint >= 0xffe0 && codePoint <= 0xffe6) ||
-    (codePoint >= 0x1f300 && codePoint <= 0x1faff) || // emoji blocks
-    (codePoint >= 0x20000 && codePoint <= 0x3fffd) // CJK ext B+
-  ) {
-    return 2;
-  }
-  return 1;
-}
+// Re-export from the shared width module (single source of truth — 2026-07-09 audit).
+export { charDisplayWidth } from "./width.js";
 
 /** Total display width of a plain (unstyled) string. */
 export function stringDisplayWidth(text: string): number {
@@ -167,7 +160,11 @@ function insertNewline(state: EditorState): EditorState {
  * CR/CRLF are normalized to LF so a Windows-origin paste doesn't leave stray \r.
  */
 function insertPaste(state: EditorState, text: string): EditorState {
-  const normalized = text.replace(/\r\n?/gu, "\n");
+  // Tabs render as a jump to the next tab stop — a width the wrap math cannot
+  // model (it counts \t as one cell), so ONE pasted tab desynced the composer's
+  // relative-move row accounting exactly like the xenl bug (stacked frames).
+  // Normalize to spaces at insert time; the submitted text carries the spaces.
+  const normalized = text.replace(/\r\n?/gu, "\n").replace(/\t/gu, "    ");
   if (!normalized.includes("\n")) {
     return insertText(state, normalized);
   }
@@ -363,14 +360,16 @@ export function editorReduce(state: EditorState, key: EditorKey): EditorStep {
   if (name === "up") {
     if (state.row > 0) {
       const row = state.row - 1;
-      return render({ ...state, row, col: clamp(state.col, 0, (state.lines[row] ?? "").length) });
+      const line = state.lines[row] ?? "";
+      return render({ ...state, row, col: snapToCharBoundary(line, clamp(state.col, 0, line.length)) });
     }
     return render(recallHistory(state, -1)); // first row → history, readline-style
   }
   if (name === "down") {
     if (state.row < state.lines.length - 1) {
       const row = state.row + 1;
-      return render({ ...state, row, col: clamp(state.col, 0, (state.lines[row] ?? "").length) });
+      const line = state.lines[row] ?? "";
+      return render({ ...state, row, col: snapToCharBoundary(line, clamp(state.col, 0, line.length)) });
     }
     return render(recallHistory(state, 1)); // last row → toward the draft
   }
@@ -440,7 +439,7 @@ export function renderEditorFrame(
     let currentWidth = 0;
     let offset = 0;
     const placeCursorIfHere = (): void => {
-      if (index === state.row && !cursorPlaced && offset === state.col) {
+      if (index === state.row && !cursorPlaced && offset >= state.col) {
         cursorChunk = chunks.length;
         cursorDisplayCol = currentWidth;
         cursorPlaced = true;

@@ -61,9 +61,8 @@ describe("tool parity map", () => {
   });
 
   it("should mark still-absent integration tools RED with owner modules", () => {
-    // MCP bridge flipped out of pure RED 2026-07-10 (attach + toolBridge live).
-    // Desktop + delegated provider CLI remain RED by design until those waves.
-    for (const id of ["provider_cli_status", "pyautogui_status", "pyautogui_keyboard"]) {
+    // Desktop computer-use remains RED until a guarded PyAutoGUI wave.
+    for (const id of ["pyautogui_status", "pyautogui_keyboard"]) {
       const row = findToolParityRow(id);
 
       expect(row).toBeDefined();
@@ -73,10 +72,12 @@ describe("tool parity map", () => {
     }
   });
 
-  it("should mark MCP list/call and todo board GREEN", () => {
+  it("should mark MCP list/call, todo board, and provider CLI tools GREEN", () => {
     expect(findToolParityRow("mcp_list_tools")).toMatchObject({ status: "native-equivalent", verdict: "GREEN" });
     expect(findToolParityRow("mcp_call_tool")).toMatchObject({ status: "native-equivalent", verdict: "GREEN" });
     expect(findToolParityRow("todo_write")).toMatchObject({ status: "native-equivalent", verdict: "GREEN" });
+    expect(findToolParityRow("provider_cli_status")).toMatchObject({ status: "native-equivalent", verdict: "GREEN" });
+    expect(findToolParityRow("provider_cli_run")).toMatchObject({ status: "native-equivalent", verdict: "GREEN" });
     expect(findToolParityRow("web_fetch")).toMatchObject({ status: "partial-equivalent", verdict: "YELLOW" });
   });
 
@@ -91,6 +92,7 @@ describe("tool parity map", () => {
   });
 
   it("should summarize RED/YELLOW/GREEN counts", () => {
-    expect(getToolParityVerdictCounts()).toEqual({ GREEN: 12, YELLOW: 4, RED: 6 });
+    // Desktop family (4) still RED; research/MCP status/repo stay YELLOW partials.
+    expect(getToolParityVerdictCounts()).toEqual({ GREEN: 14, YELLOW: 4, RED: 4 });
   });
 });

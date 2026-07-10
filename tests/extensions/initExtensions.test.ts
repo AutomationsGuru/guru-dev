@@ -22,7 +22,9 @@ describe("initExtensions", () => {
         "service_readiness_report",
         "todo_write",
         "todo_list",
-        "web_fetch"
+        "web_fetch",
+        "provider_cli_status",
+        "provider_cli_run"
       ])
     );
   });
@@ -34,6 +36,7 @@ describe("initExtensions", () => {
     expect(ids).toContain("service_readiness_report");
     expect(ids).toContain("todo_write");
     expect(ids).toContain("web_fetch");
+    expect(ids).toContain("provider_cli_status");
   });
 });
 
@@ -47,6 +50,7 @@ describe("extension tools wired into the live runtime", () => {
     expect(ids).toContain("service_readiness_report");
     expect(ids).toContain("todo_list");
     expect(ids).toContain("web_fetch");
+    expect(ids).toContain("provider_cli_status");
   });
 
   it("executes honcho_memory_status through the live runtime", async () => {

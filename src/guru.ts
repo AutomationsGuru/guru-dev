@@ -428,7 +428,9 @@ export const GURU_CHAT_TOOL_IDS: ReadonlySet<string> = new Set([
   "resolve_capability_gap",
   "todo_write",
   "todo_list",
-  "web_fetch"
+  "web_fetch",
+  "provider_cli_status",
+  "provider_cli_run"
 ]);
 
 export const READ_ONLY_TOOL_IDS: ReadonlySet<string> = new Set([
@@ -447,6 +449,7 @@ export const READ_ONLY_TOOL_IDS: ReadonlySet<string> = new Set([
   "get_task_output",
   "resolve_capability_gap",
   "todo_list",
+  "provider_cli_status",
   "service_readiness_report",
   "maintenance.audit.run",
   "operational.project.get",

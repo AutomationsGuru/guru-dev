@@ -83,6 +83,8 @@ describe("startHarnessSession", () => {
       "operational.project.get",
       "operational.state.list",
       "operational.state.write",
+      "provider_cli_run",
+      "provider_cli_status",
       "read",
       "repo.context.resolve",
       "resolve_capability_gap",
