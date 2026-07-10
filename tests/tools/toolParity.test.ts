@@ -41,7 +41,8 @@ describe("tool parity map", () => {
         "pyautogui_screen",
         "pyautogui_mouse",
         "pyautogui_keyboard",
-        "repo_route_lookup"
+        "repo_route_lookup",
+        "ask_question"
       ])
     );
   });
@@ -80,6 +81,7 @@ describe("tool parity map", () => {
     expect(findToolParityRow("provider_cli_status")).toMatchObject({ status: "native-equivalent", verdict: "GREEN" });
     expect(findToolParityRow("provider_cli_run")).toMatchObject({ status: "native-equivalent", verdict: "GREEN" });
     expect(findToolParityRow("web_search")).toMatchObject({ status: "native-equivalent", verdict: "GREEN" });
+    expect(findToolParityRow("ask_question")).toMatchObject({ status: "native-equivalent", verdict: "GREEN" });
     expect(findToolParityRow("web_fetch")).toMatchObject({ status: "partial-equivalent", verdict: "YELLOW" });
   });
 
@@ -95,6 +97,6 @@ describe("tool parity map", () => {
 
   it("should summarize RED/YELLOW/GREEN counts", () => {
     // Desktop family (4) still RED; web_fetch/MCP status/perplexity/repo stay YELLOW.
-    expect(getToolParityVerdictCounts()).toEqual({ GREEN: 15, YELLOW: 4, RED: 4 });
+    expect(getToolParityVerdictCounts()).toEqual({ GREEN: 16, YELLOW: 4, RED: 4 });
   });
 });

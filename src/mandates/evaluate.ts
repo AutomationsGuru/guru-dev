@@ -39,6 +39,8 @@ const TOOL_VERBS: Readonly<Record<string, readonly MandateVerb[]>> = {
   // Session task board — process memory only, never disk secrets.
   todo_write: [],
   todo_list: [],
+  // Operator Q&A — no mutation.
+  ask_question: [],
   // Networked research (bounded).
   web_fetch: ["net"],
   web_search: ["net"],
@@ -63,6 +65,7 @@ export const MANDATE_READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   "honcho_recall",
   "honcho_context",
   "todo_list",
+  "ask_question",
   "provider_cli_status",
   "service_readiness_report",
   "operational.project.get",

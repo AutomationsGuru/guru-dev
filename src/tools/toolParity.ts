@@ -293,6 +293,17 @@ export const TOOL_PARITY_ROWS: readonly ToolParityRow[] = [
     ownerModule: "src/repo",
     notes: "Current repo.context.resolve resolves git root/status and AGENTS chain, but lacks repo id/name/category/worktree lookup, workspace maps, ambiguity handling, and governed path awareness.",
     nextAction: "Expand repo routing/capture in Dev 3 D3.7 and keep current repo.context.resolve as the initial compatibility base."
+  },
+  {
+    toolId: "ask_question",
+    category: "base-tool",
+    requirementIds: ["FR-08", "TR-19"],
+    currentGuruHarnessToolIds: ["ask_question"],
+    status: "native-equivalent",
+    verdict: "GREEN",
+    ownerModule: "src/tools/builtins/askQuestionTool.ts",
+    notes: "Operator multi-choice Q&A (TTY readline default; inject onAsk for rich TUI). Headless returns interactive:false with empty answers.",
+    nextAction: "Optional: native composer overlay instead of readline when TUI is live."
   }
 ];
 
