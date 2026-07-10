@@ -29,6 +29,7 @@ import { registerSecretValue } from "./safety/secretSafety.js";
 import { directAgentTurn, type AgentToolEvent } from "./model/agentTurn.js";
 import { isOperatorAuthRoute, resolveOperatorAuthPresence, getOperatorAuthSpec } from "./model/operatorAuth.js";
 import type { ToolDefinition } from "./tools/registry.js";
+import { getSharedTodoBoard } from "./tools/builtins/todoTools.js";
 import { DEFAULT_ANSI_THEME, bold, colorize, dim, STATUS_COLOR } from "./tui/ansi.js";
 import { mapRoutesToProviders, renderProviderPicker, renderReadinessSummary, summarizeReadiness } from "./tui/providerPicker.js";
 import { deriveConversationTitle } from "./guru/conversationStore.js";
@@ -424,7 +425,10 @@ export const GURU_CHAT_TOOL_IDS: ReadonlySet<string> = new Set([
   "spawn_agent",
   "get_task_output",
   "kill_task",
-  "resolve_capability_gap"
+  "resolve_capability_gap",
+  "todo_write",
+  "todo_list",
+  "web_fetch"
 ]);
 
 export const READ_ONLY_TOOL_IDS: ReadonlySet<string> = new Set([
@@ -442,6 +446,7 @@ export const READ_ONLY_TOOL_IDS: ReadonlySet<string> = new Set([
   "memory_get",
   "get_task_output",
   "resolve_capability_gap",
+  "todo_list",
   "service_readiness_report",
   "maintenance.audit.run",
   "operational.project.get",
@@ -480,6 +485,7 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = [
   { name: "/keys", usage: "/keys [rm <NAME> | reload]", description: "The encrypted credential vault — an env-var alternative (add via `guru keys set <NAME>`)" },
   { name: "/logout", usage: "/logout <provider>", description: "How to disconnect a provider (guru holds no token file)" },
   { name: "/tools", usage: "/tools", description: "List live session tools" },
+  { name: "/todo", usage: "/todo", description: "Show the agent task board (todo_list / todo_write)" },
   { name: "/mandate", usage: "/mandate [grant space|machine <verbs> | list | revoke]", description: "Standing permission grants (this repo/computer is yours)" },
   { name: "/yolo", usage: "/yolo [on|off]", description: "YOLO is the default; /yolo off engages safe mode (hard edges always hold)" },
   { name: "/clear", usage: "/clear", description: "Clear the screen" },
@@ -2425,6 +2431,26 @@ function cmdTools(state: GuruState): void {
   print(paint.fg("fgFaint", `  ${GLYPHS.agent} = offered to the model in chat turns · GATED = prompts per-call (y/N/always)`));
 }
 
+function cmdTodo(): void {
+  const board = getSharedTodoBoard().snapshot();
+  print(paint.bold(paint.fg("fgBright", "Task board")) + paint.fg("muted", `  · ${board.summary}`));
+  if (board.todos.length === 0) {
+    print(dim(theme, "  (empty — the model fills this via todo_write during multi-step work)"));
+    return;
+  }
+  for (const todo of board.todos) {
+    const mark =
+      todo.status === "completed"
+        ? paint.fg("success", "✓")
+        : todo.status === "in_progress"
+          ? paint.fg("warning", "…")
+          : todo.status === "cancelled"
+            ? paint.fg("muted", "×")
+            : paint.fg("fgFaint", "·");
+    print(`  ${mark} ${paint.fg("accent2", todo.id)} ${paint.fg("fgFaint", `[${todo.status}]`)} ${todo.content}`);
+  }
+}
+
 function cmdHelp(): void {
   // Keep the displayed names matched to SLASH_COMMANDS so /help never advertises
   // a command that no longer exists. Review 2026-07-08 added /tree /fork /clone
@@ -2433,7 +2459,7 @@ function cmdHelp(): void {
   const groups: ReadonlyArray<{ title: string; names: readonly string[] }> = [
     {
       title: "work",
-      names: ["/model", "/models", "/role", "/mandate", "/yolo", "/lookahead", "/tools", "/skills", "/remember", "/memory", "/recall", "/compact"]
+      names: ["/model", "/models", "/role", "/mandate", "/yolo", "/lookahead", "/tools", "/todo", "/skills", "/remember", "/memory", "/recall", "/compact"]
     },
     { title: "sessions", names: ["/sessions", "/resume", "/new", "/clear", "/tree", "/fork", "/clone"] },
     { title: "info", names: ["/status", "/login", "/accounts", "/logout", "/keys", "/settings", "/help"] },
@@ -2459,7 +2485,7 @@ function cmdHelp(): void {
 function cmdMenu(): void {
   print(bold(theme, "/ command menu") + dim(theme, "  (type / then ↑↓ · → drill · ⇥ accept · ⏎ run)"));
   const groups: ReadonlyArray<{ title: string; names: readonly string[] }> = [
-    { title: "work", names: ["/model", "/models", "/role", "/mandate", "/yolo", "/lookahead", "/tools", "/skills", "/remember", "/memory", "/recall"] },
+    { title: "work", names: ["/model", "/models", "/role", "/mandate", "/yolo", "/lookahead", "/tools", "/todo", "/skills", "/remember", "/memory", "/recall"] },
     { title: "sessions", names: ["/sessions", "/resume", "/new", "/tree", "/fork", "/clone", "/clear"] },
     { title: "info", names: ["/status", "/login", "/accounts", "/keys", "/logout", "/settings", "/help"] },
     { title: "leave", names: ["/exit"] }
@@ -4111,6 +4137,9 @@ async function handleLine(state: GuruState, line: string, rl: { close(): void })
       break;
     case "/tools":
       cmdTools(state);
+      break;
+    case "/todo":
+      cmdTodo();
       break;
     case "/clear":
       process.stdout.write("\x1b[2J\x1b[H");

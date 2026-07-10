@@ -19,7 +19,10 @@ describe("initExtensions", () => {
         "honcho_recall",
         "honcho_context",
         "honcho_log_turn",
-        "service_readiness_report"
+        "service_readiness_report",
+        "todo_write",
+        "todo_list",
+        "web_fetch"
       ])
     );
   });
@@ -29,6 +32,8 @@ describe("initExtensions", () => {
 
     expect(ids).toContain("honcho_memory_status");
     expect(ids).toContain("service_readiness_report");
+    expect(ids).toContain("todo_write");
+    expect(ids).toContain("web_fetch");
   });
 });
 
@@ -40,6 +45,8 @@ describe("extension tools wired into the live runtime", () => {
 
     expect(ids).toContain("honcho_memory_status");
     expect(ids).toContain("service_readiness_report");
+    expect(ids).toContain("todo_list");
+    expect(ids).toContain("web_fetch");
   });
 
   it("executes honcho_memory_status through the live runtime", async () => {

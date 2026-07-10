@@ -9,6 +9,8 @@ import { createMemoryTools } from "../memory/tools.js";
 import { getSharedSwarmManager, type SwarmManager } from "../swarm/manager.js";
 import { createSwarmTools } from "../swarm/tools.js";
 import { createResolverTools } from "../selfbuild/resolverTool.js";
+import { createTodoTools } from "../tools/builtins/todoTools.js";
+import { createWebFetchTools } from "../tools/builtins/webFetchTool.js";
 import type { SwarmConfig } from "../swarm/schema.js";
 
 /** Env var NAMES (never values) the Honcho runtime requires. */
@@ -62,6 +64,9 @@ export function initExtensions(options: InitExtensionsOptions = {}): HarnessExte
     api.registerTool({ factory: () => createSwarmTools({ manager: swarm }) });
     // Never-stuck resolver (Phase G) — context late-bound by the live session.
     api.registerTool({ factory: () => createResolverTools() });
+    // Session task board + bounded web fetch (harness baseline parity, 2026-07-10).
+    api.registerTool({ factory: () => createTodoTools() });
+    api.registerTool({ factory: () => createWebFetchTools() });
   });
 
   host.start();
