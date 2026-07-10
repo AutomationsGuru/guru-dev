@@ -49,7 +49,12 @@ const TOOL_VERBS: Readonly<Record<string, readonly MandateVerb[]>> = {
   // Provider CLI matrix is a PATH/env-name probe only.
   provider_cli_status: [],
   // Live delegated CLI may shell out (and often spend via provider plans).
-  provider_cli_run: ["exec"]
+  provider_cli_run: ["exec"],
+  // Desktop: status is probe-only; mutations escalate (live path still needs userApproved).
+  pyautogui_status: [],
+  pyautogui_screen: [],
+  pyautogui_mouse: ["exec"],
+  pyautogui_keyboard: ["exec"]
 };
 
 /** Read-only tools: never gated by the mandate (the always-allowed floor). */
@@ -70,6 +75,7 @@ export const MANDATE_READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   "ask_question",
   "mcp_bridge_status",
   "provider_cli_status",
+  "pyautogui_status",
   "service_readiness_report",
   "operational.project.get",
   "operational.state.list",

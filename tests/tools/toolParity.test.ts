@@ -62,15 +62,10 @@ describe("tool parity map", () => {
     });
   });
 
-  it("should mark still-absent integration tools RED with owner modules", () => {
-    // Desktop computer-use remains RED until a guarded PyAutoGUI wave.
-    for (const id of ["pyautogui_status", "pyautogui_keyboard"]) {
-      const row = findToolParityRow(id);
-
-      expect(row).toBeDefined();
-      expect(row).toMatchObject({ status: "absent", verdict: "RED" });
-      expect(row?.ownerModule).toMatch(/^src\//);
-      expect(row?.currentGuruHarnessToolIds).toEqual([]);
+  it("should mark desktop pyautogui tools GREEN", () => {
+    for (const id of ["pyautogui_status", "pyautogui_screen", "pyautogui_mouse", "pyautogui_keyboard"]) {
+      expect(findToolParityRow(id)).toMatchObject({ status: "native-equivalent", verdict: "GREEN" });
+      expect(findToolParityRow(id)?.currentGuruHarnessToolIds).toContain(id);
     }
   });
 
@@ -97,7 +92,7 @@ describe("tool parity map", () => {
   });
 
   it("should summarize RED/YELLOW/GREEN counts", () => {
-    // Desktop family (4) still RED; perplexity + repo stay YELLOW partials.
-    expect(getToolParityVerdictCounts()).toEqual({ GREEN: 18, YELLOW: 2, RED: 4 });
+    // No RED rows remain; perplexity + repo stay YELLOW partials.
+    expect(getToolParityVerdictCounts()).toEqual({ GREEN: 22, YELLOW: 2, RED: 0 });
   });
 });

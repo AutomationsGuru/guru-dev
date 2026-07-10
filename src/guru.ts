@@ -433,7 +433,11 @@ export const GURU_CHAT_TOOL_IDS: ReadonlySet<string> = new Set([
   "ask_question",
   "mcp_bridge_status",
   "provider_cli_status",
-  "provider_cli_run"
+  "provider_cli_run",
+  "pyautogui_status",
+  "pyautogui_screen",
+  "pyautogui_mouse",
+  "pyautogui_keyboard"
 ]);
 
 export const READ_ONLY_TOOL_IDS: ReadonlySet<string> = new Set([
@@ -455,6 +459,7 @@ export const READ_ONLY_TOOL_IDS: ReadonlySet<string> = new Set([
   "ask_question",
   "mcp_bridge_status",
   "provider_cli_status",
+  "pyautogui_status",
   "service_readiness_report",
   "maintenance.audit.run",
   "operational.project.get",
