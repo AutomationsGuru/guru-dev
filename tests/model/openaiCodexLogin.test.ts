@@ -12,8 +12,10 @@ import {
   readCodexCacheToken,
   refreshOAuthToken,
   resolveOAuthConfig,
+  sanitizeBrowserOpenUrl,
   type GuruOAuthToken
 } from "../../src/model/oauth/openaiCodexLogin.js";
+import { stripTrailingSlashes } from "../../src/model/agentTurn.js";
 import { clearOAuthTokenAccessor, registerOAuthTokenAccessor } from "../../src/model/oauth/tokenRegistry.js";
 import { resolveProviderWire } from "../../src/model/providerWire.js";
 import { ProviderRouteDescriptorSchema } from "../../src/providers/schemas.js";
@@ -151,5 +153,28 @@ describe("guru-oauth lane resolves token + account id from the vault registry (n
     const credential = resolveRouteCredential(route, EMPTY_ENV);
     expect(credential.usable).toBe(false);
     expect(credential.reason).toContain("/login");
+  });
+});
+
+describe("sanitizeBrowserOpenUrl — CodeQL command-injection hardening", () => {
+  it("accepts known OAuth / loopback hosts and re-serializes", () => {
+    expect(sanitizeBrowserOpenUrl("https://auth.openai.com/authorize?x=1")).toContain("auth.openai.com");
+    expect(sanitizeBrowserOpenUrl("https://auth.x.ai/oauth")).toContain("auth.x.ai");
+    expect(sanitizeBrowserOpenUrl("http://127.0.0.1:1455/auth/callback")).toContain("127.0.0.1");
+  });
+
+  it("rejects non-http(s), credentials, and unknown hosts", () => {
+    expect(sanitizeBrowserOpenUrl("file:///etc/passwd")).toBeNull();
+    expect(sanitizeBrowserOpenUrl("https://evil.example/phish")).toBeNull();
+    expect(sanitizeBrowserOpenUrl("https://user:pass@auth.openai.com/x")).toBeNull();
+    expect(sanitizeBrowserOpenUrl("not a url")).toBeNull();
+  });
+});
+
+describe("stripTrailingSlashes — CodeQL ReDoS hardening", () => {
+  it("strips trailing slashes without a trailing-slash regex", () => {
+    expect(stripTrailingSlashes("https://api.example.com///")).toBe("https://api.example.com");
+    expect(stripTrailingSlashes("https://api.example.com")).toBe("https://api.example.com");
+    expect(stripTrailingSlashes("")).toBe("");
   });
 });

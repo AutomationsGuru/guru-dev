@@ -270,18 +270,63 @@ export function safeReadFile(path: string): string | null {
 }
 
 /**
- * Best-effort system-browser open (never an embedded webview). The URL is validated to be
- * an http(s) URL before it reaches any command line — a defence against passing an
- * unexpected value to the shell (the loopback/authorize/verification URLs are always http(s)).
+ * Parse + allowlist an http(s) URL for browser open. Rejects non-http(s), credentials,
+ * and hosts outside the OAuth / loopback set so a remote verification_uri cannot become
+ * command-line injection (CodeQL js/command-line-injection).
+ */
+export function sanitizeBrowserOpenUrl(url: string): string | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return null;
+  }
+  if (parsed.username || parsed.password) {
+    return null;
+  }
+  const host = parsed.hostname.toLowerCase();
+  const allowed =
+    host === "localhost" ||
+    host === "127.0.0.1" ||
+    host === "[::1]" ||
+    host === "::1" ||
+    host === "auth.openai.com" ||
+    host === "chatgpt.com" ||
+    host.endsWith(".openai.com") ||
+    host === "auth.x.ai" ||
+    host.endsWith(".x.ai") ||
+    host === "twitter.com" ||
+    host === "x.com" ||
+    host.endsWith(".twitter.com");
+  if (!allowed) {
+    return null;
+  }
+  // Re-serialize so raw input metacharacters cannot survive into argv.
+  return parsed.toString();
+}
+
+/**
+ * Best-effort system-browser open (never an embedded webview). Fixed executable +
+ * argv array (shell:false) and a sanitized http(s) URL only — never a shell string.
  */
 export function defaultOpenBrowser(url: string): void {
-  if (!/^https?:\/\//iu.test(url)) {
+  const safeUrl = sanitizeBrowserOpenUrl(url);
+  if (safeUrl === null) {
     return;
   }
   const platform = process.platform;
-  const [cmd, args] = platform === "win32" ? ["cmd", ["/c", "start", "", url]] : platform === "darwin" ? ["open", [url]] : ["xdg-open", [url]];
+  const [cmd, args]: [string, string[]] =
+    platform === "win32"
+      ? ["cmd.exe", ["/c", "start", "", safeUrl]]
+      : platform === "darwin"
+        ? ["open", [safeUrl]]
+        : ["xdg-open", [safeUrl]];
   try {
-    spawn(cmd, args, { stdio: "ignore", detached: true }).unref();
+    const child = spawn(cmd, args, { stdio: "ignore", detached: true, shell: false, windowsHide: true });
+    child.unref();
   } catch {
     /* headless / no opener — the caller prints the URL for manual paste */
   }

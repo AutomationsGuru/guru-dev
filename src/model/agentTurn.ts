@@ -39,10 +39,27 @@ export type HeaderStyle = "bearer" | "api-key" | "x-api-key";
  * (env names only); the API paths are composed here so operators never hand-build
  * URLs. azure-openai → {endpoint}/openai/v1 · azure-foundry → {endpoint}/models.
  */
+/** Strip trailing `/` without a trailing-slash regex (CodeQL js/polynomial-redos). */
+export function stripTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 47) {
+    end -= 1;
+  }
+  return end === value.length ? value : value.slice(0, end);
+}
+
 export function adjustProviderBase(providerId: string, base: string): string {
   if (providerId.startsWith("azure")) {
     // Azure resource endpoints → exactly one /openai/v1 suffix.
-    return `${base.replace(/\/openai(?:\/v1)?$/u, "")}/openai/v1`;
+    // Manual suffix strip (no backtracking regex on library-controlled base URLs).
+    let trimmed = stripTrailingSlashes(base);
+    const lower = trimmed.toLowerCase();
+    if (lower.endsWith("/openai/v1")) {
+      trimmed = trimmed.slice(0, -"/openai/v1".length);
+    } else if (lower.endsWith("/openai")) {
+      trimmed = trimmed.slice(0, -"/openai".length);
+    }
+    return `${stripTrailingSlashes(trimmed)}/openai/v1`;
   }
   return base;
 }
@@ -204,7 +221,7 @@ export async function directAgentTurn(
   if (baseUrl.length === 0) {
     throw new DirectChatError("Route has no usable baseUrl.", { routeId: route.routeId });
   }
-  const normalizedBase = adjustProviderBase(route.providerId, baseUrl.replace(/\/+$/u, ""));
+  const normalizedBase = adjustProviderBase(route.providerId, stripTrailingSlashes(baseUrl));
   const secretValue = credential.value ?? (credential.envName ? env[credential.envName] : undefined);
   const wire = resolveProviderWire(route, env);
   const headerStyle: HeaderStyle = wire.headerStyle;
