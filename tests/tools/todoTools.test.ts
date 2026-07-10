@@ -1,6 +1,11 @@
 import { describe, expect, it, beforeEach } from "vitest";
 
-import { createTodoBoard, createTodoTools, resetSharedTodoBoard } from "../../src/tools/builtins/todoTools.js";
+import {
+  createTodoBoard,
+  createTodoTools,
+  resetSharedTodoBoard,
+  type TodoBoardOutput
+} from "../../src/tools/builtins/todoTools.js";
 
 describe("todo board — session task list", () => {
   beforeEach(() => {
@@ -40,15 +45,15 @@ describe("todo board — session task list", () => {
     const [writeTool, listTool] = createTodoTools({ board });
     expect(writeTool?.id).toBe("todo_write");
     expect(listTool?.id).toBe("todo_list");
-    const written = await writeTool!.execute(
+    const written = (await writeTool!.execute(
       {
         merge: true,
         todos: [{ id: "a", content: "ship feature", status: "in_progress" }]
       },
       {}
-    );
+    )) as TodoBoardOutput;
     expect(written.todos).toHaveLength(1);
-    const listed = await listTool!.execute({}, {});
+    const listed = (await listTool!.execute({}, {})) as TodoBoardOutput;
     expect(listed.todos[0]?.content).toBe("ship feature");
     expect(listed.counts.in_progress).toBe(1);
   });

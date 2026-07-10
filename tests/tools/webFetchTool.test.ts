@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { createWebFetchTools, fetchUrlText } from "../../src/tools/builtins/webFetchTool.js";
+import { createWebFetchTools, fetchUrlText, type WebFetchOutput } from "../../src/tools/builtins/webFetchTool.js";
 
 function mockFetch(handlers: Record<string, { status: number; body: string; headers?: Record<string, string>; location?: string }>): typeof fetch {
   return async (input, init) => {
@@ -76,7 +76,10 @@ describe("web_fetch — bounded HTTP GET", () => {
         throw new Error("network down");
       }
     });
-    const out = await tool!.execute({ url: "https://example.com", maxBytes: 100, timeoutMs: 1000 }, {});
+    const out = (await tool!.execute(
+      { url: "https://example.com", maxBytes: 100, timeoutMs: 1000 },
+      {}
+    )) as WebFetchOutput;
     expect(out.ok).toBe(false);
     expect(out.summary).toContain("network down");
   });
