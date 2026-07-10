@@ -39,3 +39,7 @@ Thumbs.db
 .vscode/
 .idea/
 .claude/
+
+# local scratch
+fix-turn-interrupted.py
+
