@@ -149,6 +149,28 @@ export async function runCommandGate(
   };
 }
 
+/**
+ * Windows npm/git/pwsh live as bare names that Node cannot spawn with shell:false
+ * unless the `.cmd` extension is explicit. Map bare names → `name.cmd`; leave
+ * absolute paths and already-suffixed names unchanged. Never uses `cmd.exe /c`.
+ */
+function resolveWindowsGateExecutable(executable: string): string {
+  if (process.platform !== "win32") {
+    return executable;
+  }
+  // Path-like (absolute/relative) or already has an extension → spawn as-is.
+  if (executable.includes("/") || executable.includes("\\") || executable.includes(":")) {
+    return executable;
+  }
+  if (/\.(?:exe|cmd|bat|com)$/iu.test(executable)) {
+    return executable;
+  }
+  if (!/^[A-Za-z0-9._-]+$/u.test(executable)) {
+    return executable;
+  }
+  return `${executable}.cmd`;
+}
+
 export async function executeCommand(
   command: readonly string[],
   context: CommandExecutionContext
@@ -165,17 +187,13 @@ export async function executeCommand(
     };
   }
 
-  // Only bare tool names (no path separators / absolute paths) may go through
-  // cmd.exe. Absolute or relative paths are always spawn'd as argv0 with shell:false
-  // so CodeQL js/shell-command-injection-from-environment stays quiet and a hostile
-  // path cannot ride `/c` into a different interpretation.
-  const isBareToolName = /^[A-Za-z0-9._-]+$/u.test(executable);
-  const needsCmdShell = process.platform === "win32" && isBareToolName && !/\.exe$/iu.test(executable);
+  // Never shell out via `cmd.exe /c <dynamic>` (CodeQL js/shell-command-injection-
+  // from-environment). On Windows, bare npm/git/etc. are `.cmd` shims — spawn the
+  // `.cmd` path directly with shell:false so argv0 is fixed and no `/c` string is built.
+  const resolvedExecutable = resolveWindowsGateExecutable(executable);
 
   return new Promise<CommandExecutionResult>((resolveExecution) => {
-    const child = needsCmdShell
-      ? spawn("cmd.exe", ["/c", executable, ...args], { cwd: context.cwd, shell: false, windowsHide: true })
-      : spawn(executable, args, { cwd: context.cwd, shell: false, windowsHide: true });
+    const child = spawn(resolvedExecutable, args, { cwd: context.cwd, shell: false, windowsHide: true });
     let stdout = "";
     let stderr = "";
     let settled = false;
