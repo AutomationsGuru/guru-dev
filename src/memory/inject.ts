@@ -104,9 +104,17 @@ export function mergeScopedBootInjection(stores: readonly ScopedStore[], options
       });
     }
     for (const learning of loadLearnings(store)) {
-      if (!seenLearning.has(learning.id)) {
-        seenLearning.add(learning.id);
-        learnings.push(learning);
+      // One malformed learning (hand-edited frontmatter, a bad date string) must
+      // never blank ALL boot memory — it used to throw through to the blunt catch
+      // in refreshBootMemoryBlock that wipes every fact for the session. Skip the
+      // single bad learning instead (review 2026-07-08).
+      try {
+        if (!seenLearning.has(learning.id)) {
+          seenLearning.add(learning.id);
+          learnings.push(learning);
+        }
+      } catch {
+        continue;
       }
     }
   }

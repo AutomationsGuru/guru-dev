@@ -62,7 +62,9 @@ export function findGitRoot(startPath: string): string | undefined {
   try {
     const output = execFileSync("git", ["-C", searchDir, "rev-parse", "--show-toplevel"], {
       encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: ["ignore", "pipe", "pipe"],
+      // A wedged network share must not hang session start forever (mirrors readGitStatus).
+      timeout: GIT_STATUS_TIMEOUT_MS
     });
 
     return resolve(output.trim());

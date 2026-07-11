@@ -80,6 +80,25 @@ describe("editor reducer — the ADR key map", () => {
     expect(editorText(historyRecall.state)).toBe("old entry");
   });
 
+  it("↑/↓ preserve the visual column across wide and ZWJ graphemes", () => {
+    const family = "👨‍👩‍👧‍👦";
+    const fromFamily: EditorState = {
+      ...createEditorState(),
+      lines: ["abcd", family],
+      row: 1,
+      col: family.length
+    };
+    expect(drive(fromFamily, [KEY.up]).state.col).toBe(2);
+
+    const fromCjk: EditorState = {
+      ...createEditorState(),
+      lines: ["abcd", "汉"],
+      row: 1,
+      col: 1
+    };
+    expect(drive(fromCjk, [KEY.up]).state.col).toBe(2);
+  });
+
   it("history: ↑ recalls, ↓ returns to the preserved draft (readline-compatible)", () => {
     const state = createEditorState(["one", "two"]);
     const typedDraft = drive(state, type("draft"));
@@ -132,6 +151,35 @@ describe("editor reducer — the ADR key map", () => {
     const withText = drive(createEditorState(), [...type("ab"), KEY.ctrl("a"), KEY.ctrl("d")]);
     expect(withText.state.lines[0]).toBe("b");
     expect(withText.effect.kind).toBe("render");
+  });
+
+  it.each([
+    ["emoji modifier", "👍🏽"],
+    ["ZWJ family", "👨‍👩‍👧‍👦"],
+    ["regional-indicator flag", "🇺🇸"],
+    ["combining sequence", "é"]
+  ])("moves across and backspaces the whole %s grapheme", (_label, grapheme) => {
+    const typed = drive(createEditorState(), [{ sequence: `A${grapheme}B` }]).state;
+    const beforeGrapheme = drive(typed, [KEY.left, KEY.left]).state;
+    expect(beforeGrapheme.col).toBe(1);
+
+    const afterGrapheme = drive(beforeGrapheme, [KEY.right]).state;
+    expect(afterGrapheme.col).toBe(1 + grapheme.length);
+
+    const removed = drive(afterGrapheme, [KEY.backspace]).state;
+    expect(removed.lines[0]).toBe("AB");
+    expect(removed.col).toBe(1);
+  });
+
+  it.each([
+    ["emoji modifier", "👍🏽"],
+    ["ZWJ family", "👨‍👩‍👧‍👦"],
+    ["regional-indicator flag", "🇺🇸"]
+  ])("forward-deletes the whole %s grapheme", (_label, grapheme) => {
+    const typed = drive(createEditorState(), [{ sequence: `${grapheme}B` }, KEY.ctrl("a")]).state;
+    const removed = drive(typed, [{ name: "delete" }]).state;
+    expect(removed.lines[0]).toBe("B");
+    expect(removed.col).toBe(0);
   });
 });
 
@@ -198,5 +246,24 @@ describe("renderEditorFrame — wrap-aware rows + cursor math", () => {
     expect(frame.rows).toHaveLength(3); // two full rows + the empty cursor row
     expect(frame.cursorRow).toBe(2);
     expect(frame.cursorCol).toBe(2 + 1); // prompt pad + column 1
+  });
+
+  it.each([
+    ["emoji modifier", "👍🏽"],
+    ["ZWJ family", "👨‍👩‍👧‍👦"],
+    ["regional-indicator flag", "🇺🇸"]
+  ])("renders the %s grapheme as one two-cell glyph", (_label, grapheme) => {
+    const state = drive(createEditorState(), [{ sequence: `${grapheme}x` }]).state;
+    const frame = renderEditorFrame(paint, state, prompt, 80);
+    expect(frame.rows).toEqual([`> ${grapheme}x`]);
+    expect(frame.cursorCol).toBe(2 + 3 + 1);
+  });
+
+  it("keeps a regional-indicator flag intact when wrapping", () => {
+    const state = drive(createEditorState(), [{ sequence: "xxxxx🇺🇸" }]).state;
+    const frame = renderEditorFrame(paint, state, prompt, 8); // content width 6
+    expect(frame.rows).toEqual(["> xxxxx", "  🇺🇸"]);
+    expect(frame.cursorRow).toBe(1);
+    expect(frame.cursorCol).toBe(2 + 2 + 1);
   });
 });

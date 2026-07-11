@@ -2,7 +2,7 @@
 model_list:
   - model_name: router-openai-gpt-5-5
     litellm_params:
-      model: openai/gpt-5.5
+      model: openai/gpt-5.6-sol
       api_base: https://api.openai.com/v1
       api_key: os.environ/OPENAI_API_KEY
     model_info:
@@ -12,7 +12,7 @@ model_list:
           - router-openai-gpt-5-5
   - model_name: router-openai-gpt-5-5-pro
     litellm_params:
-      model: openai/gpt-5.5-pro
+      model: openai/gpt-5.6-luna
       api_base: https://api.openai.com/v1
       api_key: os.environ/OPENAI_API_KEY
     model_info:
@@ -22,7 +22,7 @@ model_list:
           - router-openai-gpt-5-5-pro
   - model_name: router-openai-api
     litellm_params:
-      model: openai/gpt-5.5-mini
+      model: openai/gpt-5.6-terra
       api_base: https://api.openai.com/v1
       api_key: os.environ/OPENAI_API_KEY
     model_info:
@@ -42,7 +42,7 @@ model_list:
           - router-claude-opus-4-8
   - model_name: router-claude-sonnet-4-6
     litellm_params:
-      model: anthropic/claude-sonnet-4-6
+      model: anthropic/claude-sonnet-5
       api_base: https://api.anthropic.com
       api_key: os.environ/ANTHROPIC_API_KEY
     model_info:
@@ -50,6 +50,16 @@ model_list:
         provider_group: anthropic-api
         router_aliases:
           - router-claude-sonnet-4-6
+  - model_name: router-claude-fable-5
+    litellm_params:
+      model: anthropic/claude-fable-5
+      api_base: https://api.anthropic.com
+      api_key: os.environ/ANTHROPIC_API_KEY
+    model_info:
+      metadata:
+        provider_group: anthropic-api
+        router_aliases:
+          - router-claude-fable-5
   - model_name: router-claude-haiku-4-5
     litellm_params:
       model: anthropic/claude-haiku-4-5
@@ -62,7 +72,7 @@ model_list:
           - router-claude-haiku-4-5
   - model_name: router-claude-api
     litellm_params:
-      model: anthropic/claude-sonnet-4-6
+      model: anthropic/claude-sonnet-5
       api_base: https://api.anthropic.com
       api_key: os.environ/ANTHROPIC_API_KEY
     model_info:
@@ -122,7 +132,7 @@ model_list:
           - router-gemini-flash
   - model_name: router-foundry-pro
     litellm_params:
-      model: azure/gpt-5.5-pro
+      model: azure/gpt-5.6-sol
       api_base: os.environ/AZURE_FOUNDRY_API_BASE
       api_key: os.environ/AZURE_FOUNDRY_API_KEY
     model_info:
@@ -132,7 +142,7 @@ model_list:
           - router-foundry-pro
   - model_name: router-foundry-fast
     litellm_params:
-      model: azure/gpt-5.5-mini
+      model: azure/gpt-5.6-terra
       api_base: os.environ/AZURE_FOUNDRY_API_BASE
       api_key: os.environ/AZURE_FOUNDRY_API_KEY
     model_info:
@@ -140,19 +150,19 @@ model_list:
         provider_group: azure-foundry
         router_aliases:
           - router-foundry-fast
-  - model_name: router-foundry-chat
+  - model_name: router-foundry-luna
     litellm_params:
-      model: azure/gpt-5.5-chat
+      model: azure/gpt-5.6-luna
       api_base: os.environ/AZURE_FOUNDRY_API_BASE
       api_key: os.environ/AZURE_FOUNDRY_API_KEY
     model_info:
       metadata:
         provider_group: azure-foundry
         router_aliases:
-          - router-foundry-chat
+          - router-foundry-luna
   - model_name: router-kimi
     litellm_params:
-      model: azure/kimi-k2
+      model: azure/kimi-k2.6
       api_base: os.environ/AZURE_FOUNDRY_API_BASE
       api_key: os.environ/AZURE_FOUNDRY_API_KEY
     model_info:
@@ -162,7 +172,7 @@ model_list:
           - router-kimi
   - model_name: router-deepseek
     litellm_params:
-      model: azure/deepseek-r1
+      model: azure/deepseek-v4-pro
       api_base: os.environ/AZURE_FOUNDRY_API_BASE
       api_key: os.environ/AZURE_FOUNDRY_API_KEY
     model_info:
@@ -172,7 +182,7 @@ model_list:
           - router-deepseek
   - model_name: router-deepseek-flash
     litellm_params:
-      model: azure/deepseek-v3-flash
+      model: azure/deepseek-v4-flash
       api_base: os.environ/AZURE_FOUNDRY_API_BASE
       api_key: os.environ/AZURE_FOUNDRY_API_KEY
     model_info:
@@ -182,7 +192,7 @@ model_list:
           - router-deepseek-flash
   - model_name: router-grok
     litellm_params:
-      model: azure/grok-4
+      model: azure/grok-4.5
       api_base: os.environ/AZURE_FOUNDRY_API_BASE
       api_key: os.environ/AZURE_FOUNDRY_API_KEY
     model_info:
@@ -190,6 +200,16 @@ model_list:
         provider_group: azure-foundry
         router_aliases:
           - router-grok
+  - model_name: router-xai-grok-4-3
+    litellm_params:
+      model: xai/grok-4.5
+      api_base: https://api.x.ai/v1
+      api_key: os.environ/XAI_API_KEY
+    model_info:
+      metadata:
+        provider_group: xai-api
+        router_aliases:
+          - router-xai-grok-4-3
   - model_name: router-glm-5-2
     litellm_params:
       model: openai/glm-5.2
@@ -240,16 +260,16 @@ model_list:
         provider_group: minimax
         router_aliases:
           - router-minimax-m27-highspeed
-  - model_name: router-minimax-codex
+  - model_name: router-minimax-m27
     litellm_params:
-      model: openai/minimax-codex
+      model: openai/minimax-m2.7
       api_base: https://api.minimax.io/v1
       api_key: os.environ/MINIMAX_API_KEY
     model_info:
       metadata:
         provider_group: minimax
         router_aliases:
-          - router-minimax-codex
+          - router-minimax-m27
   - model_name: router-fugu
     litellm_params:
       model: openai/fugu
@@ -312,7 +332,7 @@ model_list:
           - router-perplexity-sonar-deep-research
   - model_name: router-sonnet
     litellm_params:
-      model: anthropic/claude-sonnet-4-6
+      model: anthropic/claude-sonnet-5
       api_base: https://api.anthropic.com
       api_key: os.environ/ANTHROPIC_API_KEY
     model_info:
@@ -352,7 +372,7 @@ model_list:
           - router-vertex-claude-opus-4-8
   - model_name: router-vertex-claude-sonnet-4-6
     litellm_params:
-      model: vertex_ai/claude-sonnet-4-6
+      model: vertex_ai/claude-sonnet-5
       api_base: https://us-central1-aiplatform.googleapis.com
       api_key: os.environ/VERTEX_CLAUDE_API_KEY
     model_info:

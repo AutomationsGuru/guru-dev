@@ -5,8 +5,10 @@ import { fileURLToPath } from "node:url";
 import { execSync } from "node:child_process";
 
 import {
+  createHarnessRuntime,
   createInMemoryOperationalStore,
   runSelfBuildExecutor,
+  type HarnessRuntimeDependencies,
   type PlannerModel,
   type PlannerModelFetch,
   type PlannerModelRequest
@@ -59,6 +61,26 @@ class FlakyPlannerModel implements PlannerModel {
 
     return this.plan;
   }
+}
+
+function createRuntimeCloseTracker(): {
+  readonly factory: (dependencies: HarnessRuntimeDependencies) => ReturnType<typeof createHarnessRuntime>;
+  readonly closedRoles: readonly ("executor" | "planner")[];
+} {
+  const closedRoles: ("executor" | "planner")[] = [];
+  return {
+    factory(dependencies) {
+      const role = dependencies.plannerModel ? "planner" : "executor";
+      const runtime = createHarnessRuntime(dependencies);
+      const closeRuntime = runtime.close.bind(runtime);
+      runtime.close = async () => {
+        closedRoles.push(role);
+        await closeRuntime();
+      };
+      return runtime;
+    },
+    closedRoles
+  };
 }
 
 describe("runSelfBuildExecutor", () => {
@@ -635,6 +657,51 @@ describe("runSelfBuildExecutor runtime hardening", () => {
     ]);
     expect(report.donePacket.risks.join("\n")).toContain("provider-retry-used");
     expect(model.requests).toHaveLength(2);
+  });
+
+  it("closes the executor runtime and every planner retry runtime", async () => {
+    const model = new FlakyPlannerModel(1, {
+      objective: "Execute task.",
+      summary: "No tools needed.",
+      steps: []
+    });
+    const tracker = createRuntimeCloseTracker();
+
+    const report = await runSelfBuildExecutor({
+      cwd: repoRoot,
+      taskId: "self-build-executor",
+      allowDirtyWorkspace: true,
+      allowRiskyPaths: true,
+      plannerModel: model,
+      maxPlannerRetries: 2,
+      commandExecutor: createCommandExecutor([]),
+      runtimeFactory: tracker.factory
+    });
+
+    expect(report.planner.status).toBe("completed");
+    expect(tracker.closedRoles.filter((role) => role === "planner")).toHaveLength(2);
+    expect(tracker.closedRoles.filter((role) => role === "executor")).toHaveLength(1);
+  });
+
+  it("closes the executor runtime when session startup throws", async () => {
+    const tracker = createRuntimeCloseTracker();
+    const factory = (dependencies: HarnessRuntimeDependencies) => {
+      const runtime = tracker.factory(dependencies);
+      runtime.startSession = async () => {
+        throw new Error("executor startup failed");
+      };
+      return runtime;
+    };
+
+    await expect(
+      runSelfBuildExecutor({
+        cwd: repoRoot,
+        taskId: "self-build-executor",
+        allowDirtyWorkspace: true,
+        runtimeFactory: factory
+      })
+    ).rejects.toThrow("executor startup failed");
+    expect(tracker.closedRoles).toEqual(["executor"]);
   });
 
   it("should block live git automation when approvalPolicy.autoCommitPushPr is false", async () => {

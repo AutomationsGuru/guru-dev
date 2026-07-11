@@ -69,11 +69,13 @@ export function resolveMemoryDirectory(options: FileMemoryStoreOptions = {}): st
 }
 
 function tokenize(text: string): Set<string> {
+  // >= 2 to match tokenizeRecall (review 2026-07-08): keeps 2-char meaningful
+  // terms (db, js, go, ai) searchable; single letters stay excluded.
   return new Set(
     text
       .toLowerCase()
       .split(/[^a-z0-9]+/u)
-      .filter((token) => token.length > 2)
+      .filter((token) => token.length >= 2)
   );
 }
 
@@ -317,8 +319,23 @@ export function createFileMemoryStore(options: FileMemoryStoreOptions = {}): Fil
       const original = readFileSync(path, "utf8");
       const trashed = `${original.trimEnd()}\n\n<!-- forgotten ${now().toISOString()}: ${input.reason} -->\n`;
       const trashPath = join(directory, TRASH_DIR, `${input.name}.${now().getTime()}.md`);
-      writeFileSync(trashPath, trashed, "utf8");
-      rmSync(path);
+      // Atomic trash write first (Windows EBUSY-safe vs write-then-delete race):
+      // never delete the live fact until the trash copy is durable (B20).
+      writeAtomic(trashPath, trashed);
+      try {
+        rmSync(path);
+      } catch {
+        // Trash is durable; leave the live file if delete fails (e.g. Windows
+        // EBUSY) and rebuild the index so the operator can retry — never lose
+        // the only copy mid-move.
+        rebuildIndex();
+        return {
+          status: "forgotten",
+          name: input.name,
+          summary: `Copied [[${input.name}]] to .trash/ (live file still present after delete failed — safe to retry /forget).`,
+          blockers: ["delete-deferred"]
+        };
+      }
       rebuildIndex();
       return { status: "forgotten", name: input.name, summary: `Moved [[${input.name}]] to .trash/ (30-day GC). Reason recorded.`, blockers: [] };
     },

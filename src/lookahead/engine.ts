@@ -29,7 +29,10 @@ export interface LookAheadEngineOptions {
 
 export interface LookAheadEngine {
   readonly config: LookAheadConfig;
+  /** Session-scoped enable flag (config default; overridable via /lookahead on|off). */
   readonly enabled: boolean;
+  /** Toggle scouts for the rest of this guru session without editing config. */
+  setEnabled(enabled: boolean): void;
   /**
    * Called when the commit plane is about to block on a tool result (DEAD TIME):
    * pre-explore the pending step's forks with read-only scouts. No-op when
@@ -57,14 +60,20 @@ export function createLookAheadEngine(options: LookAheadEngineOptions): LookAhea
   let misses = 0;
   let throttled = false;
   let lastSkip = "";
+  let sessionEnabled = config.enabled;
 
   const engine: LookAheadEngine = {
     config,
-    enabled: config.enabled,
+    get enabled() {
+      return sessionEnabled;
+    },
+    setEnabled(enabled: boolean) {
+      sessionEnabled = enabled;
+    },
 
     scoutPendingStep(pendingToolId, opts) {
       // The law: scouts run ONLY when enabled AND the commit plane is in dead time.
-      if (!config.enabled || opts?.inDeadTime !== true) {
+      if (!sessionEnabled || opts?.inDeadTime !== true) {
         return [];
       }
       // Governor gate 1 — miss-rate throttle: speculation stopped paying off.

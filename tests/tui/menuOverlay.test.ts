@@ -20,6 +20,10 @@ describe("clampMenuText / formatRouteMenuHint", () => {
     expect(clampMenuText("", 5)).toBe("");
   });
 
+  it("never splits a ZWJ grapheme while clamping a menu label", () => {
+    expect(clampMenuText("aaaa👨‍👩‍👧‍👦bbbb", 7)).toBe("aaaa👨‍👩‍👧‍👦…");
+  });
+
   it("shortens route statuses and marks the connected route", () => {
     expect(formatRouteMenuHint("ready-unverified", { usable: true })).toBe("ready");
     expect(formatRouteMenuHint("ready-unverified", { usable: false })).toBe("needs key");

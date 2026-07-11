@@ -26,6 +26,41 @@ describe("base tools", () => {
     expect(observation.output).toMatchObject({ contents: "cde", bytesRead: 3, truncated: true });
   });
 
+  it("keeps UTF-8 code points intact when a byte window ends mid-character", async () => {
+    await writeFile(join(repoRoot, "unicode.txt"), "A😀B", "utf8");
+    const registry = createToolRegistry(createBaseTools());
+    const observation = await executeRegisteredTool(registry, "read", {
+      repoRoot,
+      path: "unicode.txt",
+      offset: 0,
+      limit: 2
+    });
+
+    expect(observation.status).toBe("succeeded");
+    expect(observation.output).toMatchObject({
+      contents: "A😀",
+      bytesRead: 5,
+      nextOffset: 5,
+      truncated: true
+    });
+    expect((observation.output as { contents?: string }).contents).not.toContain("�");
+  });
+
+  it("recovers the whole UTF-8 code point when an offset starts mid-character", async () => {
+    await writeFile(join(repoRoot, "unicode-offset.txt"), "A😀B", "utf8");
+    const registry = createToolRegistry(createBaseTools());
+    const observation = await executeRegisteredTool(registry, "read", {
+      repoRoot,
+      path: "unicode-offset.txt",
+      offset: 2,
+      limit: 2
+    });
+
+    expect(observation.status).toBe("succeeded");
+    expect(observation.output).toMatchObject({ contents: "😀", bytesRead: 4, nextOffset: 5 });
+    expect((observation.output as { contents?: string }).contents).not.toContain("�");
+  });
+
   it("should write with dry-run default and apply when requested", async () => {
     const registry = createToolRegistry(createBaseTools({ write: { riskyPathPatterns: [".env"], secretAllowList: [] } }));
     const dryRun = await executeRegisteredTool(registry, "write", { repoRoot, path: "nested/out.txt", contents: "hello" });
@@ -110,5 +145,179 @@ describe("bash full-command-line handling (shakedown fixes)", () => {
 
     expect(output.executed).toBe(false);
     expect(output.blockers.some((blocker) => blocker.includes("allowlisted"))).toBe(true);
+  });
+
+  it("rejects shell operators instead of passing them as literal argv", async () => {
+    let calls = 0;
+    const tool = createPiBashTool({
+      shellAllowlist: ["npm"],
+      executor: async () => {
+        calls += 1;
+        return { exitCode: 0, stdout: "unexpected", stderr: "", durationMs: 1 };
+      }
+    });
+    const output = await tool.execute({
+      repoRoot: process.cwd(),
+      command: "npm run typecheck && npm test",
+      args: [],
+      timeoutMs: 5000,
+      maxOutputBytes: 64000,
+      dryRun: false
+    }, {});
+
+    expect(calls).toBe(0);
+    expect(output.executed).toBe(false);
+    expect(output.blockers).toContain(
+      "Shell operators are not supported by the argv command runner; issue each command as a separate tool call."
+    );
+  });
+
+  it("rejects shell operators supplied through explicit args", async () => {
+    let calls = 0;
+    const tool = createPiBashTool({
+      shellAllowlist: ["npm"],
+      executor: async () => {
+        calls += 1;
+        return { exitCode: 0, stdout: "unexpected", stderr: "", durationMs: 1 };
+      }
+    });
+    const output = await tool.execute({
+      repoRoot: process.cwd(),
+      command: "npm",
+      args: ["test", "&", "echo", "unexpected"],
+      timeoutMs: 5000,
+      maxOutputBytes: 64000,
+      dryRun: false
+    }, {});
+
+    expect(calls).toBe(0);
+    expect(output.executed).toBe(false);
+    expect(output.blockers).toContain(
+      "Shell operators are not supported by the argv command runner; issue each command as a separate tool call."
+    );
+  });
+
+  it("rejects an unterminated quoted argument instead of silently changing it", async () => {
+    let calls = 0;
+    const tool = createPiBashTool({
+      shellAllowlist: ["git"],
+      executor: async () => {
+        calls += 1;
+        return { exitCode: 0, stdout: "unexpected", stderr: "", durationMs: 1 };
+      }
+    });
+    const output = await tool.execute({
+      repoRoot: process.cwd(),
+      command: 'git commit -m "unfinished',
+      args: [],
+      timeoutMs: 5000,
+      maxOutputBytes: 64000,
+      dryRun: false
+    }, {});
+
+    expect(calls).toBe(0);
+    expect(output.executed).toBe(false);
+    expect(output.blockers).toContain(
+      "Command line has an unterminated quote; correct the quoting and retry."
+    );
+  });
+});
+
+describe("parity tools (askQuestion, searchWeb, readUrl)", () => {
+  it("should execute ask_question when callback is provided", async () => {
+    let asked = false;
+    const registry = createToolRegistry(createBaseTools({
+      askQuestion: {
+        onAsk: async (questions) => {
+          asked = true;
+          return [["Option A"]];
+        }
+      }
+    }));
+
+    const obs = await executeRegisteredTool(registry, "ask_question", {
+      questions: [{ question: "A or B?", options: ["Option A", "Option B"] }]
+    });
+
+    expect(obs.status).toBe("succeeded");
+    expect(obs.output).toMatchObject({ answers: [["Option A"]] });
+    expect(asked).toBe(true);
+  });
+
+  it("should fail ask_question when callback is missing and stdin is non-TTY", async () => {
+    // Vitest runs non-TTY, so the default TTY prompt path is skipped and we
+    // still get the clean "not supported" failure for headless/RPC callers.
+    const registry = createToolRegistry(createBaseTools());
+    const obs = await executeRegisteredTool(registry, "ask_question", {
+      questions: [{ question: "A?", options: ["A", "B"] }]
+    });
+    expect(obs.status).toBe("failed");
+    expect(obs.error).toContain("not supported");
+  });
+
+  it("should refuse default TTY prompt when allowDefaultTtyPrompt is false", async () => {
+    const registry = createToolRegistry(
+      createBaseTools({ askQuestion: { allowDefaultTtyPrompt: false } })
+    );
+    const obs = await executeRegisteredTool(registry, "ask_question", {
+      questions: [{ question: "A?", options: ["A", "B"] }]
+    });
+    expect(obs.status).toBe("failed");
+    expect(obs.error).toContain("not supported");
+  });
+
+  it("should execute search_web when callback is provided", async () => {
+    const registry = createToolRegistry(createBaseTools({
+      searchWeb: {
+        onSearch: async (q) => [{ title: "T", url: "U", snippet: q }]
+      }
+    }));
+
+    const obs = await executeRegisteredTool(registry, "search_web", { query: "hello" });
+    expect(obs.status).toBe("succeeded");
+    expect(obs.output).toMatchObject({ results: [{ title: "T", url: "U", snippet: "hello" }] });
+  });
+
+  it("should execute read_url_content when callback is provided", async () => {
+    const registry = createToolRegistry(createBaseTools({
+      readUrl: {
+        onFetch: async (u) => `content from ${u}`
+      }
+    }));
+
+    const obs = await executeRegisteredTool(registry, "read_url_content", { url: "http://example.com" });
+    expect(obs.status).toBe("succeeded");
+    expect(obs.output).toMatchObject({ content: "content from http://example.com" });
+  });
+
+  it("should execute schedule tool when callback is provided", async () => {
+    const registry = createToolRegistry(createBaseTools({
+      schedule: {
+        onSchedule: async (input) => `task-${input.DurationSeconds}`
+      }
+    }));
+
+    const obs = await executeRegisteredTool(registry, "schedule", { Prompt: "Wait", DurationSeconds: "10" });
+    expect(obs.status).toBe("succeeded");
+    expect(obs.output).toMatchObject({ taskId: "task-10" });
+  });
+
+  it("should execute manage_task tool by default", async () => {
+    const registry = createToolRegistry(createBaseTools());
+    const obs = await executeRegisteredTool(registry, "manage_task", { Action: "list" });
+    expect(obs.status).toBe("succeeded");
+    expect(Array.isArray((obs.output as { result: unknown }).result)).toBe(true);
+  });
+
+  it("should execute manage_task tool when callback is provided", async () => {
+    const registry = createToolRegistry(createBaseTools({
+      manageTask: {
+        onManage: async (action, taskId, input) => `${action} on ${taskId}`
+      }
+    }));
+
+    const obs = await executeRegisteredTool(registry, "manage_task", { Action: "status", TaskId: "t1" });
+    expect(obs.status).toBe("succeeded");
+    expect(obs.output).toMatchObject({ result: "status on t1" });
   });
 });

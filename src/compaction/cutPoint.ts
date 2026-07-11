@@ -43,6 +43,14 @@ function isValidCut(entries: readonly TranscriptEntry[], index: number): boolean
   if (previous && previous.kind === "toolCall") {
     return false;
   }
+  // Never orphan a toolResult from the toolCall that produced it (review 2026-07-08):
+  // if the first-kept entry is preceded by a toolResult, that result belongs to a
+  // toolCall that would be SUMMARIZED — orphaning the result from its call. This
+  // matters for richer transcripts where a single toolCall can have multiple results
+  // (parallel tool use): summarizing only SOME results of a call breaks the pair.
+  if (previous && previous.kind === "toolResult") {
+    return false;
+  }
   return true;
 }
 

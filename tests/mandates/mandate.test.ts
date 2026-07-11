@@ -33,6 +33,50 @@ describe("verbsForCall", () => {
     expect(verbsForCall("bash", { command: "git push --force-with-lease" })).not.toContain("destructive");
   });
 
+  it("escalates split/long rm flags and git push -f (not only rm -rf / --force)", () => {
+    // YOLO-default sessions silently allowed these before the matcher covered split flags.
+    for (const command of [
+      "rm -r -f build",
+      "rm -f -r build",
+      "rm --recursive --force build",
+      "rm --force --recursive /tmp/out",
+      "rm -rf build",
+      "git push -f origin main",
+      "git push origin main -f"
+    ]) {
+      expect(verbsForCall("bash", { command }), command).toContain("destructive");
+    }
+    expect(verbsForCall("bash", { command: "rm -r build" })).not.toContain("destructive"); // recursive alone is not force
+    expect(verbsForCall("bash", { command: "git push --force-with-lease origin main" })).not.toContain("destructive");
+  });
+
+  it("escalates Windows recursive deletes under YOLO (cmd + PowerShell)", () => {
+    // This host is Windows: del/rmdir/Remove-Item were only `exec` before —
+    // YOLO lifted them with no hard-edge prompt.
+    for (const command of [
+      "del /s /q C:\\temp\\out",
+      "del /s build",
+      "del /f /s /q build",
+      "erase /s /q old",
+      "rmdir /s /q node_modules",
+      "rd /s /q dist",
+      "Remove-Item -Recurse -Force build",
+      "Remove-Item -r -fo .\\out",
+      "ri -Recurse -Force tmp",
+      "ri -r -fo tmp"
+    ]) {
+      expect(verbsForCall("bash", { command }), command).toContain("destructive");
+      expect(
+        evaluateToolMandate("bash", { command }, { cwd: CWD, state: EMPTY, yolo: true }).outcome,
+        command
+      ).toBe("escalate");
+    }
+    // Non-recursive / non-force deletes stay ordinary exec (not hard-edge).
+    expect(verbsForCall("bash", { command: "del file.txt" })).not.toContain("destructive");
+    expect(verbsForCall("bash", { command: "Remove-Item file.txt" })).not.toContain("destructive");
+    expect(verbsForCall("bash", { command: "rmdir empty-dir" })).not.toContain("destructive");
+  });
+
   it("escalates money-moving / billable-provisioning commands to the spend verb (S6)", () => {
     for (const command of [
       "terraform apply -auto-approve",
@@ -82,6 +126,15 @@ describe("evaluateToolMandate — grants", () => {
     expect(evaluateToolMandate("write", {}, { cwd: join(CWD, "src"), state, yolo: false }).outcome).toBe("allow");
     const elsewhere = process.platform === "win32" ? "D:\\other" : "/other";
     expect(evaluateToolMandate("write", {}, { cwd: elsewhere, state, yolo: false }).outcome).toBe("escalate");
+  });
+
+  it("SPACE grant scopes to the write TARGET path, not only cwd (B13)", () => {
+    const state: MandateState = { grants: [{ scope: "space", path: CWD, verbs: ["write"], grantedAt: "t" }], denies: [] };
+    // Operator is inside the grant, but the write escapes outside — must escalate.
+    const outside = process.platform === "win32" ? "D:\\other\\escape.txt" : "/other/escape.txt";
+    expect(evaluateToolMandate("write", { path: outside }, { cwd: CWD, state, yolo: false }).outcome).toBe("escalate");
+    // Target inside the grant is allowed even when specified as a relative path.
+    expect(evaluateToolMandate("write", { path: "src/ok.ts" }, { cwd: CWD, state, yolo: false }).outcome).toBe("allow");
   });
 
   it("a grant missing a required verb does not cover the call", () => {

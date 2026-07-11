@@ -32,7 +32,7 @@ describe("direct-first route planner", () => {
   });
 
   it("should reject routing operator-owned plan auth through LiteLLM", () => {
-    const decision = planRoute({ providerId: "openai-codex", modelId: "gpt-5.5", requireRouterBridge: true }, createDirectProviderCatalog(), []);
+    const decision = planRoute({ providerId: "openai-codex", modelId: "gpt-5.6-sol", requireRouterBridge: true }, createDirectProviderCatalog(), []);
 
     expect(decision.verdict).toBe("rejected");
     expect(decision.policyReason).toMatch(/cannot be routed through LiteLLM/i);

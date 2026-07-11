@@ -79,7 +79,10 @@ function bridgeOne(options: McpToolBridgeOptions, descriptor: McpToolDescriptor)
 
 /** Discover the server's tools and wrap each as a registry ToolDefinition. */
 export async function discoverMcpTools(options: McpToolBridgeOptions): Promise<readonly ToolDefinition[]> {
-  const descriptors = await options.client.listTools();
+  // Forward callTimeoutMs to listTools (review 2026-07-08): the old call passed
+  // no options, so a slow/hung tools/list stalled the serial attach loop for the
+  // full 30s default per server. The bridge's callTimeoutMs now bounds discovery too.
+  const descriptors = await options.client.listTools(options.callTimeoutMs !== undefined ? { timeoutMs: options.callTimeoutMs } : {});
   return descriptors.map((descriptor) => bridgeOne(options, descriptor));
 }
 

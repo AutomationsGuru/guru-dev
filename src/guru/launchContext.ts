@@ -12,12 +12,18 @@ const MONTHS = [
   "July", "August", "September", "October", "November", "December"
 ] as const;
 
-/** A stable, unambiguous date line for the system prompt (UTC + ISO). */
+/**
+ * A stable, unambiguous date line for the system prompt — the OPERATOR's local
+ * calendar date. UTC was wrong here: an evening operator west of UTC (or a
+ * morning operator east of it) got told the model a different day than the one
+ * on their wall clock, so "today"/"yesterday" in prompts drifted by one day.
+ */
 export function formatTodayLine(now: Date): string {
-  const weekday = WEEKDAYS[now.getUTCDay()];
-  const month = MONTHS[now.getUTCMonth()];
-  const iso = now.toISOString().slice(0, 10);
-  return `Today is ${weekday}, ${now.getUTCDate()} ${month} ${now.getUTCFullYear()} (${iso}).`;
+  const weekday = WEEKDAYS[now.getDay()];
+  const month = MONTHS[now.getMonth()];
+  const pad = (value: number): string => String(value).padStart(2, "0");
+  const iso = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+  return `Today is ${weekday}, ${now.getDate()} ${month} ${now.getFullYear()} (${iso}).`;
 }
 
 /**

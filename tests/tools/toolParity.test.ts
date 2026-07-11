@@ -82,6 +82,6 @@ describe("tool parity map", () => {
   });
 
   it("should summarize RED/YELLOW/GREEN counts", () => {
-    expect(getToolParityVerdictCounts()).toEqual({ GREEN: 9, YELLOW: 1, RED: 10 });
+    expect(getToolParityVerdictCounts()).toEqual({ GREEN: 14, YELLOW: 1, RED: 10 });
   });
 });

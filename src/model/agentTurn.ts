@@ -39,10 +39,27 @@ export type HeaderStyle = "bearer" | "api-key" | "x-api-key";
  * (env names only); the API paths are composed here so operators never hand-build
  * URLs. azure-openai → {endpoint}/openai/v1 · azure-foundry → {endpoint}/models.
  */
+/** Strip trailing `/` without a trailing-slash regex (CodeQL js/polynomial-redos). */
+export function stripTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 47) {
+    end -= 1;
+  }
+  return end === value.length ? value : value.slice(0, end);
+}
+
 export function adjustProviderBase(providerId: string, base: string): string {
   if (providerId.startsWith("azure")) {
     // Azure resource endpoints → exactly one /openai/v1 suffix.
-    return `${base.replace(/\/openai(?:\/v1)?$/u, "")}/openai/v1`;
+    // Manual suffix strip (no backtracking regex on library-controlled base URLs).
+    let trimmed = stripTrailingSlashes(base);
+    const lower = trimmed.toLowerCase();
+    if (lower.endsWith("/openai/v1")) {
+      trimmed = trimmed.slice(0, -"/openai/v1".length);
+    } else if (lower.endsWith("/openai")) {
+      trimmed = trimmed.slice(0, -"/openai".length);
+    }
+    return `${stripTrailingSlashes(trimmed)}/openai/v1`;
   }
   return base;
 }
@@ -80,7 +97,7 @@ export interface AgentTurnOptions extends DirectChatOptions {
   /**
    * Stream callback: assistant text chunks as the model generates them. When set,
    * requests SSE streaming; falls back to non-streaming (honestly, same result shape)
-   * if the provider rejects the stream request.
+   * only when the endpoint explicitly reports streaming as unsupported.
    */
   readonly onToken?: (text: string) => void;
   /**
@@ -204,7 +221,7 @@ export async function directAgentTurn(
   if (baseUrl.length === 0) {
     throw new DirectChatError("Route has no usable baseUrl.", { routeId: route.routeId });
   }
-  const normalizedBase = adjustProviderBase(route.providerId, baseUrl.replace(/\/+$/u, ""));
+  const normalizedBase = adjustProviderBase(route.providerId, stripTrailingSlashes(baseUrl));
   const secretValue = credential.value ?? (credential.envName ? env[credential.envName] : undefined);
   const wire = resolveProviderWire(route, env);
   const headerStyle: HeaderStyle = wire.headerStyle;
@@ -331,20 +348,32 @@ async function performToolCall(context: FamilyContext, apiName: string, rawArgum
     return JSON.stringify({ error: `Unknown tool: ${apiName}` });
   }
 
+  const block = (detail: string, error: string): string => {
+    const event: AgentToolEvent = { toolId: declaration.toolId, status: "blocked", detail };
+    context.events.push(event);
+    context.onToolEvent?.(event);
+    return JSON.stringify({ error });
+  };
+
+  // An abort is a hard action boundary: partial model text may be kept, but no
+  // newly assembled action may proceed after the operator cancels the turn.
+  if (context.signal?.aborted) {
+    return block("Skipped because the turn was aborted.", "Tool call skipped because the turn was aborted.");
+  }
+
   const input = typeof rawArguments === "string" ? safeParseJson(rawArguments) : rawArguments ?? {};
 
   if (!(await context.approveTool(declaration.toolId, input))) {
-    const event: AgentToolEvent = {
-      toolId: declaration.toolId,
-      status: "blocked",
-      detail: "Blocked by approval policy — the operator declined this tool call."
-    };
-    context.events.push(event);
-    context.onToolEvent?.(event);
+    return block(
+      "Blocked by approval policy — the operator declined this tool call.",
+      "Tool call blocked by the harness approval policy (the operator declined it)."
+    );
+  }
 
-    return JSON.stringify({
-      error: "Tool call blocked by the harness approval policy (the operator declined it)."
-    });
+  // Approval can be asynchronous; Ctrl+C may land while its prompt/callback is
+  // active. Recheck immediately before invoking the executor.
+  if (context.signal?.aborted) {
+    return block("Skipped because the turn was aborted during approval.", "Tool call skipped because the turn was aborted.");
   }
 
   // Dead-time signal: approved and about to block on the tool result.
@@ -516,7 +545,26 @@ async function runChatCompletionsLoop(context: FamilyContext, messages: readonly
     if (assistantText.length > 0) {
       lastAssistant = assistantText;
     }
+    if (context.signal?.aborted) {
+      return assistantText.length > 0 ? assistantText : lastAssistant;
+    }
     if (toolCalls.length === 0) {
+      // No-tool answer: still honor mid-run steers typed during this stream.
+      // Previously pullSteering only ran at iteration>0, so a plain chat turn
+      // showed "↳ steered" but never sent the note to the model.
+      const pendingSteers = context.pullSteering?.() ?? [];
+      if (pendingSteers.length > 0) {
+        if (assistantText.length > 0) {
+          lastAssistant = assistantText;
+          conversation.push({ role: "assistant", content: assistantText });
+        }
+        for (const note of pendingSteers) {
+          conversation.push({ role: "user", content: `[steering] ${note}` });
+        }
+        // Visual break so the steered continuation does not glue onto the prior stream.
+        context.onToken?.("\n");
+        continue;
+      }
       // Terminal turn: fall back to the last non-empty assistant text when the
       // final turn is empty (mirrors the anthropic loop fix, review 2026-07-08).
       return assistantText.length > 0 ? assistantText : lastAssistant;
@@ -614,7 +662,22 @@ async function runResponsesLoop(context: FamilyContext, messages: readonly ChatT
     if (responseText.length > 0) {
       lastText = responseText;
     }
+    if (context.signal?.aborted) {
+      return responseText.length > 0 ? responseText : lastText;
+    }
     if (functionCalls.length === 0) {
+      const pendingSteers = context.pullSteering?.() ?? [];
+      if (pendingSteers.length > 0) {
+        if (responseText.length > 0) {
+          lastText = responseText;
+          input.push({ role: "assistant", content: responseText });
+        }
+        for (const note of pendingSteers) {
+          input.push({ role: "user", content: `[steering] ${note}` });
+        }
+        context.onToken?.("\n");
+        continue;
+      }
       // Terminal turn: fall back to the last non-empty text when the final turn
       // is empty (mirrors the anthropic/chat-completions fix, review 2026-07-08).
       return responseText.length > 0 ? responseText : lastText;
@@ -721,7 +784,25 @@ async function runAnthropicLoop(context: FamilyContext, messages: readonly ChatT
     if (blockText.length > 0) {
       lastText = blockText;
     }
+    if (context.signal?.aborted) {
+      return blockText.length > 0 ? blockText : lastText;
+    }
     if (toolUses.length === 0 || response.stop_reason !== "tool_use") {
+      // No-tool / end turn: honor mid-run steers (same daily-driver gap as the
+      // other families). Preserve anthropic user/assistant alternation.
+      const pendingSteers = context.pullSteering?.() ?? [];
+      if (pendingSteers.length > 0 && toolUses.length === 0) {
+        if (blockText.length > 0 || blocks.length > 0) {
+          lastText = blockText.length > 0 ? blockText : lastText;
+          conversation.push({ role: "assistant", content: blocks.length > 0 ? blocks : [{ type: "text", text: lastText }] });
+        }
+        conversation.push({
+          role: "user",
+          content: pendingSteers.map((note) => ({ type: "text", text: `[steering] ${note}` }))
+        });
+        context.onToken?.("\n");
+        continue;
+      }
       // Terminal turn. A common Claude pattern emits the real answer as text on
       // the tool-requesting turn ("Let me read foo.txt" + tool_use), then ends
       // on a later turn with empty text. Returning blockText alone gave the user
@@ -750,13 +831,25 @@ async function runAnthropicLoop(context: FamilyContext, messages: readonly ChatT
 // SSE streaming: each stream* function requests server-sent events, emits text
 // chunks through context.onToken, and RECONSTRUCTS the same response shape the
 // non-streaming path returns — so the tool-loop logic above is identical either
-// way. If the provider rejects the stream request (HTTP error), streaming is
-// disabled for the rest of the turn and the same request is retried non-streaming.
+// way. Retryable open failures use the request policy; only explicit
+// streaming-unsupported statuses fall back to a non-streaming request.
 // ---------------------------------------------------------------------------
 
 interface SseEvent {
   readonly event?: string;
   readonly data: string;
+}
+
+function findSseEventBoundary(buffer: string): { readonly index: number; readonly length: number } | undefined {
+  const lfIndex = buffer.indexOf("\n\n");
+  const crlfIndex = buffer.indexOf("\r\n\r\n");
+  if (lfIndex === -1 && crlfIndex === -1) {
+    return undefined;
+  }
+  if (crlfIndex !== -1 && (lfIndex === -1 || crlfIndex < lfIndex)) {
+    return { index: crlfIndex, length: 4 };
+  }
+  return { index: lfIndex, length: 2 };
 }
 
 /** Compose operator abort + per-request timeout into one signal for fetch. */
@@ -812,13 +905,58 @@ function isTransientStreamError(error: unknown): boolean {
     return true;
   }
   if (error instanceof DirectChatError) {
-    const annotated = error as DirectChatError & { networkFailure?: boolean; aborted?: boolean };
-    return annotated.networkFailure === true || annotated.aborted === true;
+    const annotated = error as DirectChatError & { networkFailure?: boolean; aborted?: boolean; timeout?: boolean };
+    return annotated.networkFailure === true || annotated.aborted === true || annotated.timeout === true;
   }
   return false;
 }
 
-async function* sseEvents(response: Response, signal?: AbortSignal): AsyncGenerator<SseEvent> {
+async function readSseChunk(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  idleTimeoutMs: number | undefined,
+  routeId: string
+) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const read = reader.read();
+    if (idleTimeoutMs === undefined || idleTimeoutMs <= 0) {
+      return await read;
+    }
+    return await Promise.race([
+      read,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          reject(
+            annotateForRetry(
+              new DirectChatError(`Stream body idle timeout after ${idleTimeoutMs}ms.`, { routeId }),
+              { timeout: true }
+            )
+          );
+          void reader.cancel().catch(() => undefined);
+        }, idleTimeoutMs);
+      })
+    ]);
+  } catch (error) {
+    if (error instanceof DirectChatError) {
+      throw error;
+    }
+    throw annotateForRetry(
+      new DirectChatError(`Stream body read failed: ${sanitizeErrorMessage(error)}`, { routeId }),
+      { networkFailure: true }
+    );
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+async function* sseEvents(
+  response: Response,
+  signal: AbortSignal | undefined,
+  idleTimeoutMs: number,
+  routeId: string
+): AsyncGenerator<SseEvent> {
   const body = response.body;
   if (!body) {
     return;
@@ -843,20 +981,20 @@ async function* sseEvents(response: Response, signal?: AbortSignal): AsyncGenera
       if (signal?.aborted) {
         break;
       }
-      const { done, value } = await reader.read();
+      const { done, value } = await readSseChunk(reader, idleTimeoutMs, routeId);
       if (done) {
         break;
       }
       buffer += decoder.decode(value, { stream: true });
-      let boundary = buffer.indexOf("\n\n");
-      while (boundary !== -1) {
-        const raw = buffer.slice(0, boundary);
-        buffer = buffer.slice(boundary + 2);
+      let boundary = findSseEventBoundary(buffer);
+      while (boundary) {
+        const raw = buffer.slice(0, boundary.index);
+        buffer = buffer.slice(boundary.index + boundary.length);
         const parsed = parseSseEvent(raw);
         if (parsed) {
           yield parsed;
         }
-        boundary = buffer.indexOf("\n\n");
+        boundary = findSseEventBoundary(buffer);
       }
     }
     if (!signal?.aborted) {
@@ -909,56 +1047,17 @@ async function openSseResponse(
   };
   const url = `${context.normalizedBase}${path}`;
 
-  // A lane that REQUIRES streaming cannot fall back to non-stream — it gets the
-  // full retry policy on the streaming request itself (429/5xx/network back off;
-  // other 4xx surface the real streaming error). Ordinary lanes keep the instant
-  // fall-back-to-non-streaming below: the non-stream retry they fall back to
-  // carries the policy already, so retrying here too would double-retry.
-  if (context.requireStreaming) {
-    const { response } = await fetchWithPolicy(context, url, headers, body, "Streaming request");
-    return response;
-  }
-
-  // Operator abort + timeout bound TIME-TO-HEADERS on the SSE open. A blackholed
-  // connection must not hang forever; an operator cancel must reach the fetch.
-  // No retry loop here: abort/timeout lands in the catch below, which falls back
-  // to the policy-carrying non-streaming path (unless the operator cancelled).
-  const timeoutMs = context.retry.provider.timeoutMs;
-  const { signal, disarm } = composeRequestSignal(context.signal, timeoutMs);
-  let response: Response;
-  try {
-    response = await context.fetchImpl(url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-      ...(signal ? { signal } : {})
-    });
-  } catch (error) {
-    disarm();
-    // Operator cancel is not a "try non-streaming" event — rethrow so the turn stops.
-    if (context.signal?.aborted) {
-      throw annotateForRetry(
-        new DirectChatError(`Streaming request aborted: ${sanitizeErrorMessage(error)}`, { routeId: context.routeId }),
-        { aborted: true }
-      );
-    }
-    // Per-request timeout: don't fall through to a non-stream retry (it would just
-    // wait out the same timeout again). Surface it honestly as a terminal timeout.
-    if (isAbortError(error)) {
-      throw annotateForRetry(
-        new DirectChatError(`Streaming request timed out after ${context.retry.provider.timeoutMs}ms (retry.provider.timeoutMs).`, { routeId: context.routeId }),
-        { timeout: true }
-      );
-    }
-    // Network-level failure on the streaming request (DNS blip, reset socket).
-    // Don't kill the turn: disable streaming and let the caller retry the identical
-    // request non-streaming. If the network is truly down, that retry raises its own
-    // honest error.
-    context.streamingDisabled = true;
-    return null;
-  } finally {
-    disarm(); // headers arrived; the stream body stays open by design
-  }
+  const isStreamingUnsupported = (response: Response): boolean =>
+    response.status === 405 || response.status === 415 || response.status === 501;
+  const { response } = await fetchWithPolicy(
+    context,
+    url,
+    headers,
+    body,
+    "Streaming request",
+    false,
+    context.requireStreaming ? undefined : isStreamingUnsupported
+  );
 
   if (!response.ok) {
     // Distinguish "provider doesn't support streaming" (a fallback case) from a
@@ -967,19 +1066,6 @@ async function openSseResponse(
     // (auth) or 400/404 (bad model/path/URL) is a genuine request error: falling
     // back would silently re-send the identical bad request, doubling latency and
     // rate-limit hits while obscuring the real first error. Surface those now.
-    const status = response.status;
-    const isStreamingUnsupported = status === 405 || status === 415 || status === 501 || status === 502;
-    if (!isStreamingUnsupported) {
-      const detail = await response.text().catch(() => "");
-      const retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"));
-      throw annotateForRetry(
-        new DirectChatError(`Streaming request failed with HTTP ${status}: ${sanitizeErrorMessage(detail).slice(0, 300)}`, {
-          routeId: context.routeId,
-          status
-        }),
-        { ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) }
-      );
-    }
     // Provider rejected streaming — disable streaming and let the caller retry the
     // identical request non-streaming. Honest fallback, not fake.
     context.streamingDisabled = true;
@@ -1003,54 +1089,81 @@ async function streamChatCompletions(context: FamilyContext, body: Record<string
   let text = "";
   const toolCalls = new Map<number, ToolCallAcc>();
   let usage: { prompt_tokens?: number; completion_tokens?: number } | undefined;
+  let streamInterrupted = false;
+  let streamCompleted = false;
 
-  for await (const event of sseEvents(response, context.signal)) {
-    if (event.data === "[DONE]") {
-      break;
-    }
-    let chunk: unknown;
-    try {
-      chunk = JSON.parse(event.data) as unknown;
-    } catch {
-      continue;
-    }
-    const parsed = chunk as {
-      choices?: Array<{
-        delta?: {
-          content?: string | null;
-          tool_calls?: Array<{ index?: number; id?: string; function?: { name?: string; arguments?: string } }>;
-        };
-      }>;
-      usage?: { prompt_tokens?: number; completion_tokens?: number };
-    };
-    if (parsed.usage) {
-      usage = parsed.usage;
-    }
-    const delta = parsed.choices?.[0]?.delta;
-    if (!delta) {
-      continue;
-    }
-    if (typeof delta.content === "string" && delta.content.length > 0) {
-      text += delta.content;
-      context.onToken?.(delta.content);
-    }
-    for (const toolDelta of delta.tool_calls ?? []) {
-      const index = toolDelta.index ?? 0;
-      const acc = toolCalls.get(index) ?? { id: "", name: "", argumentsText: "" };
-      if (toolDelta.id) {
-        acc.id = toolDelta.id;
+  try {
+    for await (const event of sseEvents(response, context.signal, context.retry.provider.timeoutMs, context.routeId)) {
+      if (event.data === "[DONE]") {
+        streamCompleted = true;
+        break;
       }
-      if (toolDelta.function?.name) {
-        acc.name += toolDelta.function.name;
+      let chunk: unknown;
+      try {
+        chunk = JSON.parse(event.data) as unknown;
+      } catch {
+        continue;
       }
-      if (toolDelta.function?.arguments) {
-        acc.argumentsText += toolDelta.function.arguments;
+      const parsed = chunk as {
+        choices?: Array<{
+          finish_reason?: string | null;
+          delta?: {
+            content?: string | null;
+            tool_calls?: Array<{ index?: number; id?: string; function?: { name?: string; arguments?: string } }>;
+          };
+        }>;
+        usage?: { prompt_tokens?: number; completion_tokens?: number };
+      };
+      if (parsed.usage) {
+        usage = parsed.usage;
       }
-      toolCalls.set(index, acc);
+      const choice = parsed.choices?.[0];
+      if (choice?.finish_reason) {
+        streamCompleted = true;
+      }
+      const delta = choice?.delta;
+      if (!delta) {
+        continue;
+      }
+      if (typeof delta.content === "string" && delta.content.length > 0) {
+        text += delta.content;
+        context.onToken?.(delta.content);
+      }
+      for (const toolDelta of delta.tool_calls ?? []) {
+        const index = toolDelta.index ?? 0;
+        const acc = toolCalls.get(index) ?? { id: "", name: "", argumentsText: "" };
+        if (toolDelta.id) {
+          acc.id = toolDelta.id;
+        }
+        if (toolDelta.function?.name) {
+          acc.name += toolDelta.function.name;
+        }
+        if (toolDelta.function?.arguments) {
+          acc.argumentsText += toolDelta.function.arguments;
+        }
+        toolCalls.set(index, acc);
+      }
     }
+  } catch (error) {
+    if (text.length === 0 || !isTransientStreamError(error)) {
+      throw error;
+    }
+    // Preserve visible text, but never execute a tool call assembled from a
+    // response that ended before the provider's completion marker. Partial JSON
+    // used to fall through safeParseJson as {}, turning a socket reset into a
+    // plausible but unintended action.
+    streamInterrupted = true;
   }
 
-  const toolCallList = [...toolCalls.entries()]
+  // A clean transport EOF is not a provider commit. Keep any visible text, but
+  // never act on tool deltas unless [DONE] or finish_reason positively closed
+  // the response. Abort is likewise an action boundary even if buffered events
+  // arrived after the signal fired.
+  if (!streamCompleted || context.signal?.aborted) {
+    streamInterrupted = true;
+  }
+
+  const toolCallList = (streamInterrupted ? [] : [...toolCalls.entries()])
     .sort((left, right) => left[0] - right[0])
     // type:"function" is required when this reconstructed message is echoed back in
     // the next loop iteration — several providers (e.g. GLM error 1214) reject
@@ -1079,22 +1192,28 @@ async function streamResponses(context: FamilyContext, body: Record<string, unkn
   let completed: unknown = null;
   let streamedText = "";
 
-  for await (const event of sseEvents(response, context.signal)) {
-    let payload: unknown;
-    try {
-      payload = JSON.parse(event.data) as unknown;
-    } catch {
-      continue;
+  try {
+    for await (const event of sseEvents(response, context.signal, context.retry.provider.timeoutMs, context.routeId)) {
+      let payload: unknown;
+      try {
+        payload = JSON.parse(event.data) as unknown;
+      } catch {
+        continue;
+      }
+      const typed = payload as { type?: string; delta?: string; response?: unknown };
+      const kind = event.event ?? typed.type;
+      if (kind === "response.output_text.delta" && typeof typed.delta === "string") {
+        streamedText += typed.delta;
+        context.onToken?.(typed.delta);
+      } else if (kind === "response.completed" && typed.response !== undefined) {
+        completed = typed.response;
+      } else if (kind === "response.failed") {
+        throw new DirectChatError("Agent stream reported response.failed.", { routeId: context.routeId });
+      }
     }
-    const typed = payload as { type?: string; delta?: string; response?: unknown };
-    const kind = event.event ?? typed.type;
-    if (kind === "response.output_text.delta" && typeof typed.delta === "string") {
-      streamedText += typed.delta;
-      context.onToken?.(typed.delta);
-    } else if (kind === "response.completed" && typed.response !== undefined) {
-      completed = typed.response;
-    } else if (kind === "response.failed") {
-      throw new DirectChatError("Agent stream reported response.failed.", { routeId: context.routeId });
+  } catch (error) {
+    if (streamedText.length === 0 || !isTransientStreamError(error)) {
+      throw error;
     }
   }
 
@@ -1143,50 +1262,57 @@ async function streamAnthropicMessages(
   let stopReason: string | undefined;
   const usage: { input_tokens?: number; output_tokens?: number } = {};
 
-  for await (const event of sseEvents(response, context.signal)) {
-    let payload: unknown;
-    try {
-      payload = JSON.parse(event.data) as unknown;
-    } catch {
-      continue;
-    }
-    const typed = payload as {
-      type?: string;
-      index?: number;
-      content_block?: { type?: string; id?: string; name?: string; text?: string };
-      delta?: { type?: string; text?: string; partial_json?: string; stop_reason?: string };
-      message?: { usage?: { input_tokens?: number } };
-      usage?: { output_tokens?: number };
-    };
-    const kind = event.event ?? typed.type;
+  try {
+    for await (const event of sseEvents(response, context.signal, context.retry.provider.timeoutMs, context.routeId)) {
+      let payload: unknown;
+      try {
+        payload = JSON.parse(event.data) as unknown;
+      } catch {
+        continue;
+      }
+      const typed = payload as {
+        type?: string;
+        index?: number;
+        content_block?: { type?: string; id?: string; name?: string; text?: string };
+        delta?: { type?: string; text?: string; partial_json?: string; stop_reason?: string };
+        message?: { usage?: { input_tokens?: number } };
+        usage?: { output_tokens?: number };
+      };
+      const kind = event.event ?? typed.type;
 
-    if (kind === "message_start" && typed.message?.usage?.input_tokens !== undefined) {
-      usage.input_tokens = typed.message.usage.input_tokens;
-    } else if (kind === "content_block_start" && typed.index !== undefined && typed.content_block) {
-      blocks.set(typed.index, {
-        type: typed.content_block.type ?? "text",
-        ...(typed.content_block.id !== undefined ? { id: typed.content_block.id } : {}),
-        ...(typed.content_block.name !== undefined ? { name: typed.content_block.name } : {}),
-        text: typed.content_block.text ?? "",
-        inputJson: ""
-      });
-    } else if (kind === "content_block_delta" && typed.index !== undefined && typed.delta) {
-      const acc = blocks.get(typed.index);
-      if (acc) {
-        if (typed.delta.type === "text_delta" && typeof typed.delta.text === "string") {
-          acc.text = (acc.text ?? "") + typed.delta.text;
-          context.onToken?.(typed.delta.text);
-        } else if (typed.delta.type === "input_json_delta" && typeof typed.delta.partial_json === "string") {
-          acc.inputJson = (acc.inputJson ?? "") + typed.delta.partial_json;
+      if (kind === "message_start" && typed.message?.usage?.input_tokens !== undefined) {
+        usage.input_tokens = typed.message.usage.input_tokens;
+      } else if (kind === "content_block_start" && typed.index !== undefined && typed.content_block) {
+        blocks.set(typed.index, {
+          type: typed.content_block.type ?? "text",
+          ...(typed.content_block.id !== undefined ? { id: typed.content_block.id } : {}),
+          ...(typed.content_block.name !== undefined ? { name: typed.content_block.name } : {}),
+          text: typed.content_block.text ?? "",
+          inputJson: ""
+        });
+      } else if (kind === "content_block_delta" && typed.index !== undefined && typed.delta) {
+        const acc = blocks.get(typed.index);
+        if (acc) {
+          if (typed.delta.type === "text_delta" && typeof typed.delta.text === "string") {
+            acc.text = (acc.text ?? "") + typed.delta.text;
+            context.onToken?.(typed.delta.text);
+          } else if (typed.delta.type === "input_json_delta" && typeof typed.delta.partial_json === "string") {
+            acc.inputJson = (acc.inputJson ?? "") + typed.delta.partial_json;
+          }
+        }
+      } else if (kind === "message_delta") {
+        if (typed.delta?.stop_reason) {
+          stopReason = typed.delta.stop_reason;
+        }
+        if (typed.usage?.output_tokens !== undefined) {
+          usage.output_tokens = typed.usage.output_tokens;
         }
       }
-    } else if (kind === "message_delta") {
-      if (typed.delta?.stop_reason) {
-        stopReason = typed.delta.stop_reason;
-      }
-      if (typed.usage?.output_tokens !== undefined) {
-        usage.output_tokens = typed.usage.output_tokens;
-      }
+    }
+  } catch (error) {
+    const hasPartialText = [...blocks.values()].some((block) => block.type === "text" && (block.text?.length ?? 0) > 0);
+    if (!hasPartialText || !isTransientStreamError(error)) {
+      throw error;
     }
   }
 
@@ -1259,8 +1385,8 @@ function describeRequestFailure(error: unknown): {
  *
  * `readBody: true` (non-streaming callers) consumes the body INSIDE the attempt
  * so the timeout covers the whole read — headers-then-hang can't stall the turn
- * (review 2026-07-05). Streaming callers keep the body open; their timer
- * disarms at headers (a stream is SUPPOSED to stay open past any timeout).
+ * (review 2026-07-05). Streaming callers disarm the open timeout at headers;
+ * the SSE reader then applies the same duration as an inactivity timeout.
  */
 async function fetchWithPolicy(
   context: FamilyContext,
@@ -1268,7 +1394,8 @@ async function fetchWithPolicy(
   headers: Record<string, string>,
   body: unknown,
   failurePrefix: string,
-  readBody = false
+  readBody = false,
+  acceptResponse?: (response: Response) => boolean
 ): Promise<{ response: Response; bodyText?: string }> {
   return runWithRetryPolicy(
     async () => {
@@ -1310,7 +1437,7 @@ async function fetchWithPolicy(
           { networkFailure: true }
         );
       }
-      if (!response.ok) {
+      if (!response.ok && !acceptResponse?.(response)) {
         const detail = await response.text().catch(() => "");
         disarm();
         const retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"));

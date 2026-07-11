@@ -160,3 +160,24 @@ describe("fork enumerator — failure surface + garage priors", () => {
     expect(enumerate("some_unknown_tool", 3).length).toBeGreaterThan(0); // default fork
   });
 });
+
+describe("LookAheadEngine — session toggle", () => {
+  it("setEnabled toggles scouts without restarting the engine", () => {
+    const spawned: string[] = [];
+    const engine = createLookAheadEngine({
+      config: { enabled: false, idempotentAllowlist: ["bash"] },
+      spawnScout: (fork) => {
+        spawned.push(fork.triggerCondition);
+        return { taskId: "scout-1" };
+      },
+      enumerateForks: () => [{ triggerCondition: "fail", prompt: "retry" }]
+    });
+    expect(engine.enabled).toBe(false);
+    expect(engine.scoutPendingStep("bash", { inDeadTime: true })).toEqual([]);
+    engine.setEnabled(true);
+    expect(engine.enabled).toBe(true);
+    expect(engine.scoutPendingStep("bash", { inDeadTime: true }).length).toBe(1);
+    engine.setEnabled(false);
+    expect(engine.scoutPendingStep("bash", { inDeadTime: true })).toEqual([]);
+  });
+});

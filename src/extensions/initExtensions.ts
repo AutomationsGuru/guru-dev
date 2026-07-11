@@ -9,6 +9,7 @@ import { createMemoryTools } from "../memory/tools.js";
 import { getSharedSwarmManager, type SwarmManager } from "../swarm/manager.js";
 import { createSwarmTools } from "../swarm/tools.js";
 import { createResolverTools } from "../selfbuild/resolverTool.js";
+import { registerShellHooks } from "./shellHooks.js";
 import type { SwarmConfig } from "../swarm/schema.js";
 
 /** Env var NAMES (never values) the Honcho runtime requires. */
@@ -38,37 +39,45 @@ export interface InitExtensionsOptions {
  * flow into the session tool registry through the extension host rather than being
  * hardcoded. Env NAMES only; nothing here reads or prints secret values.
  */
+let sharedHost: ExtensionHost | null = null;
+let sharedTools: readonly ToolDefinition[] | null = null;
+let sharedMemoryStore: FileMemoryStore | null = null;
+let sharedSwarm: SwarmManager | null = null;
+
 export function initExtensions(options: InitExtensionsOptions = {}): HarnessExtensions {
-  const host = createExtensionHost();
-  const honchoClient = createInMemoryHonchoClient({
-    config: HonchoConfigSchema.parse({
-      workspaceId: "guruharness",
-      writeEnabled: false,
-      requiredEnvNames: [...HONCHO_REQUIRED_ENV_NAMES]
-    })
-  });
-  const memoryStore = createFileMemoryStore({
-    ...(options.memoryDirectory ? { directory: options.memoryDirectory } : {}),
-    ...(options.sessionId ? { sessionId: options.sessionId } : {})
-  });
-  const swarm = getSharedSwarmManager(options.swarmConfig ?? {});
+  if (!sharedHost) {
+    sharedHost = createExtensionHost();
+    const honchoClient = createInMemoryHonchoClient({
+      config: HonchoConfigSchema.parse({
+        workspaceId: "guruharness",
+        writeEnabled: false,
+        requiredEnvNames: [...HONCHO_REQUIRED_ENV_NAMES]
+      })
+    });
+    sharedMemoryStore = createFileMemoryStore({
+      ...(options.memoryDirectory ? { directory: options.memoryDirectory } : {}),
+      ...(options.sessionId ? { sessionId: options.sessionId } : {})
+    });
+    sharedSwarm = getSharedSwarmManager(options.swarmConfig ?? {});
 
-  host.registerExtension((api) => {
-    api.registerTool({ factory: () => createHonchoTools({ client: honchoClient }) });
-    api.registerTool({ factory: () => createReadinessTools({ honchoClient }) });
-    // Memory organ (Foundation Wave PR 2) — self-registered, no api.ts change.
-    api.registerTool({ factory: () => createMemoryTools({ store: memoryStore }) });
-    // Swarm v1 (Phase F) — bounded contract per the 2026-07-04 swarm ADR.
-    api.registerTool({ factory: () => createSwarmTools({ manager: swarm }) });
-    // Never-stuck resolver (Phase G) — context late-bound by the live session.
-    api.registerTool({ factory: () => createResolverTools() });
-  });
+    sharedHost.registerExtension((api) => {
+      api.registerTool({ factory: () => createHonchoTools({ client: honchoClient }) });
+      api.registerTool({ factory: () => createReadinessTools({ honchoClient }) });
+      api.registerTool({ factory: () => createMemoryTools({ store: sharedMemoryStore! }) });
+      api.registerTool({ factory: () => createSwarmTools({ manager: sharedSwarm! }) });
+      api.registerTool({ factory: () => createResolverTools() });
+    });
+    // Shell hooks: side-effecting lifecycle listeners (.guru/hooks/*.sh|bat|ps1). Must
+    // be registered BEFORE start() so the first start() iterates its body — the
+    // host only re-runs `start()` bodies for extensions already in the registry.
+    // A dynamic import here would race start() and silently miss the first session.
+    sharedHost.registerExtension(registerShellHooks);
 
-  host.start();
+    sharedHost.start();
+    sharedTools = sharedHost.getToolFactories().flatMap((factory) => [...factory.factory()]);
+  }
 
-  const tools = host.getToolFactories().flatMap((factory) => [...factory.factory()]);
-
-  return { host, tools, memoryStore, swarm };
+  return { host: sharedHost, tools: sharedTools!, memoryStore: sharedMemoryStore!, swarm: sharedSwarm! };
 }
 
 /** Collect the extension-contributed tool definitions for the session tool registry. */

@@ -165,12 +165,12 @@ export async function executeCommand(
     };
   }
 
-  // Windows: bare tool names (npm, git) resolve to .cmd shims that cannot be
-  // spawned with shell:false — the child dies instantly with a null exit code. Route
-  // them through cmd.exe with a fixed argv (no shell-string interpolation), same
-  // pattern as the provider-CLI delegate.
-  const needsCmdShell =
-    process.platform === "win32" && !/\.exe$/iu.test(executable) && !executable.includes("/") && !executable.includes("\\");
+  // Only bare tool names (no path separators / absolute paths) may go through
+  // cmd.exe. Absolute or relative paths are always spawn'd as argv0 with shell:false
+  // so CodeQL js/shell-command-injection-from-environment stays quiet and a hostile
+  // path cannot ride `/c` into a different interpretation.
+  const isBareToolName = /^[A-Za-z0-9._-]+$/u.test(executable);
+  const needsCmdShell = process.platform === "win32" && isBareToolName && !/\.exe$/iu.test(executable);
 
   return new Promise<CommandExecutionResult>((resolveExecution) => {
     const child = needsCmdShell

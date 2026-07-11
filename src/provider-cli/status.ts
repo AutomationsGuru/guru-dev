@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 
+import { commandExists } from "../review/gates.js";
 import { ProviderCliConfigSchema, type ProviderCliConfig, type ProviderCliId, type ProviderCliStatusReport } from "./schemas.js";
 
 export const DEFAULT_PROVIDER_CLI_CONFIGS: readonly ProviderCliConfig[] = [
@@ -49,11 +50,28 @@ export async function getProviderCliStatusMatrix(options: ProviderCliStatusOptio
 
 const defaultStatusExecutor: ProviderCliStatusExecutor = {
   commandExists(commandName) {
-    return commandName.includes("/") || commandName.includes("\\") ? existsSync(commandName) : true;
+    // A path-qualified command: check the file exists. A bare command name: probe
+    // PATH (review 2026-07-08). The old code returned `true` for EVERY bare name,
+    // so `missing-command` was unreachable and a missing CLI showed as a confusing
+    // "version probe failed" error instead of the clean "X was not found."
+    if (commandName.includes("/") || commandName.includes("\\")) {
+      return existsSync(commandName);
+    }
+    return commandExists(commandName);
   },
   async version(config) {
     const { executeCommand } = await import("../review/gates.js");
-    return await executeCommand([config.commandName, ...config.statusArgs], { gate: { kind: "validation", name: `provider-cli:${config.id}`, command: [config.commandName, ...config.statusArgs], required: false } });
+    // Forward the config's timeoutMs so a wedged CLI can't hang the status matrix
+    // forever (review 2026-07-08): the old call passed no timeoutMs, so a CLI that
+    // blocks (license prompt, network call, stuck drive) hung Promise.all with no
+    // escape. config.timeoutMs defaults to 30000 (schemas.ts).
+    return await executeCommand(
+      [config.commandName, ...config.statusArgs],
+      {
+        gate: { kind: "validation", name: `provider-cli:${config.id}`, command: [config.commandName, ...config.statusArgs], required: false },
+        timeoutMs: config.timeoutMs
+      }
+    );
   }
 };
 

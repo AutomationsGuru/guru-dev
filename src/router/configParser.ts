@@ -224,6 +224,7 @@ function inferProviderGroup(alias: string): LiteLlmProviderGroup {
   if (alias.startsWith("router-glm-")) return "bigmodel-zhipu";
   if (alias.startsWith("router-minimax-")) return "minimax";
   if (alias.startsWith("router-fugu")) return "sakana";
+  if (alias.startsWith("router-xai-")) return "xai-api";
   if (alias.startsWith("router-perplexity-")) return "perplexity-sonar";
   if (alias === "router-sonnet" || alias === "router-haiku" || alias === "router-opus") return "legacy-compatibility";
   if (alias.startsWith("router-vertex-claude-")) return "vertex-claude";

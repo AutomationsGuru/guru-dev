@@ -11,6 +11,8 @@
 export interface ResolvedOAuthToken {
   readonly accessToken: string;
   readonly accountId?: string;
+  /** Epoch-ms when the access token expires, when known (so the resolver can flag a stale lane). */
+  readonly expiresAt?: number;
 }
 
 let accessor: ((providerId: string) => ResolvedOAuthToken | null) | null = null;

@@ -6,6 +6,8 @@ import type { RuntimeHardeningConfig } from "../config/schema.js";
 import type { MandateDecision } from "../mandates/evaluate.js";
 import { createDirectionAlignmentReport } from "../direction/hereThere.js";
 import { applySelfBuildProgress, createSelfBuildState, planNextSelfBuildTask, type SelfBuildTask } from "../kernel/selfBuildLoop.js";
+import { attachConfiguredMcpServers, type McpAttachment } from "../mcp/attach.js";
+import type { McpServerConfig, McpServerStatus } from "../mcp/schemas.js";
 import { createInMemoryOperationalStore, type OperationalStore } from "../operational/store.js";
 import { createBlockedPlannerRunReport, runPlannerExecution, type PlannerModel } from "../planner/runtime.js";
 import {
@@ -40,7 +42,7 @@ import { createListSkillsTool, createLoadSkillTool } from "../tools/builtins/ski
 import { createShellExecTool } from "../tools/builtins/shellExecTool.js";
 import { BashOptimizerConfigSchema, type BashOptimizerConfig } from "../tools/bashOptimizer.js";
 import { createToolRegistry, executeRegisteredTool, type ToolObservation, type ToolRegistry } from "../tools/registry.js";
-import { collectExtensionTools } from "../extensions/initExtensions.js";
+import { initExtensions } from "../extensions/initExtensions.js";
 import type { CommandExecutor } from "../review/gates.js";
 import {
   HarnessSessionSchema,
@@ -54,6 +56,9 @@ export interface HarnessRuntimeDependencies {
   readonly sessionPersistenceStore?: SessionPersistenceStore;
   readonly commandExecutor?: CommandExecutor;
   readonly plannerModel?: PlannerModel;
+  readonly interactiveCallbacks?: {
+    readonly askQuestion?: (questions: any) => Promise<string[][]>;
+  };
   /**
    * Mandate enforcement policy (ADR 2026-07-05-composer-completion). When set,
    * executeTool evaluates evaluateToolMandate BEFORE running a tool and BLOCKS
@@ -76,6 +81,12 @@ export interface HarnessRuntime {
   executeTool(sessionId: string, toolId: string, input: unknown, signal?: AbortSignal): Promise<ToolObservation>;
   /** Full tool definitions (with schemas) registered for a session — for model tool-calling. */
   getSessionTools(sessionId: string): readonly import("../tools/registry.js").ToolDefinition[];
+  /** MCP readiness/discovery results for a live session. Unknown or closed sessions return an empty list. */
+  getSessionMcpStatuses(sessionId: string): readonly McpServerStatus[];
+  /** Close retained MCP clients and forget one live session. Returns false when the id is not live. */
+  closeSession(sessionId: string): Promise<boolean>;
+  /** Close every live session and make this runtime reject future start/resume calls. Idempotent. */
+  close(): Promise<void>;
   runPlanner(sessionId: string, options: PlannerRunOptions): Promise<PlannerRunReport>;
   listSessionEvents(sessionId: string): Promise<readonly PersistedSessionEvent[]>;
   listSessions(options?: PersistedSessionListOptions): Promise<readonly PersistedSessionListItem[]>;
@@ -84,11 +95,13 @@ export interface HarnessRuntime {
 interface BuiltHarnessSession {
   readonly session: HarnessSession;
   readonly registry: ToolRegistry;
+  readonly mcpAttachment: McpAttachment;
 }
 
 interface RebuiltHarnessSessionDependencies {
   readonly operationalStore: OperationalStore;
   readonly commandExecutor?: CommandExecutor;
+  readonly interactiveCallbacks?: HarnessRuntimeDependencies["interactiveCallbacks"];
 }
 
 type MemoryProvider = "in-memory-operational-store" | "injected-operational-store";
@@ -97,6 +110,7 @@ interface BuildHarnessSessionDependencies {
   readonly operationalStore: OperationalStore;
   readonly memoryProvider: MemoryProvider;
   readonly commandExecutor?: CommandExecutor;
+  readonly interactiveCallbacks?: HarnessRuntimeDependencies["interactiveCallbacks"];
 }
 
 interface CreateDefaultHarnessToolRegistryOptions {
@@ -105,43 +119,71 @@ interface CreateDefaultHarnessToolRegistryOptions {
   readonly runtimeHardening: RuntimeHardeningConfig;
   readonly commandExecutor?: CommandExecutor;
   readonly bashOptimizer?: BashOptimizerConfig;
+  readonly interactiveCallbacks?: HarnessRuntimeDependencies["interactiveCallbacks"];
 }
 
 const DEFAULT_RUNTIME_STARTED_BY = "guruharness-runtime";
 
 export function createHarnessRuntime(dependencies: HarnessRuntimeDependencies = {}): HarnessRuntime {
   const sessions = new Map<string, BuiltHarnessSession>();
+  let closed = false;
   const operationalStore = dependencies.operationalStore ?? createInMemoryOperationalStore();
   const sessionPersistenceStore = dependencies.sessionPersistenceStore ?? createOperationalSessionPersistenceStore(operationalStore);
   const memoryProvider: MemoryProvider = dependencies.operationalStore ? "injected-operational-store" : "in-memory-operational-store";
 
   const runtime: HarnessRuntime = {
     async startSession(options = {}) {
+      assertRuntimeOpen(closed);
       const builtSession = await buildHarnessSession(options, {
         operationalStore,
         memoryProvider,
-        ...(dependencies.commandExecutor ? { commandExecutor: dependencies.commandExecutor } : {})
+        ...(dependencies.commandExecutor ? { commandExecutor: dependencies.commandExecutor } : {}),
+        interactiveCallbacks: dependencies.interactiveCallbacks
       });
-      sessions.set(builtSession.session.id, builtSession);
-      await sessionPersistenceStore.recordSessionStarted(builtSession.session);
+      if (closed) {
+        await builtSession.mcpAttachment.closeAll();
+        throw new Error("Harness runtime is closed.");
+      }
 
-      return builtSession.session;
+      try {
+        await sessionPersistenceStore.recordSessionStarted(builtSession.session);
+        initExtensions().host.sendMessage("session:start", { sessionId: builtSession.session.id });
+        sessions.set(builtSession.session.id, builtSession);
+        return builtSession.session;
+      } catch (error) {
+        await builtSession.mcpAttachment.closeAll();
+        throw error;
+      }
     },
     async resumeSession(sessionId, options = {}) {
+      assertRuntimeOpen(closed);
       const loadedSession = await sessionPersistenceStore.loadSession(sessionId);
 
       if (!loadedSession) {
         return undefined;
       }
 
-      const rebuiltSession = rebuildHarnessSession(loadedSession, options, {
+      const rebuiltSession = await rebuildHarnessSession(loadedSession, options, {
         operationalStore,
-        ...(dependencies.commandExecutor ? { commandExecutor: dependencies.commandExecutor } : {})
+        ...(dependencies.commandExecutor ? { commandExecutor: dependencies.commandExecutor } : {}),
+        interactiveCallbacks: dependencies.interactiveCallbacks
       });
-      sessions.set(rebuiltSession.session.id, rebuiltSession);
-      await sessionPersistenceStore.recordSessionResumed(rebuiltSession.session, sessionId);
+      if (closed) {
+        await rebuiltSession.mcpAttachment.closeAll();
+        throw new Error("Harness runtime is closed.");
+      }
 
-      return rebuiltSession.session;
+      try {
+        await sessionPersistenceStore.recordSessionResumed(rebuiltSession.session, sessionId);
+        initExtensions().host.sendMessage("session:start", { sessionId: rebuiltSession.session.id });
+        const previousSession = sessions.get(rebuiltSession.session.id);
+        sessions.set(rebuiltSession.session.id, rebuiltSession);
+        await previousSession?.mcpAttachment.closeAll();
+        return rebuiltSession.session;
+      } catch (error) {
+        await rebuiltSession.mcpAttachment.closeAll();
+        throw error;
+      }
     },
     async executeTool(sessionId, toolId, input, signal) {
       const builtSession = sessions.get(sessionId);
@@ -158,10 +200,12 @@ export function createHarnessRuntime(dependencies: HarnessRuntimeDependencies = 
         const decision = dependencies.mandatePolicy(toolId, input, cwd);
         if (decision && decision.outcome !== "allow") {
           const blocked = createFailedRuntimeObservation(toolId, `Blocked by mandate: ${decision.reason} (verbs: ${decision.verbs.join("+") || "none"}).`);
-          await sessionPersistenceStore.recordToolObservation(sessionId, blocked);
+          await safeRecordToolObservation(sessionPersistenceStore, sessionId, blocked); // best-effort (review 2026-07-08)
           return blocked;
         }
       }
+
+      initExtensions().host.sendMessage("tool:execute", { toolId, input });
 
       const observation = await executeRegisteredTool(builtSession.registry, toolId, input, {
         runId: builtSession.session.id,
@@ -174,7 +218,7 @@ export function createHarnessRuntime(dependencies: HarnessRuntimeDependencies = 
         // Forward the turn abort so bash can kill its child on operator cancel.
         ...(signal ? { signal } : {})
       });
-      await sessionPersistenceStore.recordToolObservation(sessionId, observation);
+      await safeRecordToolObservation(sessionPersistenceStore, sessionId, observation); // best-effort (review 2026-07-08)
 
       return observation;
     },
@@ -199,7 +243,7 @@ export function createHarnessRuntime(dependencies: HarnessRuntimeDependencies = 
         // Same mandate floor as executeTool — planner steps are gated too.
         ...(dependencies.mandatePolicy ? { mandatePolicy: dependencies.mandatePolicy } : {})
       });
-      await sessionPersistenceStore.recordPlannerRun(report);
+      await safeRecordPlannerRun(sessionPersistenceStore, report); // best-effort (review 2026-07-08)
 
       return report;
     },
@@ -207,6 +251,29 @@ export function createHarnessRuntime(dependencies: HarnessRuntimeDependencies = 
       const builtSession = sessions.get(sessionId);
 
       return builtSession ? builtSession.registry.list() : [];
+    },
+    getSessionMcpStatuses(sessionId) {
+      return sessions.get(sessionId)?.mcpAttachment.statuses ?? [];
+    },
+    async closeSession(sessionId) {
+      const builtSession = sessions.get(sessionId);
+      if (!builtSession) {
+        return false;
+      }
+
+      sessions.delete(sessionId);
+      await builtSession.mcpAttachment.closeAll();
+      return true;
+    },
+    async close() {
+      if (closed) {
+        return;
+      }
+
+      closed = true;
+      const liveSessions = [...sessions.values()];
+      sessions.clear();
+      await Promise.allSettled(liveSessions.map((session) => session.mcpAttachment.closeAll()));
     },
     async listSessionEvents(sessionId) {
       return sessionPersistenceStore.listEvents(sessionId);
@@ -219,12 +286,16 @@ export function createHarnessRuntime(dependencies: HarnessRuntimeDependencies = 
 }
 
 export async function startHarnessSession(options: StartHarnessSessionOptions = {}): Promise<HarnessSession> {
-  return (
-    await buildHarnessSession(options, {
-      operationalStore: createInMemoryOperationalStore(),
-      memoryProvider: "in-memory-operational-store"
-    })
-  ).session;
+  const builtSession = await buildHarnessSession(options, {
+    operationalStore: createInMemoryOperationalStore(),
+    memoryProvider: "in-memory-operational-store"
+  });
+
+  try {
+    return builtSession.session;
+  } finally {
+    await builtSession.mcpAttachment.closeAll();
+  }
 }
 
 export function createDefaultHarnessToolRegistry(options: CreateDefaultHarnessToolRegistryOptions): ToolRegistry {
@@ -247,7 +318,17 @@ export function createDefaultHarnessToolRegistry(options: CreateDefaultHarnessTo
         secretAllowList: options.runtimeHardening.secretAllowList,
         ...(options.bashOptimizer ? { optimizer: options.bashOptimizer } : {})
       },
-      read: { secretAllowList: options.runtimeHardening.secretAllowList }
+      read: { secretAllowList: options.runtimeHardening.secretAllowList },
+      // TUI/RPC can inject ask_question; otherwise the tool falls back to its own TTY prompt.
+      ...(options.interactiveCallbacks?.askQuestion
+        ? { askQuestion: { onAsk: options.interactiveCallbacks.askQuestion } }
+        : {}),
+      // read_url_content / search_web default to globalThis.fetch with a
+      // 20s timeout + 512KB cap (the safety defaults live in httpFetch.ts). The
+      // caller can override via fetchImpl for testing or a sandboxed proxy.
+      searchWeb: {},
+      readUrl: {},
+      ...(options.commandExecutor ? { readDiagnostics: { executor: options.commandExecutor } } : {})
     }),
     createMaintenanceAuditTool(),
     createFileEditTool({
@@ -284,15 +365,15 @@ export function createDefaultHarnessToolRegistry(options: CreateDefaultHarnessTo
     createCreateOperationalBacklogItemTool(options.operationalStore, { secretAllowList: options.runtimeHardening.secretAllowList }),
     createListOperationalBacklogItemsTool(options.operationalStore),
     createCreateOperationalImplementationTool(options.operationalStore, { secretAllowList: options.runtimeHardening.secretAllowList }),
-    ...collectExtensionTools()
+    ...initExtensions().tools
   ]);
 }
 
-function rebuildHarnessSession(
+async function rebuildHarnessSession(
   session: HarnessSession,
   options: StartHarnessSessionOptions,
   dependencies: RebuiltHarnessSessionDependencies
-): BuiltHarnessSession {
+): Promise<BuiltHarnessSession> {
   const parsedOptions = StartHarnessSessionOptionsSchema.parse(options);
   const cwd = parsedOptions.cwd ?? session.repo?.repoRoot ?? process.cwd();
   const configResult = loadHarnessConfig({
@@ -300,15 +381,22 @@ function rebuildHarnessSession(
     cwd
   });
   const configCwd = configResult.status === "loaded" ? dirname(configResult.path) : cwd;
-  const registry = createDefaultHarnessToolRegistry({
+  const { registry, mcpAttachment } = await createSessionTooling({
     skillLoaderOptions: { directories: configResult.config.skillDirectories, cwd: configCwd },
     operationalStore: dependencies.operationalStore,
     runtimeHardening: configResult.config.runtimeHardening,
     bashOptimizer: configResult.config.bashOptimizer,
-    ...(dependencies.commandExecutor ? { commandExecutor: dependencies.commandExecutor } : {})
+    mcpServers: configResult.config.mcpServers,
+    ...(dependencies.commandExecutor ? { commandExecutor: dependencies.commandExecutor } : {}),
+    ...(dependencies.interactiveCallbacks ? { interactiveCallbacks: dependencies.interactiveCallbacks } : {})
   });
 
-  return { session: HarnessSessionSchema.parse(session), registry };
+  const rebuiltSession = HarnessSessionSchema.parse({
+    ...session,
+    tools: materializeTools(registry)
+  });
+
+  return { session: rebuiltSession, registry, mcpAttachment };
 }
 
 async function buildHarnessSession(
@@ -335,12 +423,14 @@ async function buildHarnessSession(
   const repo = resolveSessionRepositoryContext(parsedOptions.targetPath, cwd, blockers);
   const catalog = discoverSessionSkills(configResult.config.skillDirectories, configCwd, blockers);
   const loadedSkills = loadSessionSkills(parsedOptions.skillIds, configResult.config.skillDirectories, configCwd, blockers);
-  const registry = createDefaultHarnessToolRegistry({
+  const { registry, mcpAttachment } = await createSessionTooling({
     skillLoaderOptions: { directories: configResult.config.skillDirectories, cwd: configCwd },
     operationalStore: dependencies.operationalStore,
     runtimeHardening: configResult.config.runtimeHardening,
     bashOptimizer: configResult.config.bashOptimizer,
-    ...(dependencies.commandExecutor ? { commandExecutor: dependencies.commandExecutor } : {})
+    mcpServers: configResult.config.mcpServers,
+    ...(dependencies.commandExecutor ? { commandExecutor: dependencies.commandExecutor } : {}),
+    ...(dependencies.interactiveCallbacks ? { interactiveCallbacks: dependencies.interactiveCallbacks } : {})
   });
 
   if (configResult.verdict === "RED") {
@@ -392,16 +482,45 @@ async function buildHarnessSession(
       },
       approvalPolicy: configResult.config.approvalPolicy
     },
-    tools: registry.list().map((tool) => ({
-      id: tool.id,
-      title: tool.title,
-      description: tool.description
-    })),
+    tools: materializeTools(registry),
     blockers,
     nextActions: buildNextActions(blockers, task)
   });
 
-  return { session, registry };
+  return { session, registry, mcpAttachment };
+}
+
+interface CreateSessionToolingOptions extends CreateDefaultHarnessToolRegistryOptions {
+  readonly mcpServers: readonly McpServerConfig[];
+}
+
+async function createSessionTooling(options: CreateSessionToolingOptions): Promise<Pick<BuiltHarnessSession, "registry" | "mcpAttachment">> {
+  const registry = createDefaultHarnessToolRegistry(options);
+  const mcpAttachment = await attachConfiguredMcpServers({ servers: options.mcpServers });
+
+  try {
+    for (const tool of mcpAttachment.tools) {
+      registry.register(tool);
+    }
+    return { registry, mcpAttachment };
+  } catch (error) {
+    await mcpAttachment.closeAll();
+    throw error;
+  }
+}
+
+function materializeTools(registry: ToolRegistry): readonly { id: string; title: string; description: string }[] {
+  return registry.list().map((tool) => ({
+    id: tool.id,
+    title: tool.title,
+    description: tool.description
+  }));
+}
+
+function assertRuntimeOpen(closed: boolean): void {
+  if (closed) {
+    throw new Error("Harness runtime is closed.");
+  }
 }
 
 function createMissingSessionObservation(sessionId: string, toolId: string): ToolObservation {
@@ -421,6 +540,31 @@ function createMissingSessionObservation(sessionId: string, toolId: string): Too
 function createFailedRuntimeObservation(toolId: string, error: string): ToolObservation {
   const now = new Date().toISOString();
   return { toolId, status: "failed", startedAt: now, endedAt: now, durationMs: 0, error };
+}
+
+/**
+ * Best-effort tool-observation persistence (review 2026-07-08): the observation is
+ * the load-bearing value of executeTool. A persistence write failure (DB down, disk
+ * full, permission) used to reject executeTool's promise — turning a SUCCESSFUL tool
+ * into a hard failure the agent loop reads as an error. These wrappers swallow the
+ * store error (logging it) so the real result always reaches the caller.
+ */
+async function safeRecordToolObservation(store: SessionPersistenceStore, sessionId: string, observation: ToolObservation): Promise<void> {
+  try {
+    await store.recordToolObservation(sessionId, observation);
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.warn(`[runtime] persistence: could not record tool observation for ${sessionId} (${error instanceof Error ? error.message : String(error)}). The tool result is preserved; only the audit trail missed this entry.`);
+  }
+}
+
+async function safeRecordPlannerRun(store: SessionPersistenceStore, report: PlannerRunReport): Promise<void> {
+  try {
+    await store.recordPlannerRun(report);
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.warn(`[runtime] persistence: could not record planner run for ${report.sessionId} (${error instanceof Error ? error.message : String(error)}). The report is preserved; only the audit trail missed this run.`);
+  }
 }
 
 function selectSessionTask(tasks: readonly SelfBuildTask[], taskId: string | undefined): SelfBuildTask | undefined {

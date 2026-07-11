@@ -1,3 +1,5 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -6,12 +8,38 @@ import { z } from "zod";
 import {
   createHarnessRuntime,
   createInMemoryOperationalStore,
+  createInMemorySessionPersistenceStore,
   createToolRegistry,
   startHarnessSession,
+  type HarnessRuntime,
   type ToolDefinition
 } from "../../src/index.js";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
+const fakeMcpServer = resolve(repoRoot, "tests", "mcp", "fixtures", "fake-mcp-server.mjs");
+
+async function writeMcpConfig(servers: readonly Record<string, unknown>[]): Promise<{ directory: string; path: string }> {
+  const directory = await mkdtemp(resolve(tmpdir(), "guruharness-runtime-mcp-"));
+  const path = resolve(directory, "guruharness.config.json");
+  await writeFile(path, JSON.stringify({ mcpServers: servers }), "utf8");
+  return { directory, path };
+}
+
+function fakeMcpConfig(id = "fake"): Record<string, unknown> {
+  return {
+    id,
+    transport: "stdio",
+    command: process.execPath,
+    args: [fakeMcpServer],
+    category: "test",
+    timeoutMs: 10_000
+  };
+}
+
+async function closeRuntimeAndRemoveConfig(runtime: HarnessRuntime, directory: string): Promise<void> {
+  await runtime.close();
+  await rm(directory, { recursive: true, force: true });
+}
 
 describe("startHarnessSession", () => {
   it("should assemble the next task, repo, skill catalog, memory, policy, and tools", async () => {
@@ -29,9 +57,11 @@ describe("startHarnessSession", () => {
       },
       repo: {
         repoRoot,
-        // main is a pristine runtime package (no AGENTS.md by design); AGENTS.md chain-
-        // walking is covered against fixture repos in tests/maintenance/audit.test.ts.
-        agentsChain: []
+        agentsChain: [
+          expect.objectContaining({
+            relativePath: "AGENTS.md"
+          })
+        ]
       },
       memory: {
         provider: "in-memory-operational-store",
@@ -52,6 +82,7 @@ describe("startHarnessSession", () => {
       expect.arrayContaining(["guruharness-self-build"])
     );
     expect(session.tools.map((tool) => tool.id)).toEqual([
+      "ask_question",
       "bash",
       "edit",
       "fs.edit.apply",
@@ -70,6 +101,7 @@ describe("startHarnessSession", () => {
       "kill_task",
       "ls",
       "maintenance.audit.run",
+      "manage_task",
       "memory_doctor",
       "memory_forget",
       "memory_get",
@@ -84,10 +116,15 @@ describe("startHarnessSession", () => {
       "operational.state.list",
       "operational.state.write",
       "read",
+      "read_diagnostics",
+      "read_url_content",
       "repo.context.resolve",
       "resolve_capability_gap",
       "review.gates.run",
+      "schedule",
+      "search_web",
       "service_readiness_report",
+      "session_todos",
       "shell.command.run",
       "skill.document.load",
       "skills.catalog.list",
@@ -133,6 +170,108 @@ describe("startHarnessSession", () => {
 });
 
 describe("createHarnessRuntime", () => {
+  it("should attach configured MCP tools to a new runtime session", async () => {
+    const config = await writeMcpConfig([fakeMcpConfig()]);
+    const runtime = createHarnessRuntime();
+
+    try {
+      const session = await runtime.startSession({ cwd: repoRoot, configPath: config.path });
+
+      expect(session.tools.map((tool) => tool.id)).toContain("mcp.fake.echo");
+      expect(runtime.getSessionTools(session.id).map((tool) => tool.id)).toContain("mcp.fake.echo");
+      expect(runtime.getSessionMcpStatuses(session.id)).toEqual([
+        expect.objectContaining({ serverId: "fake", status: "ready", toolCount: 4 })
+      ]);
+
+      const observation = await runtime.executeTool(session.id, "mcp.fake.echo", { arguments: { value: "runtime" } });
+      expect(observation).toMatchObject({
+        status: "succeeded",
+        output: expect.objectContaining({ status: "succeeded", text: expect.stringContaining('echo:{"value":"runtime"}') })
+      });
+    } finally {
+      await closeRuntimeAndRemoveConfig(runtime, config.directory);
+    }
+  });
+
+  it("should surface partial MCP attachment failures without blocking session startup", async () => {
+    const missingEnvName = "GURUHARNESS_RUNTIME_MCP_TEST_KEY_THAT_IS_UNSET";
+    delete process.env[missingEnvName];
+    const config = await writeMcpConfig([
+      fakeMcpConfig(),
+      { ...fakeMcpConfig("keyless"), requiredEnvNames: [missingEnvName] },
+      { ...fakeMcpConfig("broken"), command: "definitely-not-a-real-binary-guruharness", timeoutMs: 500 }
+    ]);
+    const runtime = createHarnessRuntime();
+
+    try {
+      const session = await runtime.startSession({ cwd: repoRoot, configPath: config.path });
+      const statuses = new Map(runtime.getSessionMcpStatuses(session.id).map((status) => [status.serverId, status]));
+
+      expect(session.status).toBe("ready");
+      expect(runtime.getSessionTools(session.id).map((tool) => tool.id)).toContain("mcp.fake.echo");
+      expect(statuses.get("fake")).toMatchObject({ status: "ready", toolCount: 4 });
+      expect(statuses.get("keyless")).toMatchObject({ status: "missing-env", missingEnvNames: [missingEnvName] });
+      expect(statuses.get("broken")).toMatchObject({ status: "error" });
+    } finally {
+      await closeRuntimeAndRemoveConfig(runtime, config.directory);
+    }
+  });
+
+  it("should reattach configured MCP tools when resuming a persisted session", async () => {
+    const config = await writeMcpConfig([fakeMcpConfig()]);
+    const persistence = createInMemorySessionPersistenceStore();
+    const firstRuntime = createHarnessRuntime({ sessionPersistenceStore: persistence });
+    const secondRuntime = createHarnessRuntime({ sessionPersistenceStore: persistence });
+
+    try {
+      const started = await firstRuntime.startSession({ cwd: repoRoot });
+      const resumed = await secondRuntime.resumeSession(started.id, { cwd: repoRoot, configPath: config.path });
+
+      expect(resumed?.tools.map((tool) => tool.id)).toContain("mcp.fake.echo");
+      expect(secondRuntime.getSessionTools(started.id).map((tool) => tool.id)).toContain("mcp.fake.echo");
+      expect(secondRuntime.getSessionMcpStatuses(started.id)).toEqual([
+        expect.objectContaining({ serverId: "fake", status: "ready", toolCount: 4 })
+      ]);
+    } finally {
+      await firstRuntime.close();
+      await closeRuntimeAndRemoveConfig(secondRuntime, config.directory);
+    }
+  });
+
+  it("should close and forget one runtime session explicitly", async () => {
+    const config = await writeMcpConfig([fakeMcpConfig()]);
+    const runtime = createHarnessRuntime();
+
+    try {
+      const session = await runtime.startSession({ cwd: repoRoot, configPath: config.path });
+
+      await expect(runtime.closeSession(session.id)).resolves.toBe(true);
+      expect(runtime.getSessionTools(session.id)).toEqual([]);
+      expect(runtime.getSessionMcpStatuses(session.id)).toEqual([]);
+      await expect(runtime.closeSession(session.id)).resolves.toBe(false);
+    } finally {
+      await closeRuntimeAndRemoveConfig(runtime, config.directory);
+    }
+  });
+
+  it("should close every retained MCP client during runtime teardown", async () => {
+    const config = await writeMcpConfig([fakeMcpConfig()]);
+    const runtime = createHarnessRuntime();
+
+    try {
+      const first = await runtime.startSession({ cwd: repoRoot, configPath: config.path });
+      const second = await runtime.startSession({ cwd: repoRoot, configPath: config.path });
+
+      await runtime.close();
+
+      expect(runtime.getSessionTools(first.id)).toEqual([]);
+      expect(runtime.getSessionTools(second.id)).toEqual([]);
+      await expect(runtime.close()).resolves.toBeUndefined();
+    } finally {
+      await closeRuntimeAndRemoveConfig(runtime, config.directory);
+    }
+  });
+
   it("should dispatch typed tools through the session registry", async () => {
     const runtime = createHarnessRuntime();
     const session = await runtime.startSession({ cwd: repoRoot });

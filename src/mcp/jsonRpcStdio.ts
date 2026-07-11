@@ -202,7 +202,15 @@ export function connectStdioJsonRpc(options: JsonRpcStdioOptions): JsonRpcConnec
     child.kill();
     // TERM→KILL escalation, bounded — a wedged server must not outlive the harness.
     const killTimer = setTimeout(() => child.kill("SIGKILL"), CLOSE_GRACE_MS);
-    await exited;
+    // Hard cap on the exit wait (review 2026-07-08): a server that never emits
+    // `exit` (zombie grandchild holding the pipe, Windows TerminateProcess failure,
+    // ptrace-attached) used to hang close()/teardown forever — the SIGKILL fired
+    // but nothing raced the exit promise. Resolve after a bounded cap so the
+    // harness always tears down.
+    await Promise.race([
+      exited,
+      new Promise<void>((resolve) => setTimeout(resolve, CLOSE_GRACE_MS * 2))
+    ]);
     clearTimeout(killTimer);
   }
 

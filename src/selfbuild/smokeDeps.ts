@@ -1,6 +1,6 @@
 import { runCapabilitySmoke } from "../readiness/capabilitySmoke.js";
 import type { ReviewGateVerdict } from "../review/gates.js";
-import { createHarnessRuntime } from "../runtime/session.js";
+import { createHarnessRuntime, type HarnessRuntime } from "../runtime/session.js";
 import type { SmokeStageDeps } from "./smokeStage.js";
 
 /**
@@ -23,26 +23,34 @@ export interface MakeSmokeDepsInput {
 }
 
 /** Default SMOKE self-call: live session + one read-only tool. Honors abort. */
-export async function defaultSmokeSelfCall(signal: AbortSignal, cwd?: string): Promise<void> {
+export async function defaultSmokeSelfCall(
+  signal: AbortSignal,
+  cwd?: string,
+  runtimeFactory: () => HarnessRuntime = createHarnessRuntime
+): Promise<void> {
   if (signal.aborted) {
     throw new Error("aborted before smoke self-call");
   }
-  const runtime = createHarnessRuntime();
-  const session = await runtime.startSession(cwd ? { cwd } : {});
-  if (signal.aborted) {
-    throw new Error("aborted during smoke self-call");
-  }
-  const observation = await runtime.executeTool(
-    session.id,
-    "repo.context.resolve",
-    { includeContents: false },
-    signal
-  );
-  if (observation.status === "failed") {
-    throw new Error(observation.error ?? "smoke self-call tool failed");
-  }
-  if (signal.aborted) {
-    throw new Error("aborted after smoke self-call");
+  const runtime = runtimeFactory();
+  try {
+    const session = await runtime.startSession(cwd ? { cwd } : {});
+    if (signal.aborted) {
+      throw new Error("aborted during smoke self-call");
+    }
+    const observation = await runtime.executeTool(
+      session.id,
+      "repo.context.resolve",
+      { includeContents: false },
+      signal
+    );
+    if (observation.status === "failed") {
+      throw new Error(observation.error ?? "smoke self-call tool failed");
+    }
+    if (signal.aborted) {
+      throw new Error("aborted after smoke self-call");
+    }
+  } finally {
+    await runtime.close();
   }
 }
 

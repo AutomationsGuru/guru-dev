@@ -260,6 +260,61 @@ export const TOOL_PARITY_ROWS: readonly ToolParityRow[] = [
     ownerModule: "src/repo",
     notes: "Current repo.context.resolve resolves git root/status and AGENTS chain, but lacks repo id/name/category/worktree lookup, workspace maps, ambiguity handling, and governed path awareness.",
     nextAction: "Expand repo routing/capture in Dev 3 D3.7 and keep current repo.context.resolve as the initial compatibility base."
+  },
+  {
+    toolId: "ask_question",
+    category: "base-tool",
+    requirementIds: ["FR-08", "TR-19"],
+    currentGuruHarnessToolIds: ["ask_question"],
+    status: "native-equivalent",
+    verdict: "GREEN",
+    ownerModule: "src/tools/builtins/askQuestionTool.ts",
+    notes: "Added to bridge interactive clarification parity with advanced runtime environments.",
+    nextAction: "Parity met."
+  },
+  {
+    toolId: "search_web",
+    category: "research",
+    requirementIds: ["FR-09", "TR-20", "TR-36"],
+    currentGuruHarnessToolIds: ["search_web"],
+    status: "native-equivalent",
+    verdict: "GREEN",
+    ownerModule: "src/tools/builtins/searchWebTool.ts",
+    notes: "Added to bridge basic web search parity.",
+    nextAction: "Parity met for basic search. Perplexity-specific routing still pending."
+  },
+  {
+    toolId: "read_url_content",
+    category: "research",
+    requirementIds: ["FR-09", "TR-20", "TR-36"],
+    currentGuruHarnessToolIds: ["read_url_content"],
+    status: "native-equivalent",
+    verdict: "GREEN",
+    ownerModule: "src/tools/builtins/readUrlTool.ts",
+    notes: "Added to bridge fetch parity.",
+    nextAction: "Parity met."
+  },
+  {
+    toolId: "schedule",
+    category: "base-tool",
+    requirementIds: ["FR-08", "TR-19"],
+    currentGuruHarnessToolIds: ["schedule"],
+    status: "native-equivalent",
+    verdict: "GREEN",
+    ownerModule: "src/tools/builtins/scheduleTool.ts",
+    notes: "Added to bridge asynchronous timer and cron parity.",
+    nextAction: "Parity met."
+  },
+  {
+    toolId: "manage_task",
+    category: "base-tool",
+    requirementIds: ["FR-08", "TR-19"],
+    currentGuruHarnessToolIds: ["manage_task"],
+    status: "native-equivalent",
+    verdict: "GREEN",
+    ownerModule: "src/tools/builtins/manageTaskTool.ts",
+    notes: "Added to bridge background task management parity.",
+    nextAction: "Parity met."
   }
 ];
 

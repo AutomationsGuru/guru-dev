@@ -15,12 +15,18 @@
 const K1 = 1.5; // term-frequency saturation
 const B = 0.75; // length normalization
 
-/** Tokenize to lowercase alphanumeric terms of length > 2 (matches the memory tokenizer). */
+/**
+ * Tokenize to lowercase alphanumeric terms of length >= 2 (review 2026-07-08).
+ * The old `> 2` filter dropped 2-char meaningful terms (db, js, go, ai, os, ml),
+ * making them unrecallable even when they name a stored fact's subject. Both the
+ * index and the query use this function, so lowering the threshold keeps them
+ * aligned; single letters (a, I) stay excluded as too noisy.
+ */
 export function tokenizeRecall(text: string): string[] {
   return text
     .toLowerCase()
     .split(/[^a-z0-9]+/u)
-    .filter((token) => token.length > 2);
+    .filter((token) => token.length >= 2);
 }
 
 export interface RecallDoc {

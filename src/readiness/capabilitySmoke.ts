@@ -1,6 +1,6 @@
 import { getRuntimeInfo } from "../index.js";
 import { loadHarnessConfig } from "../config/loadConfig.js";
-import { createHarnessRuntime } from "../runtime/session.js";
+import { createHarnessRuntime, type HarnessRuntime } from "../runtime/session.js";
 import { HonchoConfigSchema, type HonchoStatus } from "../honcho/schemas.js";
 import { createInMemoryHonchoClient } from "../honcho/client.js";
 import { defineProviderRoute } from "../providers/registry.js";
@@ -42,6 +42,8 @@ export interface CapabilitySmokeOptions {
   readonly configPath?: string;
   readonly cwd?: string;
   readonly targetPath?: string;
+  /** Construct the runtime owned by this bounded smoke invocation. */
+  readonly runtimeFactory?: () => HarnessRuntime;
 }
 
 export interface CapabilitySmokeCompletionBlock {
@@ -136,12 +138,13 @@ export async function runCapabilitySmoke(options: CapabilitySmokeOptions = {}): 
     cwd
   });
 
-  const runtime = createHarnessRuntime();
-  const session = await runtime.startSession({
-    ...(options.configPath ? { configPath: options.configPath } : {}),
-    cwd,
-    ...(options.targetPath ? { targetPath: options.targetPath } : {})
-  });
+  const runtime = options.runtimeFactory?.() ?? createHarnessRuntime();
+  try {
+    const session = await runtime.startSession({
+      ...(options.configPath ? { configPath: options.configPath } : {}),
+      cwd,
+      ...(options.targetPath ? { targetPath: options.targetPath } : {})
+    });
 
   const toolIds = session.tools.map((tool) => tool.id);
   const repo = session.repo;
@@ -242,57 +245,60 @@ export async function runCapabilitySmoke(options: CapabilitySmokeOptions = {}): 
     handoffNeeded: "yes — Controller to confirm this slice and select the next fold-in target"
   };
 
-  return {
-    command: "capability-smoke",
-    generatedAt,
-    verdict,
-    summary,
-    runtime: runtimeInfo,
-    config: {
-      status: configResult.status,
-      verdict: configResult.verdict,
-      path: configResult.path,
-      diagnostics: [...configResult.diagnostics]
-    },
-    repo: {
-      resolved: repo !== null,
-      repoRoot: repo ? repo.repoRoot : null,
-      targetPath: repo ? repo.targetPath : null,
-      agentsChainCount: agentsChainRelativePaths.length,
-      agentsChainRelativePaths,
-      gitStatusSummary: repo ? summarizeGitStatus(repo.gitStatus) : "repository context unavailable",
-      gitStatus: repo ? repo.gitStatus : "repository context unavailable"
-    },
-    tools: { count: toolIds.length, ids: toolIds },
-    readOnlyToolRun,
-    honcho,
-    providerRouting: {
-      routeCount: routes.length,
-      catalogSource,
-      selectedRouteId: selectedRoute ? selectedRoute.routeId : null,
-      selectedRouteType: selectedRoute ? selectedRoute.routeType : null,
-      selectedRouteStatus: selectedRoute ? selectedRoute.status : null,
-      selectionKind: routePlan.choiceKind ?? null,
-      policyReason: routePlan.policyReason,
-      directFirstRank: selectedRoute ? selectedRoute.directFirstRank : null,
-      availabilitySummary,
-      routes: routes.map((route) => ({
-        routeId: route.routeId,
-        routeType: route.routeType,
-        status: route.status,
-        availability: availabilityByRouteId.get(route.routeId)?.status ?? "unknown",
-        missingEnvVarNames: availabilityByRouteId.get(route.routeId)?.missingEnvVarNames ?? [],
-        directFirstRank: route.directFirstRank,
-        allowedRouterFallback: route.allowedRouterFallback
-      }))
-    },
-    providerCli,
-    extensionHost,
-    toolParity: getToolParityVerdictCounts(),
-    sessionStatus: session.status,
-    sessionBlockers: [...session.blockers],
-    completionBlock
-  };
+    return {
+      command: "capability-smoke",
+      generatedAt,
+      verdict,
+      summary,
+      runtime: runtimeInfo,
+      config: {
+        status: configResult.status,
+        verdict: configResult.verdict,
+        path: configResult.path,
+        diagnostics: [...configResult.diagnostics]
+      },
+      repo: {
+        resolved: repo !== null,
+        repoRoot: repo ? repo.repoRoot : null,
+        targetPath: repo ? repo.targetPath : null,
+        agentsChainCount: agentsChainRelativePaths.length,
+        agentsChainRelativePaths,
+        gitStatusSummary: repo ? summarizeGitStatus(repo.gitStatus) : "repository context unavailable",
+        gitStatus: repo ? repo.gitStatus : "repository context unavailable"
+      },
+      tools: { count: toolIds.length, ids: toolIds },
+      readOnlyToolRun,
+      honcho,
+      providerRouting: {
+        routeCount: routes.length,
+        catalogSource,
+        selectedRouteId: selectedRoute ? selectedRoute.routeId : null,
+        selectedRouteType: selectedRoute ? selectedRoute.routeType : null,
+        selectedRouteStatus: selectedRoute ? selectedRoute.status : null,
+        selectionKind: routePlan.choiceKind ?? null,
+        policyReason: routePlan.policyReason,
+        directFirstRank: selectedRoute ? selectedRoute.directFirstRank : null,
+        availabilitySummary,
+        routes: routes.map((route) => ({
+          routeId: route.routeId,
+          routeType: route.routeType,
+          status: route.status,
+          availability: availabilityByRouteId.get(route.routeId)?.status ?? "unknown",
+          missingEnvVarNames: availabilityByRouteId.get(route.routeId)?.missingEnvVarNames ?? [],
+          directFirstRank: route.directFirstRank,
+          allowedRouterFallback: route.allowedRouterFallback
+        }))
+      },
+      providerCli,
+      extensionHost,
+      toolParity: getToolParityVerdictCounts(),
+      sessionStatus: session.status,
+      sessionBlockers: [...session.blockers],
+      completionBlock
+    };
+  } finally {
+    await runtime.close();
+  }
 }
 
 function resolveHonchoReadiness(): HonchoStatus {

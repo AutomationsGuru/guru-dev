@@ -35,7 +35,10 @@ const TOOL_VERBS: Readonly<Record<string, readonly MandateVerb[]>> = {
   get_task_output: [],
   kill_task: [],
   // Probe-only (registry lookups + PATH presence): never mutates.
-  resolve_capability_gap: []
+  resolve_capability_gap: [],
+  read_diagnostics: [],
+  session_todos: [],
+  manage_task: []
 };
 
 /** Read-only tools: never gated by the mandate (the always-allowed floor). */
@@ -56,17 +59,116 @@ export const MANDATE_READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   "operational.project.get",
   "operational.state.list",
   "operational.backlog.list",
-  "github.pr.status"
+  "github.pr.status",
+  "read_url_content",
+  "search_web",
+  "ask_question",
+  "read_diagnostics"
 ]);
 
+/**
+ * Non-rm destructive shell forms. `rm` is handled by {@link isDestructiveRm}
+ * so split/long flags (`rm -r -f`, `rm --recursive --force`) escalate the same
+ * way as the classic `rm -rf` cluster. Windows recursive deletes are handled by
+ * {@link isDestructiveWindowsDelete} (YOLO silent-allow hole on this host).
+ */
 const DESTRUCTIVE_PATTERNS: readonly RegExp[] = [
-  /\brm\s+-[a-z]*r[a-z]*f|\brm\s+-[a-z]*f[a-z]*r/i, // rm -rf / -fr
-  /\bgit\s+push\b[^\n]*--force(?!-with-lease)/i, // force push (not --force-with-lease)
+  // Force-push: --force (not the safer --force-with-lease).
+  /\bgit\s+push\b[^\n]*--force(?!-with-lease)/i,
+  // Force-push short form: `git push -f` / `git push origin main -f`.
+  /\bgit\s+push\b(?:\s+\S+)*?\s+-f(?:\s|$)/i,
   /\bgit\s+reset\s+--hard\b/i,
   /\bgit\s+clean\s+-[a-z]*f/i,
   /\b(mkfs|dd\s+if=|:\(\)\s*\{)/i,
   /\bshutdown\b|\breboot\b/i
 ];
+
+/**
+ * True when a shell command is a recursive+force `rm` in any common flag shape:
+ * `rm -rf`, `rm -fr`, `rm -r -f`, `rm -f -r`, `rm --recursive --force`.
+ * Recursive alone (`rm -r`) is NOT destructive-class (no force).
+ */
+export function isDestructiveRm(command: string): boolean {
+  if (!/\brm\b/i.test(command)) {
+    return false;
+  }
+  // Scan tokens after the first `rm` until a non-flag path argument.
+  const tokens = command.split(/\s+/u).filter((t) => t.length > 0);
+  const rmAt = tokens.findIndex((t) => t.toLowerCase() === "rm");
+  if (rmAt < 0) {
+    return false;
+  }
+  let recursive = false;
+  let force = false;
+  for (let i = rmAt + 1; i < tokens.length; i += 1) {
+    const token = tokens[i] as string;
+    if (token === "--") {
+      break;
+    }
+    if (token.startsWith("--")) {
+      const long = token.toLowerCase();
+      if (long === "--recursive" || long === "--dir" || long === "--directory") {
+        recursive = true;
+      } else if (long === "--force") {
+        force = true;
+      }
+      continue;
+    }
+    if (token.startsWith("-") && token.length > 1) {
+      // Short cluster: -rf / -fr / -R / -f / -rF etc.
+      const letters = token.slice(1);
+      if (/[rR]/u.test(letters)) {
+        recursive = true;
+      }
+      if (/[fF]/u.test(letters)) {
+        force = true;
+      }
+      continue;
+    }
+    // First non-flag token is the path/target — stop scanning flags.
+    break;
+  }
+  return recursive && force;
+}
+
+/**
+ * Windows / PowerShell recursive-delete shapes that must escalate like `rm -rf`.
+ * Under YOLO-by-default these were silent-allow (only Unix `rm` was hard-edged),
+ * so a model running on this Windows host could wipe trees without a prompt.
+ *
+ * Covered:
+ * - `del /s /q …`, `del /f /s /q …`
+ * - `rmdir /s /q …`, `rd /s /q …`
+ * - `Remove-Item -Recurse -Force …` (and `-r` / `-fo` short forms)
+ * - `ri -r -fo …` (Remove-Item alias)
+ */
+export function isDestructiveWindowsDelete(command: string): boolean {
+  // cmd.exe: del/erase with /S (recurse) — quiet or not, the tree is wiped.
+  if (/\b(?:del|erase)\b/i.test(command) && /\/s\b/i.test(command)) {
+    return true;
+  }
+  // cmd.exe: rmdir/rd with /S.
+  if (/\b(?:rmdir|rd)\b/i.test(command) && /\/s\b/i.test(command)) {
+    return true;
+  }
+  // PowerShell Remove-Item / ri: recurse + force in any flag shape.
+  if (/\b(?:remove-item|ri)\b/i.test(command)) {
+    const recurse = /(?:-recurse\b|-r\b)/i.test(command);
+    const force = /(?:-force\b|-fo\b)/i.test(command);
+    if (recurse && force) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isDestructiveCommand(command: string): boolean {
+  return (
+    isDestructiveRm(command) ||
+    isDestructiveWindowsDelete(command) ||
+    DESTRUCTIVE_PATTERNS.some((pattern) => pattern.test(command))
+  );
+}
 
 /** Secrets-adjacent file targets (.env, keys, npm auth, credentials). */
 // The boundary class includes shell redirects `>` and pipe `|` so `echo x>.env`,
@@ -109,7 +211,7 @@ export function verbsForCall(toolId: string, input: unknown): readonly MandateVe
 
   if (toolId === "bash" || toolId === "shell.command.run") {
     const command = String(record.command ?? record.cmd ?? "");
-    if (DESTRUCTIVE_PATTERNS.some((pattern) => pattern.test(command))) {
+    if (isDestructiveCommand(command)) {
       verbs.add("destructive");
     }
     if (SPEND_PATTERNS.some((pattern) => pattern.test(command))) {
@@ -144,10 +246,49 @@ export interface MandateContext {
   readonly yolo: boolean;
 }
 
-function pathCovers(grantPath: string, cwd: string): boolean {
+function pathCovers(grantPath: string, target: string): boolean {
   const g = resolve(grantPath);
-  const c = resolve(cwd);
-  return c === g || c.startsWith(`${g}/`) || c.startsWith(`${g}\\`);
+  const t = resolve(target);
+  return t === g || t.startsWith(`${g}/`) || t.startsWith(`${g}\\`);
+}
+
+/**
+ * Resolve the path a call actually touches for SPACE scoping. Prefer an explicit
+ * tool path (write/edit); fall back to cwd for shell/exec (cwd-relative ops).
+ * Without this, a SPACE grant was checked only against cwd — a write to an
+ * absolute path outside the grant still passed while the operator sat inside
+ * the granted tree (critic B13).
+ */
+export function resolveMandateTargetPath(toolId: string, input: unknown, cwd: string): string {
+  const record = typeof input === "object" && input !== null ? (input as Record<string, unknown>) : {};
+  const raw =
+    typeof record.path === "string" && record.path.length > 0
+      ? record.path
+      : typeof record.file === "string" && record.file.length > 0
+        ? record.file
+        : typeof record.file_path === "string" && record.file_path.length > 0
+          ? record.file_path
+          : "";
+  if (raw.length > 0 && (toolId === "write" || toolId === "edit" || toolId === "fs.edit.apply" || toolId === "read" || toolId === "bash" || toolId === "shell.command.run")) {
+    // Absolute targets resolve as-is; relative ones resolve under cwd.
+    return resolve(cwd, raw);
+  }
+
+  if (toolId === "bash" || toolId === "shell.command.run") {
+    const command = String(record.command ?? record.cmd ?? "");
+    // Bash-under-SPACE escape via absolute/relative paths in shell string.
+    // If the shell command names a path outside cwd (absolute or ../), treat it as the target.
+    // (Excludes /dev/null and nul).
+    const escapeMatch = command.match(/(?:^|[\s'"=|>])([a-zA-Z]:[\\/][^\s"'<>|]+|\/[^\s"'<>|]+|(?:\.\.[\\/])+[^\s"'<>|]*)/);
+    if (escapeMatch && escapeMatch[1]) {
+      const p = escapeMatch[1];
+      if (p !== "/dev/null" && p.toLowerCase() !== "nul") {
+        return resolve(cwd, p);
+      }
+    }
+  }
+
+  return resolve(cwd);
 }
 
 /**
@@ -160,6 +301,7 @@ function pathCovers(grantPath: string, cwd: string): boolean {
  */
 export function evaluateToolMandate(toolId: string, input: unknown, ctx: MandateContext): MandateDecision {
   const verbs = verbsForCall(toolId, input);
+  const targetPath = resolveMandateTargetPath(toolId, input, ctx.cwd);
 
   if (verbs.length === 0) {
     return { outcome: "allow", reason: "read-only tool (always allowed)", verbs };
@@ -167,7 +309,7 @@ export function evaluateToolMandate(toolId: string, input: unknown, ctx: Mandate
 
   // Deny-wins — beats a grant AND beats YOLO.
   for (const deny of ctx.state.denies) {
-    if (verbs.includes(deny.verb) && (!deny.path || pathCovers(deny.path, ctx.cwd))) {
+    if (verbs.includes(deny.verb) && (!deny.path || pathCovers(deny.path, targetPath))) {
       return { outcome: "deny", reason: `denied by rule (${deny.verb}${deny.path ? ` in ${deny.path}` : ""})`, verbs };
     }
   }
@@ -187,8 +329,10 @@ export function evaluateToolMandate(toolId: string, input: unknown, ctx: Mandate
   }
 
   // A covering grant that carries every required verb allows the call.
+  // SPACE scope is checked against the operation TARGET, not only cwd.
   for (const grant of ctx.state.grants) {
-    const inScope = grant.scope === "machine" || (grant.scope === "space" && grant.path && pathCovers(grant.path, ctx.cwd));
+    const inScope =
+      grant.scope === "machine" || (grant.scope === "space" && grant.path !== undefined && pathCovers(grant.path, targetPath));
     if (inScope && verbs.every((verb) => grant.verbs.includes(verb))) {
       return { outcome: "allow", reason: `granted by ${grant.scope}${grant.scope === "space" ? ` (${grant.path})` : ""} mandate`, verbs };
     }
