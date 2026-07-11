@@ -17,6 +17,18 @@ export function commandExists(name: string): boolean {
   }
 }
 
+const WINDOWS_COMMAND_SHIMS = new Set([
+  "npm", "npx", "pnpm", "pnpx", "yarn", "yarnpkg", "corepack",
+  "tsc", "tsx", "vitest", "eslint", "prettier"
+]);
+
+/** Whether a Windows command is a batch/.cmd shim that requires cmd.exe. */
+export function requiresWindowsCommandShim(executable: string): boolean {
+  const normalized = executable.replace(/\\/gu, "/").toLowerCase();
+  const name = normalized.slice(normalized.lastIndexOf("/") + 1);
+  return /\.(?:cmd|bat)$/u.test(name) || WINDOWS_COMMAND_SHIMS.has(name);
+}
+
 export type ReviewGateVerdict = "GREEN" | "YELLOW" | "RED";
 export type GateKind = "validation" | "review";
 export type GateStatus = "passed" | "failed";
@@ -240,9 +252,9 @@ export async function executeCommand(
   context: CommandExecutionContext
 ): Promise<CommandExecutionResult> {
   const startedAt = Date.now();
-  const [rawExecutable] = command;
+  const [executable, ...args] = command;
 
-  if (!rawExecutable) {
+  if (!executable) {
     return {
       exitCode: null,
       stdout: "",
@@ -251,12 +263,15 @@ export async function executeCommand(
     };
   }
 
-  // Never shell out via `cmd.exe /c <dynamic>` (CodeQL js/shell-command-injection-
-  // from-environment). Resolve to a real PE or node+cli.js — not a batch shim.
-  const { executable: resolvedExecutable, args } = resolveWindowsGateSpawn(command);
+  // Native executables (node/git/pwsh/etc.) stay shell:false on Windows too.
+  // Only known package-manager/tooling .cmd shims and explicit .cmd/.bat files
+  // need cmd.exe; their argv is metasyntax-checked by the bounded bash tool.
+  const needsCmdShell = process.platform === "win32" && requiresWindowsCommandShim(executable);
 
   return new Promise<CommandExecutionResult>((resolveExecution) => {
-    const child = spawn(resolvedExecutable, args, { cwd: context.cwd, shell: false, windowsHide: true });
+    const child = needsCmdShell
+      ? spawn("cmd.exe", ["/c", executable, ...args], { cwd: context.cwd, shell: false, windowsHide: true })
+      : spawn(executable, args, { cwd: context.cwd, shell: false, windowsHide: true });
     let stdout = "";
     let stderr = "";
     let settled = false;

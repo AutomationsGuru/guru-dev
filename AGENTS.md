@@ -18,7 +18,7 @@ This AGENTS.md is the DOX contract for `\\STORAGE\projects\guruharness\main` —
 
 # Work Guidance
 
-- Cold context: `../handoffs/CHECKPOINT-2026-07-10-usability-restore.md` then `CHECKPOINT-2026-07-10-usability-bugs.md` / this tree's `README.md` / `CHANGELOG.md`.
+- Cold context: `../handoffs/ASSESSMENT-2026-07-11-lane-fork-and-roadmap.md` then `CHECKPOINT-2026-07-11-linux-reliability-wave.md` / this tree's `README.md` / `CHANGELOG.md`.
 - Primary surfaces: `src/guru.ts`, `src/tui/*`, `src/session/agentSession.ts`, `src/model/agentTurn.ts`.
 - Verify locally before claiming green: `npm run typecheck`, focused `npx vitest run tests/guru tests/tui` (build optional for local confidence; shipping is reviewer-owned).
 - Keep durable plans/reports out of this drop-zone; handoffs live under `../handoffs/` or `R:\`.

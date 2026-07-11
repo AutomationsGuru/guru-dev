@@ -341,6 +341,23 @@ function wantsStreaming(context: FamilyContext): boolean {
   return context.onToken !== undefined || context.requireStreaming;
 }
 
+const INVALID_TOOL_ARGUMENTS = Symbol("invalid-tool-arguments");
+interface InvalidToolArguments {
+  readonly [INVALID_TOOL_ARGUMENTS]: true;
+}
+
+function parseToolArgumentsJson(text: string): unknown | InvalidToolArguments {
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return { [INVALID_TOOL_ARGUMENTS]: true };
+  }
+}
+
+function isInvalidToolArguments(value: unknown): value is InvalidToolArguments {
+  return typeof value === "object" && value !== null && INVALID_TOOL_ARGUMENTS in value;
+}
+
 /** Approval → execution → capped serialized result. Shared by all families. */
 async function performToolCall(context: FamilyContext, apiName: string, rawArguments: unknown): Promise<string> {
   const declaration = context.byApiName.get(apiName);
@@ -361,7 +378,13 @@ async function performToolCall(context: FamilyContext, apiName: string, rawArgum
     return block("Skipped because the turn was aborted.", "Tool call skipped because the turn was aborted.");
   }
 
-  const input = typeof rawArguments === "string" ? safeParseJson(rawArguments) : rawArguments ?? {};
+  const input = typeof rawArguments === "string" ? parseToolArgumentsJson(rawArguments) : rawArguments ?? {};
+  if (isInvalidToolArguments(input)) {
+    return block(
+      "Blocked because the model returned invalid JSON tool arguments.",
+      "Tool call arguments were invalid JSON. Rebuild the arguments and retry the tool call."
+    );
+  }
 
   if (!(await context.approveTool(declaration.toolId, input))) {
     return block(
@@ -450,14 +473,6 @@ function buildOutputPreview(output: unknown): string | undefined {
   const remainder = lines.length - 3;
 
   return shown.join("\n") + (remainder > 0 ? `\n… +${remainder} more line(s)` : "");
-}
-
-function safeParseJson(text: string): unknown {
-  try {
-    return JSON.parse(text) as unknown;
-  } catch {
-    return {};
-  }
 }
 
 function toolCallBudgetExhaustedMessage(): string {
@@ -1091,11 +1106,19 @@ async function streamChatCompletions(context: FamilyContext, body: Record<string
   let usage: { prompt_tokens?: number; completion_tokens?: number } | undefined;
   let streamInterrupted = false;
   let streamCompleted = false;
+  let sawFinishReason = false;
+  let toolCallsCommitted = false;
 
   try {
     for await (const event of sseEvents(response, context.signal, context.retry.provider.timeoutMs, context.routeId)) {
       if (event.data === "[DONE]") {
         streamCompleted = true;
+        // A few compatible providers omit finish_reason entirely. Their [DONE]
+        // marker is still an explicit commit, but it must not override a prior
+        // length/content_filter reason.
+        if (!sawFinishReason) {
+          toolCallsCommitted = true;
+        }
         break;
       }
       let chunk: unknown;
@@ -1119,7 +1142,9 @@ async function streamChatCompletions(context: FamilyContext, body: Record<string
       }
       const choice = parsed.choices?.[0];
       if (choice?.finish_reason) {
+        sawFinishReason = true;
         streamCompleted = true;
+        toolCallsCommitted = choice.finish_reason === "tool_calls" || choice.finish_reason === "function_call";
       }
       const delta = choice?.delta;
       if (!delta) {
@@ -1150,7 +1175,7 @@ async function streamChatCompletions(context: FamilyContext, body: Record<string
     }
     // Preserve visible text, but never execute a tool call assembled from a
     // response that ended before the provider's completion marker. Partial JSON
-    // used to fall through safeParseJson as {}, turning a socket reset into a
+    // used to degrade invalid JSON to {}, turning a socket reset into a
     // plausible but unintended action.
     streamInterrupted = true;
   }
@@ -1163,7 +1188,7 @@ async function streamChatCompletions(context: FamilyContext, body: Record<string
     streamInterrupted = true;
   }
 
-  const toolCallList = (streamInterrupted ? [] : [...toolCalls.entries()])
+  const toolCallList = (streamInterrupted || (toolCalls.size > 0 && !toolCallsCommitted) ? [] : [...toolCalls.entries()])
     .sort((left, right) => left[0] - right[0])
     // type:"function" is required when this reconstructed message is echoed back in
     // the next loop iteration — several providers (e.g. GLM error 1214) reject
@@ -1320,7 +1345,7 @@ async function streamAnthropicMessages(
     .sort((left, right) => left[0] - right[0])
     .map(([, acc]) =>
       acc.type === "tool_use"
-        ? { type: "tool_use", id: acc.id ?? "", name: acc.name ?? "", input: safeParseJson(acc.inputJson ?? "{}") }
+        ? { type: "tool_use", id: acc.id ?? "", name: acc.name ?? "", input: parseToolArgumentsJson(acc.inputJson ?? "{}") }
         : { type: "text", text: acc.text ?? "" }
     );
 

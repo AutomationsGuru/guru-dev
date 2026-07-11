@@ -3430,7 +3430,7 @@ export function attachComposer(deps: ComposerDeps): {
     if (visibleWidth(row) <= width) {
       return row;
     }
-    return clipVisible(row, width);
+    return clipVisible(row, width, { ellipsis: false });
   };
 
   const headerRows = (width: number): string[] => (deps.headerRows ? deps.headerRows(width) : []).map((row) => clampToWidth(row, width));

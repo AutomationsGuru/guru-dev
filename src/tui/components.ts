@@ -27,14 +27,15 @@ export function visibleWidth(text: string): number {
   return stringDisplayWidth(stripped);
 }
 
-/** ANSI-aware clip to a display-cell budget; ellipsis when cut (escapes kept). */
-export function clipVisible(text: string, width: number): string {
+/** ANSI-aware clip to a display-cell budget; ellipsis by default (escapes kept). */
+export function clipVisible(text: string, width: number, options: { readonly ellipsis?: boolean } = {}): string {
   if (visibleWidth(text) <= width) {
     return text;
   }
   let out = "";
   let used = 0;
-  const budget = Math.max(0, width - 1);
+  const withEllipsis = options.ellipsis ?? true;
+  const budget = Math.max(0, width - (withEllipsis ? 1 : 0));
   let clipped = false;
   for (let at = 0; at < text.length; ) {
     if (text[at] === "\x1b") {
@@ -64,7 +65,7 @@ export function clipVisible(text: string, width: number): string {
   }
   // Re-arm styling only when the clipped text actually used escapes (plain
   // no-color output must stay escape-free).
-  return `${out}…${out.includes("\x1b[") ? "\x1b[0m" : ""}`;
+  return `${out}${withEllipsis ? "…" : ""}${out.includes("\x1b[") ? "\x1b[0m" : ""}`;
 }
 
 
@@ -99,9 +100,11 @@ export function roundedBox(painter: Painter, lines: readonly string[], options: 
   const contentWidth = Math.min(maxContent, Math.max(options.width ?? 0, ...clipped.map(visibleWidth), options.title ? visibleWidth(options.title) + 4 : 0));
   const borderToken: keyof ThemeTokens = options.focused ? "accent" : "border";
   const edge = (text: string): string => painter.fg(borderToken, text);
+  const titleBudget = Math.max(0, contentWidth - 1);
+  const visibleTitle = options.title && titleBudget > 0 ? clipVisible(options.title, titleBudget) : undefined;
   // Title row chrome: "╭─ " + title + " " + dashes + "╮" must total contentWidth + 4.
-  const title = options.title
-    ? `${edge("╭─ ")}${painter.bold(painter.fg("muted", options.title))}${edge(` ${"─".repeat(Math.max(0, contentWidth - visibleWidth(options.title) - 1))}╮`)}`
+  const title = visibleTitle
+    ? `${edge("╭─ ")}${painter.bold(painter.fg("muted", visibleTitle))}${edge(` ${"─".repeat(Math.max(0, contentWidth - visibleWidth(visibleTitle) - 1))}╮`)}`
     : edge(`╭${"─".repeat(contentWidth + 2)}╮`);
 
   return [

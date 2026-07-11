@@ -6,6 +6,7 @@ import { HarnessConfigSchema } from "../../src/config/schema.js";
 import {
   createCommandGates,
   executeCommand,
+  requiresWindowsCommandShim,
   runReviewGates,
   type CommandExecutor
 } from "../../src/review/gates.js";
@@ -90,6 +91,14 @@ describe("runReviewGates", () => {
 });
 
 describe("executeCommand", () => {
+  it("uses cmd.exe only for known command shims, not native executables", () => {
+    expect(requiresWindowsCommandShim("npm")).toBe(true);
+    expect(requiresWindowsCommandShim("npx.cmd")).toBe(true);
+    expect(requiresWindowsCommandShim("node")).toBe(false);
+    expect(requiresWindowsCommandShim("git")).toBe(false);
+    expect(requiresWindowsCommandShim("pwsh")).toBe(false);
+  });
+
   it("should run a command without invoking a shell", async () => {
     const result = await executeCommand([process.execPath, "-e", "console.log('ok')"], {
       gate: {

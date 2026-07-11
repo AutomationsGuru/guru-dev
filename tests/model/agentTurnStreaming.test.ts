@@ -376,6 +376,84 @@ describe("streaming: partial response retention", () => {
     expect(executions).toBe(0);
   });
 
+  it.each(["length", "content_filter"])("does not authorize a tool call when finish_reason is %s", async (finishReason) => {
+    let executions = 0;
+    const result = await directAgentTurn(chatRoute, [{ role: "user", content: "inspect" }], {
+      env,
+      tools: [
+        {
+          id: "repo.context.resolve",
+          title: "Repo",
+          description: "Resolve repository context",
+          inputSchema: (await import("zod")).z.object({}).passthrough(),
+          outputSchema: (await import("zod")).z.object({}).passthrough(),
+          execute: () => ({})
+        }
+      ],
+      executeTool: async () => {
+        executions += 1;
+        return { toolId: "repo.context.resolve", status: "succeeded", startedAt: "", endedAt: "", durationMs: 0 };
+      },
+      approveTool: () => true,
+      onToken: () => undefined,
+      fetchImpl: (async () =>
+        sseResponse([
+          `data: {"choices":[{"finish_reason":"${finishReason}","delta":{"content":"visible partial","tool_calls":[{"index":0,"id":"c1","function":{"name":"repo__context__resolve","arguments":"{}"}}]}}]}`,
+          "data: [DONE]"
+        ])) as typeof fetch
+    });
+
+    expect(result.text).toBe("visible partial");
+    expect(result.toolCallCount).toBe(0);
+    expect(executions).toBe(0);
+  });
+
+  it("blocks malformed completed tool arguments and lets the model recover", async () => {
+    let requests = 0;
+    let approvals = 0;
+    let executions = 0;
+    const result = await directAgentTurn(chatRoute, [{ role: "user", content: "inspect" }], {
+      env,
+      tools: [
+        {
+          id: "repo.context.resolve",
+          title: "Repo",
+          description: "Resolve repository context",
+          inputSchema: (await import("zod")).z.object({}).passthrough(),
+          outputSchema: (await import("zod")).z.object({}).passthrough(),
+          execute: () => ({})
+        }
+      ],
+      executeTool: async () => {
+        executions += 1;
+        return { toolId: "repo.context.resolve", status: "succeeded", startedAt: "", endedAt: "", durationMs: 0 };
+      },
+      approveTool: () => {
+        approvals += 1;
+        return true;
+      },
+      onToken: () => undefined,
+      fetchImpl: (async () => {
+        requests += 1;
+        if (requests === 1) {
+          return sseResponse([
+            'data: {"choices":[{"finish_reason":"tool_calls","delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"repo__context__resolve","arguments":"{\\"cwd\\":"}}]}}]}',
+            "data: [DONE]"
+          ]);
+        }
+        return sseResponse(['data: {"choices":[{"finish_reason":"stop","delta":{"content":"recovered"}}]}', "data: [DONE]"]);
+      }) as typeof fetch
+    });
+
+    expect(result.text).toBe("recovered");
+    expect(result.toolCallCount).toBe(0);
+    expect(result.toolEvents).toEqual([
+      expect.objectContaining({ status: "blocked", detail: expect.stringMatching(/invalid JSON/iu) })
+    ]);
+    expect(approvals).toBe(0);
+    expect(executions).toBe(0);
+  });
+
   it("does not execute a streamed tool call after Ctrl+C aborts the turn", async () => {
     const controller = new AbortController();
     let approvals = 0;
