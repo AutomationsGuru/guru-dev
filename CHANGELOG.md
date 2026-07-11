@@ -8,9 +8,7 @@ All notable changes to GuruHarness are documented here.
 
 - **`manage_task` backend:** in-memory background task registry (list/status/kill/send_input); resets on `/new`.
 - **`read_diagnostics` tool:** path-filtered TypeScript diagnostics from repo typecheck (Cursor ReadLints parity).
-- **`session_todos` tool:** in-session task list (Cursor TodoWrite parity) — list/add/complete/remove; resets on `/new`.
-- **Grok-parity net tools (defaults, no keys):** `read_url_content` (HTTP fetch + HTML strip) and `search_web` (DuckDuckGo Instant Answer) work without injecting callbacks; offered in chat turns as read-only.
-- **`ask_question` TTY multi-choice prompt:** number keys / arrows / Enter; Space toggles multi-select. Shared interaction gate so mid-turn keys don't become steer drafts.
+- **`ask_question` TTY multi-choice prompt:** number keys / arrows / Enter; Space toggles multi-select. Shared interaction gate so mid-turn keys don't become steer drafts. (The wave's duplicate `session_todos` / `read_url_content` / `search_web` tools were superseded during lane reconciliation by the v1.4.2–v1.4.5 `todo_write`/`todo_list`, `web_fetch`, and `web_search` tools; `/new` resets the shared todo board.)
 - **`/export [path]`:** write the conversation transcript to markdown (default `.guru/exports/…`).
 - **`/copy [n]`:** copy the latest (or Nth-latest) assistant reply to the clipboard (clip / pbcopy / xclip), with print fallback.
 - **`/context`:** context-window footprint (tokens, ctx%, turns, route).
