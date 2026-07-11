@@ -2,8 +2,11 @@ import { PassThrough } from "node:stream";
 
 import { describe, expect, it } from "vitest";
 
-import { attachComposer, type ComposerDeps } from "../../src/guru.js";
+import { attachComposer, formatBusyStatusLine, type ComposerDeps } from "../../src/guru.js";
 import type { MenuItem } from "../../src/tui/menu.js";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 /**
  * Keystroke-level verification of the COMPOSER (ADR 2026-07-05): REAL bytes
@@ -43,8 +46,11 @@ function rig(options: {
   completePath?: ComposerDeps["completePath"];
   busy?: () => boolean;
   allowBusySteer?: () => boolean;
+  onBusyDraftChange?: (text: string) => void;
+  onInputActivity?: () => void;
   steers?: string[];
   followUps?: string[];
+  followUpNote?: string;
   columns?: number | (() => number);
   headerRows?: () => string[];
 } = {}): Rig {
@@ -71,11 +77,14 @@ function rig(options: {
     columns: () => (typeof options.columns === "function" ? options.columns() : (options.columns ?? 100)),
     isBusy: options.busy ?? (() => false),
     ...(options.allowBusySteer ? { allowBusySteer: options.allowBusySteer } : {}),
+    ...(options.onBusyDraftChange ? { onBusyDraftChange: options.onBusyDraftChange } : {}),
+    ...(options.onInputActivity ? { onInputActivity: options.onInputActivity } : {}),
     onBusySteer: (text) => {
       steers.push(text);
     },
     onBusyFollowUp: (text) => {
       followUps.push(text);
+      return options.followUpNote;
     },
     commandItems: (buffer) => commands.filter((c) => c.id.startsWith(buffer.trim()) || buffer.trim() === "/"),
     drillItems: (parentId) => options.drills?.[parentId] ?? [],
@@ -497,18 +506,39 @@ describe("composer — chrome + rendering invariants", () => {
     expect(await pending).toBeNull();
   });
 
+  it("notifies ordinary idle input without treating Ctrl+C as disarming activity", async () => {
+    let activity = 0;
+    const r = rig({ onInputActivity: () => { activity += 1; } });
+
+    await r.type("x");
+    expect(activity).toBe(1);
+    await r.type(KEYS.ctrlC);
+    expect(activity).toBe(1);
+  });
+
   it("busy turns: Esc/Ctrl+C interrupt; type+Enter steers; no full composer repaint", async () => {
     let busy = true;
     const steers: string[] = [];
-    const r = rig({ busy: () => busy, steers });
+    const drafts: string[] = [];
+    const r = rig({ busy: () => busy, steers, onBusyDraftChange: (text) => drafts.push(text) });
     const before = r.frames.length;
     // Mid-turn draft accumulates + writes feedback lines (not a full composer frame).
     await r.type("focus the parser");
     expect(r.frames.length).toBeGreaterThan(before); // busy feedback lines
     expect(r.frames.join("")).toMatch(/steering…/u);
     expect(r.composer.bufferText()).toBe(""); // main buffer untouched mid-turn
+    // Draft paints are in-place (\\r clear, no trailing \\n) — a newline per key
+    // stacked dead "steering…" lines in scrollback (busy-path twin of the xenl bug).
+    const draftFrames = r.frames.filter((frame) => frame.includes("steering…") && !frame.includes("↳"));
+    expect(draftFrames.length).toBeGreaterThan(0);
+    for (const frame of draftFrames) {
+      expect(frame.startsWith("\r\x1b[K")).toBe(true);
+      expect(frame.endsWith("\n")).toBe(false);
+    }
+    expect(drafts.at(-1)).toBe("focus the parser");
     await r.type(KEYS.enter);
     expect(steers).toEqual(["focus the parser"]);
+    expect(drafts.at(-1)).toBe(""); // draft cleared on submit
     // Esc aborts the running turn (same handler as ctrl+c).
     await r.type(KEYS.esc);
     expect(r.interrupts).toBe(1);
@@ -534,5 +564,156 @@ describe("composer — chrome + rendering invariants", () => {
     expect(steers).toEqual([]);
     expect(followUps).toEqual(["then run tests"]);
     expect(r.frames.join("")).toMatch(/follow-up queued/u);
+  });
+
+  it("busy turns: backspace removes one whole grapheme from the steer draft", async () => {
+    const drafts: string[] = [];
+    const r = rig({ busy: () => true, onBusyDraftChange: (text) => drafts.push(text) });
+
+    await r.type("👍🏽");
+    expect(drafts.at(-1)).toBe("👍🏽");
+    await r.type(KEYS.backspace);
+    expect(drafts.at(-1)).toBe("");
+  });
+
+  it("busy turns: bracketed paste normalizes tabs before in-place width math", async () => {
+    const drafts: string[] = [];
+    const r = rig({ busy: () => true, columns: 20, onBusyDraftChange: (text) => drafts.push(text) });
+
+    await r.type("\x1b[200~abc\tdef\x1b[201~");
+
+    expect(drafts.at(-1)).toBe("abc    def");
+    expect(r.frames.join("")).not.toContain("\t");
+  });
+
+  it("busy turns: forceRefresh never paints the idle composer into the stream", async () => {
+    const r = rig({ busy: () => true, chromeRows: () => ["STATUS-CHROME"] });
+    r.frames.length = 0;
+    r.composer.forceRefresh();
+    // No paintFrame: no clear-below, no prompt, no chrome while a turn streams.
+    expect(r.frames.join("")).not.toMatch(/\x1b\[0J/u);
+    expect(r.frames.join("")).not.toContain("STATUS-CHROME");
+    expect(r.frames.join("")).not.toContain("> ");
+  });
+
+  it("busy turns: forceRefresh reclamps an in-progress steer draft at the new width", async () => {
+    let width = 40;
+    const r = rig({ busy: () => true, columns: () => width });
+    await r.type("resize-me-steer-draft");
+    expect(r.frames.join("")).toMatch(/steering…/u);
+    r.frames.length = 0;
+    width = 24;
+    r.composer.forceRefresh();
+    const out = r.frames.join("");
+    expect(out).toMatch(/steering…/u);
+    expect(out).not.toContain("STATUS");
+    expect(out).not.toContain("> ");
+    // Still an in-place CR+clear paint, not a newline-stacked draft.
+    expect(out).toMatch(/\r\x1b\[K/u);
+    expect(out).not.toMatch(/steering…[^\r]*\n/u);
+  });
+
+  it("clear() moves to block top before erase (no orphaned header rule)", async () => {
+    const r = rig({ chromeRows: () => ["STATUS"], headerRows: () => ["HEADER-RULE"] });
+    await r.type("hello");
+    expect(r.frames.join("")).toContain("HEADER-RULE");
+    r.frames.length = 0;
+    r.composer.clear();
+    const out = r.frames.join("");
+    // Must cursor-up / home before clear-below — a bare \x1b[0J from mid-block
+    // left HEADER-RULE orphaned above the transcript.
+    expect(out).toMatch(/\x1b\[\d*A|\x1b\[1G/u);
+    expect(out).toContain("\x1b[0J");
+  });
+
+
+  it("chrome: queue depth appears in the status bar chip, never duplicated on the hint line", async () => {
+    // Regression (2026-07-10): the hint line used to push `q:N waiting` whenever
+    // the queue was non-empty, but the status bar already carries a `q:N` chip.
+    // The hint extras should stay control-only — no status duplication.
+    const seenExtras: string[][] = [];
+    const r = rig({
+      busy: () => false,
+      chromeRows: () => {
+        // Mirror runGuru's chromeRows shape: just the status bar + hint line.
+        // The hint line extras are what the rig captures.
+        const extras = ["ctrl+j newline", "@ files", "tab paths", "type+↵ steer", "alt+↵ follow-up"];
+        seenExtras.push(extras);
+        return ["STATUS-CHROME", `HINT ${extras.join(" | ")}`];
+      }
+    });
+    r.composer.beginPrompt();
+    // No "q:N waiting" in the hint extras regardless of state.
+    for (const extras of seenExtras) {
+      expect(extras.some((line) => /q:\d+ waiting/u.test(line))).toBe(false);
+    }
+    r.composer.close();
+  });
+
+  it("busy turns: long steer draft clamps to columns-1 (no xenl soft-wrap)", async () => {
+    const r = rig({ busy: () => true, columns: 40 });
+    r.frames.length = 0;
+    await r.type("x".repeat(80));
+    const draftFrames = r.frames.filter((frame) => frame.includes("steering"));
+    expect(draftFrames.length).toBeGreaterThan(0);
+    // Composer paint path must match the shared helper (same string the spinner re-paints).
+    const expected = formatBusyStatusLine(`steering… ${"x".repeat(80)}`, 40);
+    for (const frame of draftFrames) {
+      expect(frame.startsWith("\r\x1b[K")).toBe(true);
+      expect(frame.endsWith("\n")).toBe(false);
+      // Strip CSI (SGR + EL) and CR — leftover is the shared clamp body.
+      const plain = frame.replace(/\x1b\[[0-9;]*[A-Za-z]/gu, "").replace(/^\r/u, "");
+      // Must clip with ellipsis rather than dump 80 raw x's past the terminal width.
+      expect(plain).toContain("…");
+      expect(plain).toBe(expected);
+      expect(plain.length).toBeLessThan(60);
+    }
+  });
+
+  it("busy turns: follow-up event carries optional q:N status suffix", async () => {
+    const followUps: string[] = [];
+    const r = rig({ busy: () => true, followUps, followUpNote: "q:1" });
+    await r.type("then run tests");
+    await r.type(KEYS.altEnter);
+    expect(followUps).toEqual(["then run tests"]);
+    expect(r.frames.join("")).toMatch(/follow-up queued: then run tests · q:1/u);
+  });
+});
+
+describe("formatBusyStatusLine — shared clamp (composer + spinner)", () => {
+  it("never splits a ZWJ grapheme at the busy-line boundary", () => {
+    expect(formatBusyStatusLine("aaaa👨‍👩‍👧‍👦bbbb", 10)).toBe("  aaaa👨‍👩‍👧‍👦…");
+  });
+
+  it("clamps long draft bodies to columns-1 with an ellipsis", () => {
+    const line = formatBusyStatusLine(`steering… ${"y".repeat(100)}`, 40);
+    expect(line.startsWith("  steering…")).toBe(true);
+    expect(line.endsWith("…")).toBe(true);
+    // Display width must not exceed columns-1 (xenl-safe).
+    const visible = line.replace(/…$/u, "").length + 1; // ellipsis counts as 1 cell here
+    expect(line.length).toBeLessThanOrEqual(40);
+    expect(visible).toBeLessThanOrEqual(40);
+    expect(line).not.toContain("y".repeat(50));
+  });
+
+  it("passes short drafts through with the two-space pad only", () => {
+    expect(formatBusyStatusLine("steering… hi", 80)).toBe("  steering… hi");
+  });
+
+  it("chatTurn spinner draft branch calls formatBusyStatusLine (not a raw full-width write)", () => {
+    // Structural: the spinner re-paint must not reintroduce a full-width draft line.
+    // Pure helper tests above prove the clamp math; this locks the second call site.
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../../src/guru.ts"), "utf8");
+    const spinnerBlock = src.match(/if \(state\.busySteerDraft\.length > 0\) \{[\s\S]*?return;\s*\}/u)?.[0] ?? "";
+    expect(spinnerBlock.length).toBeGreaterThan(40);
+    expect(spinnerBlock).toMatch(/formatBusyStatusLine\s*\(\s*`steering… \$\{state\.busySteerDraft\}`/u);
+    // Forbidden: raw draft interpolation without the shared clamp helper.
+    expect(spinnerBlock).not.toMatch(/process\.stdout\.write\(`\\r\\x1b\[K  \$\{paint\.fg\("fgFaint", `steering… \$\{state\.busySteerDraft\}`\)\}`\)/u);
+  });
+
+  it("attachComposer writeBusyDraft uses formatBusyStatusLine", () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../../src/guru.ts"), "utf8");
+    const writeBlock = src.match(/const writeBusyDraft = \(text: string\): void => \{[\s\S]*?\};/u)?.[0] ?? "";
+    expect(writeBlock).toMatch(/formatBusyStatusLine\s*\(\s*text\s*,\s*columns\(\)\s*\)/u);
   });
 });

@@ -70,6 +70,28 @@ export class DirectChatError extends Error {
   }
 }
 
+function stripTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 47) {
+    end -= 1;
+  }
+  return end === value.length ? value : value.slice(0, end);
+}
+
+function normalizeProviderBaseUrl(providerId: string, baseUrl: string): string {
+  if (!providerId.startsWith("azure")) {
+    return stripTrailingSlashes(baseUrl);
+  }
+  let trimmed = stripTrailingSlashes(baseUrl);
+  const lower = trimmed.toLowerCase();
+  if (lower.endsWith("/openai/v1")) {
+    trimmed = trimmed.slice(0, -"/openai/v1".length);
+  } else if (lower.endsWith("/openai")) {
+    trimmed = trimmed.slice(0, -"/openai".length);
+  }
+  return `${stripTrailingSlashes(trimmed)}/openai/v1`;
+}
+
 // ---------------------------------------------------------------------------
 // Layered credential resolver (Foundation Wave PR 1, 2026-07-04)
 //
@@ -261,8 +283,25 @@ export function resolveRouteCredential(
   if (source.type === "guru-oauth") {
     const token = resolveOAuthTokenFor(route.providerId);
     if (token?.accessToken) {
+      // Check expiry (review 2026-07-08): an expired access token used to mark the
+      // lane usable, so /accounts showed "connected · no expiry" right up until a
+      // turn 401'd. Flag a past-expiry token as not-usable with a re-login hint.
+      const nowMs = Date.now();
+      if (typeof token.expiresAt === "number" && token.expiresAt <= nowMs) {
+        return {
+          usable: false,
+          source: "guru-oauth",
+          expiresAt: new Date(token.expiresAt).toISOString(),
+          reason: `Signed-in token expired. Run /login ${route.providerId.replace(/-direct$/u, "")} again to refresh.`
+        };
+      }
       return withCredentialValue(
-        { usable: true, source: "guru-oauth", reason: `Signed in via guru's own ${route.providerId} login (token in the encrypted vault).` },
+        {
+          usable: true,
+          source: "guru-oauth",
+          reason: `Signed in via guru's own ${route.providerId} login (token in the encrypted vault).`,
+          ...(typeof token.expiresAt === "number" ? { expiresAt: new Date(token.expiresAt).toISOString() } : {})
+        },
         token.accessToken
       );
     }
@@ -435,7 +474,7 @@ export async function directChat(
   }
 
   const baseUrl = (route.baseUrl?.startsWith("os.environ/") ? env[route.baseUrl.replace("os.environ/", "")] : route.baseUrl) ?? "";
-  const normalizedBase = baseUrl.replace(/\/+$/u, "");
+  const normalizedBase = normalizeProviderBaseUrl(route.providerId, baseUrl);
   const secretValue = credential.value ?? (credential.envName ? env[credential.envName] : undefined);
   const wire = resolveProviderWire(route, env);
   const authHeaders = (): Record<string, string> => {
@@ -574,7 +613,11 @@ async function postJson(
       signal
     });
   } catch (error) {
-    throw new DirectChatError(`Chat request failed: ${sanitizeErrorMessage(error)}`, { routeId });
+    // Classify the network-level failure (review 2026-07-08): the old message
+    // collapsed DNS/refused/bad-URL/timeout/abort all into "fetch failed", so a
+    // wrong baseUrl looked identical to a network outage or an operator cancel.
+    // Surface a specific, actionable reason instead.
+    throw new DirectChatError(`Chat request failed: ${classifyFetchError(error, url)}`, { routeId });
   }
 
   const text = await response.text();
@@ -586,10 +629,17 @@ async function postJson(
   }
 
   if (!response.ok) {
-    throw new DirectChatError(`Chat request failed with HTTP ${response.status}: ${sanitizeErrorMessage(extractErrorMessage(parsed))}`, {
-      routeId,
-      status: response.status
-    });
+    // Enrich auth/key errors with a setup hint (review 2026-07-08): a 401/403 on a
+    // direct-api route is almost always a missing/wrong key; on a guru-oauth route
+    // it's an expired session. Name the likely cause so the operator isn't guessing.
+    const hint = response.status === 401 || response.status === 403 ? authFailureHint(url) : "";
+    throw new DirectChatError(
+      `Chat request failed with HTTP ${response.status}: ${sanitizeErrorMessage(extractErrorMessage(parsed))}${hint ? ` — ${hint}` : ""}`,
+      {
+        routeId,
+        status: response.status
+      }
+    );
   }
 
   return parsed;
@@ -612,4 +662,62 @@ function extractErrorMessage(body: unknown): string {
     }
   }
   return "unknown error";
+}
+
+/**
+ * Turn a raw fetch throw into a specific, actionable reason (review 2026-07-08).
+ * The default Node "fetch failed" carries a `cause` (ENOTFOUND/ECONNREFUSED/etc.)
+ * that names the real problem; without this, a bad baseUrl looked identical to a
+ * network outage or an operator cancel.
+ */
+function classifyFetchError(error: unknown, url: string): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const cause = (error as { cause?: { code?: string; message?: string } } | undefined)?.cause;
+  const code = cause?.code;
+  // Operator/session abort — never a network problem.
+  if ((error as { name?: string })?.name === "AbortError" || /abort/iu.test(message)) {
+    return "request aborted (cancelled)";
+  }
+  // Bad/missing URL scheme — the most common baseUrl misconfiguration.
+  if (code === "ERR_INVALID_URL" || !/^https?:\/\//iu.test(url)) {
+    return `invalid request URL '${url.slice(0, 80)}' (baseUrl must start with http:// or https://)`;
+  }
+  // DNS resolution failure.
+  if (code === "ENOTFOUND" || /ENOTFOUND|getaddrinfo|resolve/iu.test(message)) {
+    const host = tryHost(url);
+    return `could not resolve host${host ? ` '${host}'` : ""} (check the route baseUrl or your network/DNS)`;
+  }
+  // Connection refused — service not running / wrong port.
+  if (code === "ECONNREFUSED" || /ECONNREFUSED|refused/iu.test(message)) {
+    const host = tryHost(url);
+    return `connection refused${host ? ` at ${host}` : ""} (is the service running / is the port right?)`;
+  }
+  // Connection reset / dropped mid-request.
+  if (code === "ECONNRESET" || /ECONNRESET|reset/iu.test(message)) {
+    return "connection reset by the provider (transient — retry, or check network stability)";
+  }
+  // Timeout (separate AbortController on a timeoutMs ceiling).
+  if ((error as { name?: string })?.name === "TimeoutError" || /timed?\s*out/iu.test(message)) {
+    return "request timed out (the provider didn't respond in time — raise retry.provider.timeoutMs or check connectivity)";
+  }
+  // Fallback: keep the underlying detail but drop the opaque "fetch failed" label.
+  return cause?.message && !/fetch failed/iu.test(cause.message) ? cause.message : sanitizeErrorMessage(error);
+}
+
+/** Extract host[:port] from a URL for error messages; empty on a bad URL. */
+function tryHost(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return "";
+  }
+}
+
+/** Hint for a 401/403: name the likely fix based on the URL host. */
+function authFailureHint(url: string): string {
+  const host = tryHost(url);
+  if (host.includes("127.0.0.1") || host.includes("localhost")) {
+    return "local service rejected the request (check its API key / model id)";
+  }
+  return "check the API key (env NAME) or run /login if this is an OAuth lane";
 }

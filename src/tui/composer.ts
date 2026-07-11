@@ -25,23 +25,36 @@ export function composerTopRule(painter: Painter, columns: number, modeLabel?: s
   return labelVisible > 0 ? `${rule}${painter.fg("accent", label)}` : rule;
 }
 
+/**
+ * Hint-line mode — drives which keys are actually live right now. Showing
+ * `ctrl+d exit` while a turn streams was wrong (Ctrl+D is ignored mid-busy),
+ * and showing `↵ run` mid-busy was wrong too (Enter steers, not runs).
+ */
+export type HintMode = "idle" | "menu" | "busy" | "approval";
+
+/** Static hint fragments for each mode — kept short, never chopped mid-word. */
+const HINT_FRAGMENTS: Readonly<Record<HintMode, readonly string[]>> = {
+  idle: ["/ commands", "↵ run", "ctrl+d exit"],
+  menu: ["↑↓ move", "↵ select", "tab accept", "esc close"],
+  busy: ["esc/ctrl+c interrupt", "↵ steer", "alt+↵ follow-up"],
+  // Mandate approval (y/a/n) is the common case; ask_question reuses the gate
+  // but prints its own option list so this line can stay approval-specific.
+  approval: ["[y] once · [a] always · [n/enter/esc] deny"]
+};
+
 /** The hint line under the composer: available keys, muted. Left-aligned; trims to fit. */
 export function composerHintLine(
   painter: Painter,
   extras: readonly string[] = [],
-  columns?: number,
-  busy = false
+  options: { readonly columns?: number; readonly mode?: HintMode } = {}
 ): string {
-  const effectiveColumns = columns ?? process.stdout.columns ?? Number.POSITIVE_INFINITY;
-  // esc interrupt is LIVE: mid-turn Esc/Ctrl+C abort the running agentSession.
-  const base = busy
-    ? ["esc/ctrl+c interrupt", "↵ steer", "ctrl+d exit"]
-    : ["/ commands", "↵ run", "esc/ctrl+c interrupt", "ctrl+d exit"];
-  const hints = [...base, ...extras];
+  const mode: HintMode = options.mode ?? "idle";
+  const columns = options.columns ?? process.stdout.columns ?? Number.POSITIVE_INFINITY;
+  const hints = [...HINT_FRAGMENTS[mode], ...extras];
   // The full row is ~130 cells with the composer extras — on narrower terminals
   // the paint-time clamp chopped it MID-WORD ("type+↵ ste…"). Drop whole
   // trailing hints instead so what shows is always readable.
-  const budget = Math.max(16, effectiveColumns - 1);
+  const budget = Math.max(16, columns - 1);
   const kept: string[] = [];
   let used = 2; // leading indent
   for (const hint of hints) {

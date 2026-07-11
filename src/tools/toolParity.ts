@@ -304,6 +304,28 @@ export const TOOL_PARITY_ROWS: readonly ToolParityRow[] = [
     ownerModule: "src/tools/builtins/askQuestionTool.ts",
     notes: "Operator multi-choice Q&A (TTY readline default; inject onAsk for rich TUI). Headless returns interactive:false with empty answers.",
     nextAction: "Optional: native composer overlay instead of readline when TUI is live."
+  },
+  {
+    toolId: "schedule",
+    category: "base-tool",
+    requirementIds: ["FR-08", "TR-19"],
+    currentGuruHarnessToolIds: ["schedule"],
+    status: "native-equivalent",
+    verdict: "GREEN",
+    ownerModule: "src/tools/builtins/scheduleTool.ts",
+    notes: "Added to bridge asynchronous timer and cron parity.",
+    nextAction: "Parity met."
+  },
+  {
+    toolId: "manage_task",
+    category: "base-tool",
+    requirementIds: ["FR-08", "TR-19"],
+    currentGuruHarnessToolIds: ["manage_task"],
+    status: "native-equivalent",
+    verdict: "GREEN",
+    ownerModule: "src/tools/builtins/manageTaskTool.ts",
+    notes: "Added to bridge background task management parity.",
+    nextAction: "Parity met."
   }
 ];
 

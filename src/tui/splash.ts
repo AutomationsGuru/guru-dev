@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { gradientLine } from "./gradient.js";
-import { compactMark } from "./components.js";
+import { compactMark, visibleWidth } from "./components.js";
 import type { Painter } from "./theme.js";
 
 /**
@@ -149,7 +149,14 @@ export function renderSplash(painter: Painter, info: SplashInfo, columns: number
     const mark = renderAgMark(painter);
     if (mark !== null) {
       const wordmark = gradientLine(painter, [...painter.tokens.banner], "guru harness");
-      const title = `${compactMark(painter)}  ${wordmark}  ${painter.fg("fgFaint", `v${info.version} · ${info.themeName} · node ${info.node}`)}`;
+      // Fit the title to the window: the full line is ~69 cells and wrapped
+      // mid-splash on 44–68-col terminals. Drop detail segments until it fits.
+      const candidates = [
+        `${compactMark(painter)}  ${wordmark}  ${painter.fg("fgFaint", `v${info.version} · ${info.themeName} · node ${info.node}`)}`,
+        `${compactMark(painter)}  ${painter.fg("fgFaint", `v${info.version} · node ${info.node}`)}`,
+        `${compactMark(painter)}  ${painter.fg("fgFaint", `v${info.version}`)}`
+      ];
+      const title = candidates.find((line) => visibleWidth(line) <= columns - 1) ?? (candidates[candidates.length - 1] as string);
       return `${topBand}\n${mark.join("\n")}\n\n${title}\n${bottomBand}\n`;
     }
   }

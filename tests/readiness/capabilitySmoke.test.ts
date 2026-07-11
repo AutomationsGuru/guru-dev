@@ -62,9 +62,7 @@ describe("capability-smoke", () => {
     expect(parsed.runtime?.name).toBe("GuruHarness");
     expect(parsed.config).toMatchObject({ status: "loaded", verdict: "GREEN" });
     expect(parsed.repo?.resolved).toBe(true);
-    // main is a pristine runtime package (no AGENTS.md by design) — the walked chain is
-    // empty here; GREEN-path chain coverage lives in tests/maintenance/audit.test.ts.
-    expect(parsed.repo?.agentsChainCount).toBe(0);
+    expect(parsed.repo?.agentsChainCount).toBe(1);
     expect(parsed.repo?.repoRoot).toBe(repoRoot);
   });
 

@@ -3,16 +3,16 @@ import { describe, expect, it } from "vitest";
 import { detectSuitIntent, formatTodayLine } from "../../src/guru/launchContext.js";
 
 describe("formatTodayLine — the date the model gets (§17 scenario 14)", () => {
-  it("formats a stable UTC date line with the ISO date", () => {
-    const line = formatTodayLine(new Date(Date.UTC(2026, 6, 5)));
+  it("formats the operator's LOCAL calendar date with a matching ISO date (not UTC)", () => {
+    const line = formatTodayLine(new Date(2026, 6, 5, 20, 30)); // 5 July, local evening
     expect(line).toContain("5 July 2026");
     expect(line).toContain("(2026-07-05)");
     expect(line.startsWith("Today is ")).toBe(true);
   });
 
   it("names the weekday", () => {
-    // 2026-01-01 is a Thursday (UTC).
-    expect(formatTodayLine(new Date(Date.UTC(2026, 0, 1)))).toContain("Thursday");
+    // 2026-01-01 is a Thursday (local construction).
+    expect(formatTodayLine(new Date(2026, 0, 1))).toContain("Thursday");
   });
 });
 

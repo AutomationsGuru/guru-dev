@@ -35,6 +35,7 @@ const defaultEstimate = (text: string): number => Math.ceil(text.length / 4);
 
 /** Matches `@path` tokens at a word boundary (start or after whitespace). */
 const REFERENCE_PATTERN = /(^|\s)@([^\s@]+)/gu;
+const TRAILING_REFERENCE_PUNCTUATION = /[,.:)]+$/u;
 
 interface Reference {
   readonly raw: string; // the "@path" token
@@ -46,7 +47,9 @@ function findReferences(text: string): readonly Reference[] {
   const refs: Reference[] = [];
   for (const match of text.matchAll(REFERENCE_PATTERN)) {
     const lead = match[1] ?? "";
-    const rel = match[2] ?? "";
+    // Sentence punctuation is not part of the path. Leave it outside `raw` so
+    // reverse splicing naturally preserves it after the expanded block.
+    const rel = (match[2] ?? "").replace(TRAILING_REFERENCE_PUNCTUATION, "");
     if (rel.length === 0) {
       continue;
     }

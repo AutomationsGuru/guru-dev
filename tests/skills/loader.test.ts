@@ -58,7 +58,7 @@ describe("discoverSkills", () => {
     expect(catalog.skills[0]?.allowedTools).toEqual(["Read", "Write"]);
   });
 
-  it("should reject duplicate skill ids", () => {
+  it("first-wins on duplicate skill ids (keeps the catalog, drops the dup with a diagnostic) (review 2026-07-08)", () => {
     const root = createSkillTree();
     mkdirSync(join(root, "skills", "duplicate"));
     writeFileSync(
@@ -66,7 +66,12 @@ describe("discoverSkills", () => {
       "---\nname: typescript-dev\ndescription: Duplicate.\n---\n# Duplicate\n"
     );
 
-    expect(() => discoverSkills({ directories: ["skills"], cwd: root })).toThrow("Duplicate skill id(s): typescript-dev");
+    // Old behavior threw and wiped the WHOLE catalog. Now the first-seen skill
+    // wins, the duplicate is dropped, and a diagnostic surfaces — the catalog
+    // stays usable.
+    const catalog = discoverSkills({ directories: ["skills"], cwd: root });
+    expect(catalog.skills.filter((s) => s.id === "typescript-dev")).toHaveLength(1);
+    expect(catalog.diagnostics.some((d) => d.includes("Duplicate skill id 'typescript-dev'"))).toBe(true);
   });
 });
 

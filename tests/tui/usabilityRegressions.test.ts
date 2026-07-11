@@ -62,16 +62,26 @@ describe("roundedBox — clamps to maxWidth so one long line cannot shatter the 
     const rows = roundedBox(paint, [wide], {});
     expect(strip(rows[1] ?? "")).toContain(wide);
   });
+
+  it("clips only at grapheme boundaries", () => {
+    const family = "👨‍👩‍👧‍👦";
+    const rows = roundedBox(paint, [`${family}abc`], { maxWidth: 8 });
+    const content = strip(rows[1] ?? "");
+
+    expect(content).toContain(family);
+    expect(content).toContain("…");
+    expect(visibleWidth(rows[1] ?? "")).toBeLessThanOrEqual(8);
+  });
 });
 
 describe("composerHintLine — drops whole hints on narrow terminals, never chops mid-word", () => {
   it("keeps the hint list readable at 80 columns", () => {
     const extras = ["ctrl+j newline", "@ files", "tab paths", "type+↵ steer", "alt+↵ follow-up"];
-    const line = strip(composerHintLine(paint, extras, 80));
+    const line = strip(composerHintLine(paint, extras, { columns: 80 }));
     expect(visibleWidth(line)).toBeLessThanOrEqual(79);
     // Whatever survived must be complete items joined by the separator.
     const shown = line.trim().split(" · ");
-    const all = ["/ commands", "↵ run", "esc/ctrl+c interrupt", "ctrl+d exit", ...extras];
+    const all = ["/ commands", "↵ run", "ctrl+d exit", ...extras];
     for (const item of shown) {
       expect(all).toContain(item);
     }
@@ -79,22 +89,41 @@ describe("composerHintLine — drops whole hints on narrow terminals, never chop
 
   it("wide terminals still get the full list", () => {
     const extras = ["ctrl+j newline", "@ files", "tab paths", "type+↵ steer", "alt+↵ follow-up"];
-    const line = strip(composerHintLine(paint, extras, 200));
+    const line = strip(composerHintLine(paint, extras, { columns: 200 }));
     for (const item of extras) {
       expect(line).toContain(item);
     }
   });
 
   it("always shows at least the first hint even on absurdly narrow widths", () => {
-    const line = strip(composerHintLine(paint, [], 10));
+    const line = strip(composerHintLine(paint, [], { columns: 10 }));
     expect(line).toContain("/ commands");
   });
 
-  it("shows interrupt-first hints when busy=true, omits idle run command", () => {
-    const line = strip(composerHintLine(paint, [], 80, true));
+  it("shows interrupt-first hints when busy, omits idle run command and idle exit", () => {
+    // Busy mode swaps the static hints — Enter steers (not runs), Ctrl+D is
+    // ignored mid-busy so it must NOT be advertised as "exit".
+    const line = strip(composerHintLine(paint, [], { columns: 80, mode: "busy" }));
     expect(line).toContain("esc/ctrl+c interrupt");
     expect(line).toContain("↵ steer");
     expect(line).not.toContain("/ commands");
     expect(line).not.toContain("↵ run");
+    expect(line).not.toContain("ctrl+d exit");
+  });
+
+  it("menu mode advertises navigation keys, not run/exit", () => {
+    const line = strip(composerHintLine(paint, [], { columns: 80, mode: "menu" }));
+    expect(line).toContain("↑↓ move");
+    expect(line).toContain("↵ select");
+    expect(line).not.toContain("↵ run");
+    expect(line).not.toContain("ctrl+d exit");
+  });
+
+  it("approval mode shows y/N/a semantics, no composer run/exit keys", () => {
+    const line = strip(composerHintLine(paint, [], { columns: 80, mode: "approval" }));
+    expect(line).toContain("[y] once");
+    expect(line).toContain("[n/enter/esc] deny");
+    expect(line).not.toContain("↵ run");
+    expect(line).not.toContain("ctrl+d exit");
   });
 });

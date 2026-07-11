@@ -125,7 +125,47 @@ async function getJson(url: URL, path: string): Promise<JsonResponse> {
 describe("startHarnessApiServer", () => {
   // Session start + tool-run + inspect chains are integration-heavy; allow headroom under parallel CI load.
   const integrationTimeoutMs = 30_000;
+  it("closes an internally constructed runtime with the HTTP server", async () => {
+    const runtime = createHarnessRuntime();
+    const closeRuntime = runtime.close.bind(runtime);
+    let closeCalls = 0;
+    runtime.close = async () => {
+      closeCalls += 1;
+      await closeRuntime();
+    };
+    const server = await startHarnessApiServer({
+      port: 0,
+      host: "127.0.0.1",
+      runtimeFactory: () => runtime
+    });
+
+    await server.close();
+
+    expect(closeCalls).toBe(1);
+    await expect(runtime.startSession()).rejects.toThrow("Harness runtime is closed");
+  });
+
+  it("leaves an injected runtime open when the HTTP server closes", async () => {
+    const runtime = createHarnessRuntime();
+    const closeRuntime = runtime.close.bind(runtime);
+    let closeCalls = 0;
+    runtime.close = async () => {
+      closeCalls += 1;
+      await closeRuntime();
+    };
+    const server = await startHarnessApiServer({ port: 0, host: "127.0.0.1", runtime });
+
+    await server.close();
+
+    expect(closeCalls).toBe(0);
+    const session = await runtime.startSession({ cwd: repoRoot });
+    expect(session.status).toBe("ready");
+    await runtime.close();
+  });
+
   it("serves plan and direction routes and routes run/session-start payloads", async () => {
+    let receivedPlanRequest: unknown;
+    let receivedDirectionRequest: unknown;
     let receivedSessionRequest: unknown;
     let receivedSessionListRequest: unknown;
     let receivedSessionInspectRequest: unknown;
@@ -137,8 +177,16 @@ describe("startHarnessApiServer", () => {
       port: 0,
       host: "127.0.0.1",
       handlers: {
-        buildPlan: async () => ({ route: "plan", constraints: ["api-surface"] }),
-        directionCheck: async () => ({ route: "direction", verdict: "GREEN" }),
+        buildPlan: async (request) => {
+          receivedPlanRequest = request;
+
+          return { route: "plan", constraints: ["api-surface"], request };
+        },
+        directionCheck: async (request) => {
+          receivedDirectionRequest = request;
+
+          return { route: "direction", verdict: "GREEN", request };
+        },
         startSession: async (request) => {
           receivedSessionRequest = request;
 
@@ -175,18 +223,20 @@ describe("startHarnessApiServer", () => {
 
     const url = new URL(server.url);
 
-    const planResponse = await getJson(url, "/self-build-plan");
+    const planResponse = await getJson(url, "/self-build-plan?config=/d/guru/config.json&cwd=/c/tmp/project");
     expect(planResponse.status).toBe(200);
-    expect(planResponse.body).toMatchObject({ route: "plan", constraints: ["api-surface"] });
+    expect(planResponse.body).toMatchObject({ route: "plan", constraints: ["api-surface"], request: { configPath: "D:/guru/config.json", cwd: "C:/tmp/project" } });
+    expect(receivedPlanRequest).toMatchObject({ configPath: "D:/guru/config.json", cwd: "C:/tmp/project" });
 
-    const directionResponse = await getJson(url, "/direction-check");
+    const directionResponse = await getJson(url, "/direction-check?config=/e/guru/config.json&cwd=/f/workspace");
     expect(directionResponse.status).toBe(200);
-    expect(directionResponse.body).toMatchObject({ route: "direction", verdict: "GREEN" });
+    expect(directionResponse.body).toMatchObject({ route: "direction", verdict: "GREEN", request: { configPath: "E:/guru/config.json", cwd: "F:/workspace" } });
+    expect(receivedDirectionRequest).toMatchObject({ configPath: "E:/guru/config.json", cwd: "F:/workspace" });
 
     const sessionResponse = await postJson(url, "/session-start", {
-      configPath: "api-config.json",
-      cwd: "/tmp/project",
-      targetPath: "/tmp/project/src",
+      configPath: "/g/api-config.json",
+      cwd: "/c/tmp/project",
+      targetPath: "/d/tmp/project/src",
       taskId: "api-tui-surfaces",
       skillIds: ["one", "two"]
     });
@@ -194,17 +244,17 @@ describe("startHarnessApiServer", () => {
     expect(sessionResponse.body).toMatchObject({
       route: "session",
       request: {
-        configPath: "api-config.json",
-        cwd: "/tmp/project",
-        targetPath: "/tmp/project/src",
+        configPath: "G:/api-config.json",
+        cwd: "C:/tmp/project",
+        targetPath: "D:/tmp/project/src",
         taskId: "api-tui-surfaces",
         skillIds: ["one", "two"]
       }
     });
     expect(receivedSessionRequest).toMatchObject({
-      configPath: "api-config.json",
-      cwd: "/tmp/project",
-      targetPath: "/tmp/project/src",
+      configPath: "G:/api-config.json",
+      cwd: "C:/tmp/project",
+      targetPath: "D:/tmp/project/src",
       taskId: "api-tui-surfaces",
       skillIds: ["one", "two"]
     });
@@ -225,6 +275,9 @@ describe("startHarnessApiServer", () => {
     expect(receivedSessionContinuationRequest).toMatchObject({ sessionId: "session-123" });
 
     const toolRunResponse = await postJson(url, "/tool-run", {
+      configPath: "/h/tool-config.json",
+      cwd: "/i/tool-cwd",
+      targetPath: "/j/tool-target",
       taskId: "api-tui-surfaces",
       toolId: "repo.context.resolve",
       input: { cwd: "/c/tmp/project", body: "literal /c/tmp/project content" },
@@ -234,6 +287,9 @@ describe("startHarnessApiServer", () => {
     expect(toolRunResponse.body).toMatchObject({
       route: "tool-run",
       request: {
+        configPath: "H:/tool-config.json",
+        cwd: "I:/tool-cwd",
+        targetPath: "J:/tool-target",
         taskId: "api-tui-surfaces",
         toolId: "repo.context.resolve",
         input: { cwd: "C:/tmp/project", body: "literal /c/tmp/project content" },
@@ -241,6 +297,9 @@ describe("startHarnessApiServer", () => {
       }
     });
     expect(receivedToolRunRequest).toMatchObject({
+      configPath: "H:/tool-config.json",
+      cwd: "I:/tool-cwd",
+      targetPath: "J:/tool-target",
       taskId: "api-tui-surfaces",
       toolId: "repo.context.resolve",
       input: { cwd: "C:/tmp/project", body: "literal /c/tmp/project content" },
@@ -248,6 +307,9 @@ describe("startHarnessApiServer", () => {
     });
 
     const runResponse = await postJson(url, "/run", {
+      configPath: "/k/run-config.json",
+      cwd: "/l/run-cwd",
+      targetPath: "/m/run-target",
       taskId: "api-tui-surfaces",
       objective: "Surface API run",
       maxPlannerSteps: 2,
@@ -265,6 +327,9 @@ describe("startHarnessApiServer", () => {
     expect(runResponse.body).toMatchObject({
       route: "run",
       request: {
+        configPath: "K:/run-config.json",
+        cwd: "L:/run-cwd",
+        targetPath: "M:/run-target",
         taskId: "api-tui-surfaces",
         objective: "Surface API run",
         maxPlannerSteps: 2,
@@ -278,6 +343,9 @@ describe("startHarnessApiServer", () => {
       }
     });
     expect(receivedRunRequest).toMatchObject({
+      configPath: "K:/run-config.json",
+      cwd: "L:/run-cwd",
+      targetPath: "M:/run-target",
       taskId: "api-tui-surfaces",
       objective: "Surface API run",
       maxPlannerSteps: 2,

@@ -1,5 +1,5 @@
 const PATH_FIELD_NAMES = new Set(["configPath", "cwd", "repoRoot", "rootPath", "targetPath"]);
-const MSYS_ABSOLUTE_PATH_PATTERN = /^\/([A-Za-z])\/(.*)$/u;
+const MSYS_ABSOLUTE_PATH_PATTERN = /^\/([A-Za-z])(?:\/(.*))?$/u;
 
 export function normalizeMsysPath(value: string): string {
   const match = MSYS_ABSOLUTE_PATH_PATTERN.exec(value);
@@ -11,7 +11,7 @@ export function normalizeMsysPath(value: string): string {
   const driveLetter = match[1] ?? "";
   const rest = match[2] ?? "";
 
-  return `${driveLetter.toUpperCase()}:/${rest}`;
+  return rest.length > 0 ? `${driveLetter.toUpperCase()}:/${rest}` : `${driveLetter.toUpperCase()}:/`;
 }
 
 export function normalizeKnownPathFields<T>(value: T): T {

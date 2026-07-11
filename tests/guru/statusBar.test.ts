@@ -50,10 +50,11 @@ describe("buildStatusBar — full-width indicator bar", () => {
     }
   });
 
-  it("overflows (never truncates the model) when the terminal is too narrow", () => {
+  it("stays within columns-1 and preserves a recognizable model on narrow terminals", () => {
     const bar = strip(buildStatusBar(baseState(), 40));
-    expect(visibleWidth(bar)).toBeGreaterThan(40); // content preserved, wraps naturally
-    expect(bar).toContain("zai-coding-cn/glm-5.2");
+    expect(visibleWidth(bar)).toBeLessThanOrEqual(39);
+    expect(bar).toContain("zai");
+    expect(bar).toContain("…");
   });
 
   it("shows context% and session tokens", () => {

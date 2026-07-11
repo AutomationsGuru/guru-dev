@@ -50,7 +50,10 @@ describe("recall — BM25 semantic ranking (§7 Smart Connections)", () => {
     expect(hits.map((h) => h.id)).toEqual(["aaa", "bbb"]); // equal score → id asc
   });
 
-  it("tokenizeRecall lowercases and drops ≤2-char tokens", () => {
-    expect(tokenizeRecall("The OAuth  Flow, at 2am!")).toEqual(["the", "oauth", "flow", "2am"]);
+  it("tokenizeRecall lowercases, keeps >=2-char tokens, drops single chars (review 2026-07-08)", () => {
+    // >= 2 so 2-char meaningful terms (db, js, go) are searchable; single letters stay excluded.
+    expect(tokenizeRecall("The OAuth  Flow, at 2am!")).toEqual(["the", "oauth", "flow", "at", "2am"]);
+    expect(tokenizeRecall("db js go ai")).toEqual(["db", "js", "go", "ai"]);
+    expect(tokenizeRecall("a I x")).toEqual([]);
   });
 });

@@ -162,6 +162,27 @@ export class AgentSession {
   queueDepth(): number {
     return this.steerQueue.length;
   }
+  /** Steer-kind items only (excludes follow-ups) — used to continue a turn after late steers. */
+  pendingSteerCount(): number {
+    return this.steerQueue.filter((item) => item.kind === "steer").length;
+  }
+  /**
+   * Drop pending steer-kind items (keep follow-ups). Used when a turn is aborted so
+   * a cancelled nudge does not attach to the next unrelated user message.
+   */
+  discardPendingSteers(): readonly string[] {
+    const dropped: string[] = [];
+    for (let i = 0; i < this.steerQueue.length; ) {
+      const item = this.steerQueue[i] as QueuedSteer;
+      if (item.kind === "steer") {
+        dropped.push(item.text);
+        this.steerQueue.splice(i, 1);
+      } else {
+        i += 1;
+      }
+    }
+    return dropped;
+  }
   /**
    * Interrupt the RUNNING turn (§17 S13). Trips the in-flight abort signal so the
    * turn loop stops at its next step boundary and returns the partial so far.
@@ -264,6 +285,21 @@ export class AgentSession {
     const harnessSession = driver.session ?? this.deps.session;
     const readHistory = (): ChatTurnMessage[] => (driver.getHistory ? driver.getHistory() : this.history);
 
+    // Drain steers that queued while idle (or after a turn that never pulled them).
+    // In-turn steers on no-tool answers are now continued inside agentTurn; this
+    // boundary drain covers steers typed between turns. prompt() drains before
+    // calling driveTurn, so the SDK path is unchanged when the queue is already empty.
+    for (let i = 0; i < this.steerQueue.length; ) {
+      const item = this.steerQueue[i] as QueuedSteer;
+      if (item.kind === "steer") {
+        this.steerQueue.splice(i, 1);
+        readHistory().push({ role: "system", content: `[steering] ${item.text}` });
+        this.emit("steer.injected", { text: item.text, kind: "steer" });
+      } else {
+        i += 1;
+      }
+    }
+
     const messages = driver.prepareMessages ? driver.prepareMessages(readHistory()) : readHistory();
     const modelIdOverride = driver.modelIdOverride ?? this.deps.modelIdOverride ?? "";
     const retry = driver.retry ?? this.deps.retry;
@@ -299,7 +335,13 @@ export class AgentSession {
         }
       });
 
-      readHistory().push({ role: "assistant", content: result.text });
+      // NEVER push an empty assistant message (abort before the first token, or a
+      // provider returning an empty reply): strict providers (anthropic-messages)
+      // reject empty message content on EVERY subsequent request, so one aborted
+      // turn used to poison the whole session into a 400 loop.
+      if (result.text.length > 0) {
+        readHistory().push({ role: "assistant", content: result.text });
+      }
       this.usage.turns += 1;
       this.usage.inputTokens += result.usage?.inputTokens ?? 0;
       this.usage.outputTokens += result.usage?.outputTokens ?? 0;

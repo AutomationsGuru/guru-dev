@@ -2,6 +2,59 @@
 
 All notable changes to GuruHarness are documented here.
 
+## [Unreleased]
+
+### Added
+
+- **`manage_task` backend:** in-memory background task registry (list/status/kill/send_input); resets on `/new`.
+- **`read_diagnostics` tool:** path-filtered TypeScript diagnostics from repo typecheck (Cursor ReadLints parity).
+- **`session_todos` tool:** in-session task list (Cursor TodoWrite parity) — list/add/complete/remove; resets on `/new`.
+- **Grok-parity net tools (defaults, no keys):** `read_url_content` (HTTP fetch + HTML strip) and `search_web` (DuckDuckGo Instant Answer) work without injecting callbacks; offered in chat turns as read-only.
+- **`ask_question` TTY multi-choice prompt:** number keys / arrows / Enter; Space toggles multi-select. Shared interaction gate so mid-turn keys don't become steer drafts.
+- **`/export [path]`:** write the conversation transcript to markdown (default `.guru/exports/…`).
+- **`/copy [n]`:** copy the latest (or Nth-latest) assistant reply to the clipboard (clip / pbcopy / xclip), with print fallback.
+- **`/context`:** context-window footprint (tokens, ctx%, turns, route).
+
+### Fixed
+
+- **Linux terminal text correctness:** cursor movement, deletion, wrapping, clipping, and width calculation operate on grapheme clusters, keeping emoji modifiers, ZWJ families, flags, combining marks, and CJK text intact.
+- **Reference punctuation capture:** `@file` references no longer absorb trailing comma, period, colon, or closing parenthesis.
+- **Idle Ctrl+C draft loss:** quitting now requires two consecutive presses inside the 1.5-second window; ordinary input disarms the pending exit.
+- **Narrow-terminal overflow:** status bars and rounded boxes now honor the available width, while `/model` shows a bounded ready-first list and leaves the exhaustive catalog to `/models`.
+- **Streaming transport stalls and resets:** SSE accepts CRLF boundaries split across chunks, retries retryable open failures, times out inactive response bodies, and preserves partial text when a stream fails after output begins.
+- **MCP session lifecycle:** configured MCP tools attach to new and resumed runtime sessions, expose per-server status, and close retained clients during session/runtime teardown.
+- **Command execution ambiguity:** the argv command runner rejects unsupported shell operators and unterminated quotes with a recovery hint instead of silently executing a different command.
+- **Bounded UTF-8 reads:** the read tool no longer loads the whole file and never returns a replacement character when byte limits split a multibyte character; `nextOffset` identifies the safe continuation point.
+- **Hint line width on resize:** `chromeRows` passes the composer's paint width into `composerHintLine` (was `undefined` → `stdout.columns` drift vs status bar).
+- **`abortPrompt` cursor bookkeeping:** resets `lastFrameRowWidths` + `lastCursorCol` like `clear()`/`beginPrompt`, so Ctrl+C idle path can't leave a one-frame stale physical-row map.
+- **Alt+Enter follow-up dead on Windows Terminal / xterm:** modifyOtherKeys / CSI-u modifier masks now set `meta` (and `ctrl`) — previously only Shift was decoded, so Alt+Enter never queued a follow-up on WT.
+- **Mid-turn steer ignored on no-tool chat turns:** after a plain streamed answer (zero tool rounds), pending steers now continue the agent loop so `↳ steered` reaches the model instead of waiting for the next user line.
+- **C1 short-token assignment leak:** unquoted secret assignments like `API_KEY=x supersecret` now redact through the spaced remainder (stop at `;|&` / EOL), not only the first token.
+- **Composer `clear()` orphaned header chrome:** clear now moves to the managed block top before erase (same as abortPrompt), so a mid-block clear-below cannot leave the top rule in scrollback.
+- **beginPrompt / renderFinal cursor bookkeeping:** reset `lastFrameRowWidths` + `lastCursorCol` so the next relative move cannot use a stale physical-row map.
+- **Extension host tests vs CommandHandler contract:** duplicate/isolation tests now call `(args) => void` handlers (typecheck-clean).
+- **Spinner ghost text after mid-turn steer:** spinner frames now clear-to-EOL (`\\r\\x1b[K`) so a shorter `working…`/`thinking…` line cannot leave the tail of `steering… <draft>` stuck on screen.
+- **Long mid-turn steer draft soft-wrap:** busy draft paint **and** the chatTurn spinner re-paint share `formatBusyStatusLine` (`columns-1` + ellipsis) so the spinner cannot undo the clamp every 80ms.
+- **Mid-turn follow-up queue depth:** Alt+Enter busy event line can carry `q:N` (busy `forceRefresh` no longer paints the idle status chrome into the stream).
+- **Mid-turn steer draft stacks a line per keystroke:** busy-path draft paint used a trailing newline, so typing while a turn streamed left dead `steering…` lines in scrollback (busy twin of the 1.4.1 xenl fix). Drafts now paint in-place; the spinner yields to the draft instead of overwriting it every 80ms.
+- **Steer/follow-up forceRefresh painted the idle composer into the live stream:** `forceRefresh()` no longer repaints the empty prompt + status chrome while `busy` — it only drops the stale cursor anchor so the next idle frame starts clean.
+- **Boot memory blanked on one bad learning:** a single malformed learning/date no longer wipes the whole session memory block; bad items are skipped and the last good injection is kept.
+- **`/model` override accepted garbage ids:** empty or whitespace-containing model overrides are rejected before connect (instead of failing one turn later with a provider 400/404).
+- **No-model chat hint used a wrong catalog index:** “try `/model N`” no longer points at a raw sorted-catalog index (which drifts from the connectable-first drill); it suggests a real `routeId` matching auto-connect.
+- **Destructive hard-edge misses under YOLO:** `rm -r -f` / `rm --recursive --force` and `git push -f` now escalate like `rm -rf` / `git push --force` (split and long flags were previously silent-allow under YOLO).
+- **Windows recursive delete silent under YOLO:** `del /s /q`, `rmdir /s /q`, and `Remove-Item -Recurse -Force` (plus short forms) now escalate as destructive hard edges — they previously only counted as `exec` and YOLO allowed them.
+- **SPACE mandate scoped only to cwd:** write/edit targets outside a SPACE grant escalate even when the operator’s cwd sits inside the grant.
+- **Pre-turn busy dead zone:** `AgentSession` is created when `busy=true` so steer / Esc / Alt+Enter work during compaction and the working window (no more "(no active agent session to steer)").
+- **Late steer after stream end:** `chatTurn` continues `driveTurn` while steer-kind items remain so `↳ steered` reaches the model without waiting for the next user line.
+- **Esc during compaction:** `turnAbort` is armed before `maybeAutoCompact`; compaction summarizer receives the abort signal.
+- **Aborted steer queue pollution:** `discardPendingSteers()` on abort so cancelled nudges do not attach to the next message.
+- **`ask_question` spinner leak:** mid-turn `ask_question` calls the active turn's `stopSpinner` (same as approval).
+- **Follow-up auto-chain idle gap:** `busy` stays true through `drainFollowUpQueue`; nested `chatTurn` sets busy at entry.
+- **Empty/aborted assistant turn count:** `onAssistant` no longer logs or increments turns for empty content; late-steer continuations count once per user message.
+- **Busy resize mid-steer:** `forceRefresh` reclamps the in-place steer draft at the new width.
+- **Steered continuation stream glue:** newline separator before no-tool steer continuations in `agentTurn`.
+- **`memory.forget` non-atomic trash write:** trash is written via the same atomic tmp+rename path as other memory mutations; a failed live-file delete no longer loses the only copy.
+
 ## [1.4.8] - 2026-07-10
 
 ### Added

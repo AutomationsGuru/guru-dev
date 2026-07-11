@@ -299,6 +299,36 @@ describe("directAgentTurn — abort + mid-run steering (§17 scenario 13)", () =
     expect(result.text).toBe("working on it"); // the partial assistant text is returned
   });
 
+
+  it("no-tool turn still continues when a mid-run steer arrives (plain chat steer)", async () => {
+    let apiCalls = 0;
+    let steered = false;
+    const result = await directAgentTurn(route, [{ role: "user", content: "explain this" }], {
+      env,
+      tools: [],
+      pullSteering: () => {
+        if (!steered) {
+          steered = true;
+          return ["keep it under 3 bullets"];
+        }
+        return [];
+      },
+      executeTool: async (toolId) => observation(toolId, {}),
+      approveTool: () => true,
+      fetchImpl: (async (_url: unknown, init: { body?: string }) => {
+        apiCalls += 1;
+        const body = JSON.parse(init.body ?? "{}") as { messages: unknown[] };
+        if (apiCalls === 1) {
+          return new Response(JSON.stringify({ choices: [{ message: { content: "a long essay..." } }] }), { status: 200 });
+        }
+        expect(JSON.stringify(body.messages)).toContain("[steering] keep it under 3 bullets");
+        return new Response(JSON.stringify({ choices: [{ message: { content: "- one\n- two\n- three" } }] }), { status: 200 });
+      }) as typeof fetch
+    });
+    expect(apiCalls).toBe(2);
+    expect(result.text).toContain("one");
+  });
+
   it("mid-run steering injects the operator's note into the next request", async () => {
     let apiCalls = 0;
     let steered = false;

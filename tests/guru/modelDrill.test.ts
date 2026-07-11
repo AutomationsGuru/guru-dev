@@ -2,8 +2,12 @@ import { describe, expect, it } from "vitest";
 
 import {
   assessRouteConnectability,
+  buildCompactModelRouteRows,
   buildModelDrillMenuItems,
-  sortedRoutes
+  noModelConnectedHint,
+  resolveCompactRouteSelector,
+  sortedRoutes,
+  validateModelIdOverride
 } from "../../src/guru.js";
 import { createDirectProviderCatalog } from "../../src/providers/catalog.js";
 import { defineProviderRoute } from "../../src/providers/registry.js";
@@ -88,3 +92,76 @@ describe("buildModelDrillMenuItems", () => {
   });
 });
 
+describe("buildCompactModelRouteRows", () => {
+  it("bounds the typed /model output while preserving actionable route commands", () => {
+    const rows = buildCompactModelRouteRows(createDirectProviderCatalog(), { maxItems: 8 });
+
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.length).toBeLessThanOrEqual(8);
+    expect(rows.every((row) => row.id.startsWith("/model "))).toBe(true);
+  });
+
+  it("resolves a displayed compact index to the route shown on that row", () => {
+    const routes = createDirectProviderCatalog();
+    const rows = buildCompactModelRouteRows(routes, { maxItems: 10 });
+    const selected = resolveCompactRouteSelector(routes, "1", { maxItems: 10 });
+
+    expect(selected?.routeId).toBe(rows[0]?.label);
+  });
+});
+
+describe("validateModelIdOverride", () => {
+  it("accepts a plain model id", () => {
+    expect(validateModelIdOverride("gpt-4.1")).toBeNull();
+    expect(validateModelIdOverride("  claude-sonnet-4  ")).toBeNull();
+  });
+
+  it("rejects empty and whitespace-only overrides", () => {
+    expect(validateModelIdOverride("")?.message).toMatch(/empty/iu);
+    expect(validateModelIdOverride("   ")?.message).toMatch(/empty/iu);
+  });
+
+  it("rejects overrides that contain whitespace (stray args)", () => {
+    const bad = validateModelIdOverride("gpt-4.1 oops");
+    expect(bad?.message).toMatch(/whitespace/iu);
+    expect(bad?.hint).toBe("gpt-4.1");
+  });
+});
+
+describe("noModelConnectedHint", () => {
+  it("suggests a routeId (not a catalog index) when a direct-ready route exists", () => {
+    const routes = createDirectProviderCatalog();
+    const hint = noModelConnectedHint(routes);
+    // Either a real /model <routeId> (never a bare index) or an honest empty-catalog message.
+    if (hint.includes("/model ")) {
+      expect(hint).toMatch(/\/model [a-z0-9][a-z0-9./_-]+/iu);
+      expect(hint).not.toMatch(/\/model \d+\s*$/u);
+      // Suggested id must be a real connectable catalog route.
+      const id = hint.match(/\/model ([^\s]+)/u)?.[1];
+      expect(id).toBeTruthy();
+      const route = routes.find((row) => row.routeId === id);
+      expect(route).toBeDefined();
+      expect(assessRouteConnectability(route!).connectable).toBe(true);
+    } else {
+      expect(hint).toMatch(/no routes have a usable credential/iu);
+    }
+  });
+
+  it("never emits a bare numeric /model N for a catalog with no usable credentials", () => {
+    const dead = defineProviderRoute({
+      providerId: "dead",
+      modelId: "none",
+      routeId: "dead/none",
+      routeType: "direct-api",
+      apiFamily: "openai-chat-completions",
+      baseUrl: "https://example.test/v1",
+      credentialSource: { type: "env-var", envVarName: "GURU_TEST_NO_SUCH_KEY_EVER", envVarNames: [] },
+      status: "missing-credential",
+      directFirstRank: 1,
+      allowedRouterFallback: false
+    });
+    const hint = noModelConnectedHint([dead]);
+    expect(hint).toMatch(/no routes have a usable credential/iu);
+    expect(hint).not.toMatch(/\/model \d+/u);
+  });
+});

@@ -79,6 +79,25 @@ describe("findCutPoint — the binding invariants (ADR 2026-07-04)", () => {
     expect(plan?.firstKeptIndex).toBe(3);
   });
 
+  it("NEVER orphans a toolResult from its call (review 2026-07-08)", () => {
+    // Richer transcript: a toolCall with a following toolResult, then an assistant
+    // turn. If the cut candidate lands on the assistant preceded by the toolResult,
+    // the old code allowed it — orphaning the result from the (summarized) call.
+    const entries = [
+      entry("user", text(40)),
+      entry("assistant", text(40)),
+      entry("toolCall", text(40)),
+      entry("toolResult", text(40)),
+      entry("assistant", text(10)), // candidate here is now INVALID (preceded by toolResult)
+      entry("user", text(10))
+    ];
+    const budget = 10 + 10 + 2 * ENTRY_OVERHEAD_TOKENS + 5; // candidate = index 4
+    const plan = findCutPoint(entries, budget, chars);
+    expect(plan).not.toBeNull();
+    // Index 4 (assistant preceded by toolResult) is invalid → snap forward to 5 (user).
+    expect(plan?.firstKeptIndex).toBe(5);
+  });
+
   it("split-turn: a single oversized turn cuts mid-turn at an assistant entry", () => {
     const entries = [
       entry("user", text(10)),

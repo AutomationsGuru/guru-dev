@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { charDisplayWidth } from "../../src/tui/width.js";
 import { stringDisplayWidth } from "../../src/tui/editor.js";
-import { visibleWidth } from "../../src/tui/components.js";
+import { clipVisible, visibleWidth } from "../../src/tui/components.js";
 
 /**
  * Usability-audit regression (2026-07-09): East-Asian-Width Wide BMP symbols
@@ -69,5 +69,41 @@ describe("charDisplayWidth — EAW-Wide BMP symbols", () => {
     expect(charDisplayWidth(0x61)).toBe(1); // a
     expect(charDisplayWidth(0x0301)).toBe(0); // combining acute
     expect(charDisplayWidth(0xfe0f)).toBe(0); // variation selector
+  });
+});
+
+describe("stringDisplayWidth — grapheme clusters", () => {
+  it("counts emoji modifier sequences as one two-cell glyph", () => {
+    expect(stringDisplayWidth("👍🏽")).toBe(2);
+  });
+
+  it("counts a ZWJ family as one two-cell glyph", () => {
+    expect(stringDisplayWidth("👨‍👩‍👧‍👦")).toBe(2);
+  });
+
+  it("counts a regional-indicator flag as one two-cell glyph", () => {
+    expect(stringDisplayWidth("🇺🇸")).toBe(2);
+  });
+
+  it("counts variation-selector emoji and keycaps as two-cell glyphs", () => {
+    expect(stringDisplayWidth("❤️")).toBe(2);
+    expect(stringDisplayWidth("1️⃣")).toBe(2);
+  });
+
+  it("retains CJK and combining-mark width behavior", () => {
+    expect(stringDisplayWidth("汉é")).toBe(3);
+  });
+
+  it("keeps ANSI-aware component width aligned with grapheme width", () => {
+    expect(visibleWidth("👍🏽👨‍👩‍👧‍👦🇺🇸")).toBe(6);
+    expect(visibleWidth("\x1b[33m👍🏽\x1b[39m")).toBe(2);
+  });
+
+  it("clips ANSI text only at whole grapheme boundaries", () => {
+    const family = "👨‍👩‍👧‍👦";
+    const clipped = clipVisible(`\x1b[33maaaa${family}bbbb\x1b[39m`, 7);
+
+    expect(clipped).toContain(`aaaa${family}`);
+    expect(visibleWidth(clipped)).toBe(7);
   });
 });

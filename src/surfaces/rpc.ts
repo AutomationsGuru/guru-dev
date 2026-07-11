@@ -4,7 +4,7 @@ import { z } from "zod";
 
 import { AgentSession } from "../session/agentSession.js";
 import { onSecretSanitized } from "../safety/secretSafety.js";
-import { createHarnessRuntime } from "../runtime/session.js";
+import { createHarnessRuntime, type HarnessRuntime } from "../runtime/session.js";
 import { createDirectProviderCatalog } from "../providers/catalog.js";
 import { createMandateStore } from "../mandates/store.js";
 import { createFileMemoryStore } from "../memory/store.js";
@@ -119,26 +119,33 @@ export function wireRpcEvents(session: AgentSession, emit: RpcEmit): () => void 
 export interface RunRpcOptions {
   /** Inject a session (tests); otherwise a session is bootstrapped from the catalog. */
   readonly session?: AgentSession;
+  /** Construct the runtime RPC will own when it bootstraps a session. Ignored for an injected session. */
+  readonly createRuntime?: () => HarnessRuntime;
   readonly routes?: readonly ProviderRouteDescriptor[];
   readonly input?: NodeJS.ReadableStream;
   readonly output?: NodeJS.WritableStream;
 }
 
-async function bootstrapSession(): Promise<{ session: AgentSession; routes: readonly ProviderRouteDescriptor[] }> {
-  const runtime = createHarnessRuntime();
-  const harness = await runtime.startSession({});
-  const routes = createDirectProviderCatalog();
-  const route = routes.find((r) => isChatCapableFamily(r.apiFamily) && r.routeType === "direct-api" && resolveRouteCredential(r).usable) ?? routes[0];
-  const session = new AgentSession({
-    runtime,
-    route: route as ProviderRouteDescriptor,
-    session: harness,
-    sessionTools: runtime.getSessionTools(harness.id),
-    mandate: createMandateStore().load(),
-    memory: createFileMemoryStore(),
-    now: () => new Date()
-  });
-  return { session, routes };
+async function bootstrapSession(createRuntime: () => HarnessRuntime): Promise<{ session: AgentSession; routes: readonly ProviderRouteDescriptor[]; runtime: HarnessRuntime }> {
+  const runtime = createRuntime();
+  try {
+    const harness = await runtime.startSession({});
+    const routes = createDirectProviderCatalog();
+    const route = routes.find((r) => isChatCapableFamily(r.apiFamily) && r.routeType === "direct-api" && resolveRouteCredential(r).usable) ?? routes[0];
+    const session = new AgentSession({
+      runtime,
+      route: route as ProviderRouteDescriptor,
+      session: harness,
+      sessionTools: runtime.getSessionTools(harness.id),
+      mandate: createMandateStore().load(),
+      memory: createFileMemoryStore(),
+      now: () => new Date()
+    });
+    return { session, routes, runtime };
+  } catch (error) {
+    await runtime.close();
+    throw error;
+  }
 }
 
 /** Run RPC mode: frame JSONL from stdin, dispatch on the unified engine, stream events. */
@@ -149,52 +156,71 @@ export async function runRpcMode(options: RunRpcOptions = {}): Promise<void> {
   };
   let session = options.session;
   let routes = options.routes;
+  let ownedRuntime: HarnessRuntime | undefined;
   if (!session) {
-    const boot = await bootstrapSession();
+    const boot = await bootstrapSession(options.createRuntime ?? createHarnessRuntime);
     session = boot.session;
     routes = boot.routes;
+    ownedRuntime = boot.runtime;
   }
   const ctx: RpcContext = { session, emit, ...(routes ? { routes } : {}) };
   const unwire = wireRpcEvents(session, emit);
-  emit({ type: "event", event: "ready", methods: ["prompt", "steer", "follow_up", "abort", "state", "suit_up", "park", "models"] });
+  try {
+    emit({ type: "event", event: "ready", methods: ["prompt", "steer", "follow_up", "abort", "state", "suit_up", "park", "models"] });
 
-  const input = options.input ?? process.stdin;
-  const decoder = new StringDecoder("utf8");
-  const state = { buffer: "" };
-  // Prompts serialize (each may drain follow-ups); steer/follow_up/abort stay immediate
-  // so they can land mid-turn without waiting behind a long prompt.
-  let promptChain: Promise<void> = Promise.resolve();
-  const dispatchLine = (request: RpcRequest): void => {
-    if (request.method === "prompt") {
-      promptChain = promptChain.then(async () => {
-        emit(await dispatchRpc(request, ctx));
-      });
-      return;
-    }
-    void dispatchRpc(request, ctx).then((response) => emit(response));
-  };
-  await new Promise<void>((resolve) => {
-    const finish = (): void => {
-      void promptChain.finally(() => resolve());
-    };
-    input.on("data", (chunk: Buffer | string) => {
-      for (const line of frameChunk(state, chunk, decoder)) {
-        const trimmed = line.trim();
-        if (trimmed.length === 0) {
-          continue;
-        }
-        let request: RpcRequest;
-        try {
-          request = RpcRequestSchema.parse(JSON.parse(trimmed));
-        } catch (error) {
-          emit({ ok: false, error: `bad request: ${error instanceof Error ? error.message : String(error)}` });
-          continue;
-        }
-        dispatchLine(request);
+    const input = options.input ?? process.stdin;
+    const decoder = new StringDecoder("utf8");
+    const state = { buffer: "" };
+    // Prompts serialize (each may drain follow-ups); steer/follow_up/abort stay immediate
+    // so they can land mid-turn without waiting behind a long prompt.
+    let promptChain: Promise<void> = Promise.resolve();
+    const dispatchLine = (request: RpcRequest): void => {
+      if (request.method === "prompt") {
+        // Chain prompts serially (each may drain follow-ups), but catch at each link
+        // (review 2026-07-08): the old chain had no .catch, so a single emit failure
+        // (broken pipe, closed sink) rejected the shared promise and EVERY subsequent
+        // prompt was silently swallowed for the rest of the session. Reset the chain
+        // on failure so one bad write can't permanently kill the prompt stream.
+        promptChain = promptChain
+          .then(async () => {
+            emit(await dispatchRpc(request, ctx));
+          })
+          .catch((error: unknown) => {
+            // eslint-disable-next-line no-console
+            console.warn(`[rpc] prompt chain: emit failed (${error instanceof Error ? error.message : String(error)}). Continuing.`);
+          });
+        return;
       }
+      void dispatchRpc(request, ctx).then((response) => emit(response)).catch((error: unknown) => {
+        // eslint-disable-next-line no-console
+        console.warn(`[rpc] ${request.method}: emit failed (${error instanceof Error ? error.message : String(error)}).`);
+      });
+    };
+    await new Promise<void>((resolve) => {
+      const finish = (): void => {
+        void promptChain.finally(() => resolve());
+      };
+      input.on("data", (chunk: Buffer | string) => {
+        for (const line of frameChunk(state, chunk, decoder)) {
+          const trimmed = line.trim();
+          if (trimmed.length === 0) {
+            continue;
+          }
+          let request: RpcRequest;
+          try {
+            request = RpcRequestSchema.parse(JSON.parse(trimmed));
+          } catch (error) {
+            emit({ ok: false, error: `bad request: ${error instanceof Error ? error.message : String(error)}` });
+            continue;
+          }
+          dispatchLine(request);
+        }
+      });
+      input.on("end", finish);
+      input.on("close", finish);
     });
-    input.on("end", finish);
-    input.on("close", finish);
-  });
-  unwire();
+  } finally {
+    unwire();
+    await ownedRuntime?.close();
+  }
 }

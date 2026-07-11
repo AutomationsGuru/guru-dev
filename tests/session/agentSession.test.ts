@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { AgentSession, type AgentSessionDeps, type TurnRunner } from "../../src/session/agentSession.js";
+import type { ChatTurnMessage } from "../../src/model/directChat.js";
 import { createFileMemoryStore } from "../../src/memory/store.js";
 import type { AgentTurnResult } from "../../src/model/agentTurn.js";
 
@@ -264,5 +265,65 @@ describe("AgentSession — abort + mid-run steering (§17 scenario 13)", () => {
     expect(pulled).toEqual(["focus on the parser"]); // pulled inside the running turn
     expect(injected).toBe("focus on the parser");
     expect(s.queueDepth()).toBe(0); // drained mid-run, not left for next turn
+  });
+});
+
+describe("AgentSession — usability-audit regressions (2026-07-09)", () => {
+  it("discardPendingSteers drops steers and keeps follow-ups", () => {
+    const s = makeSession({ runTurn: stubRunner({ text: "x" }) });
+    s.steer("nudge-a");
+    s.steer("nudge-b");
+    s.followUp("later");
+    expect(s.discardPendingSteers()).toEqual(["nudge-a", "nudge-b"]);
+    expect(s.pendingSteerCount()).toBe(0);
+    expect(s.takeFollowUps()).toEqual(["later"]);
+  });
+
+  it("pendingSteerCount counts steers only (excludes follow-ups)", () => {
+    const s = makeSession({ runTurn: stubRunner({ text: "x" }) });
+    expect(s.pendingSteerCount()).toBe(0);
+    s.steer("nudge");
+    s.followUp("later");
+    expect(s.queueDepth()).toBe(2);
+    expect(s.pendingSteerCount()).toBe(1);
+    s.takeFollowUps();
+    expect(s.pendingSteerCount()).toBe(1);
+    expect(s.queueDepth()).toBe(1);
+  });
+
+  it("a steer left over from a NO-TOOL turn injects at the top of the NEXT driveTurn (stuck q:N fix)", async () => {
+    // pullSteering only fires between tool rounds (agentTurn iteration > 0), so a
+    // steer typed during a plain streamed answer used to rot in the queue forever.
+    const s = makeSession({ runTurn: stubRunner({ text: "plain answer, zero tool rounds" }) });
+    s.steer("actually use TypeScript");
+    expect(s.queueDepth()).toBe(1); // stuck after the turn that never pulled it
+
+    const history: ChatTurnMessage[] = [{ role: "user", content: "next turn" }];
+    const injected: string[] = [];
+    s.subscribe("steer.injected", (e) => injected.push(e.text));
+    await s.driveTurn({ getHistory: () => history });
+    expect(s.queueDepth()).toBe(0);
+    expect(injected).toEqual(["actually use TypeScript"]);
+    expect(history.some((m) => m.role === "system" && m.content === "[steering] actually use TypeScript")).toBe(true);
+  });
+
+  it("driveTurn's boundary drain leaves follow-ups queued (they run as fresh turns, not context notes)", async () => {
+    const s = makeSession({ runTurn: stubRunner({ text: "answer" }) });
+    s.followUp("and then do the docs");
+    const history = [{ role: "user" as const, content: "turn" }];
+    await s.driveTurn({ getHistory: () => history });
+    expect(s.queueDepth()).toBe(1); // follow-up untouched by the steer drain
+    expect(s.takeFollowUps()).toEqual(["and then do the docs"]);
+  });
+
+  it("does NOT push an empty assistant message on an aborted/empty turn (anthropic 400-poison fix)", async () => {
+    const history: ChatTurnMessage[] = [{ role: "user", content: "aborted turn" }];
+    const s = makeSession({ runTurn: stubRunner({ text: "" }) });
+    await s.driveTurn({ getHistory: () => history });
+    expect(history.filter((m) => m.role === "assistant")).toHaveLength(0);
+    // prompt() path too: user message stays, no empty assistant appended after it
+    const s2 = makeSession({ runTurn: stubRunner({ text: "" }) });
+    await s2.prompt("hi");
+    expect(s2.history.map((m) => m.role)).toEqual(["user"]);
   });
 });

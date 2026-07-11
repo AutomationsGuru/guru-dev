@@ -164,11 +164,13 @@ async function probeChat(route: ProviderRouteDescriptor, options: ProbeOptions, 
       : { verdict: "unclear", evidence: `unexpected reply ${JSON.stringify(result.text.trim().slice(0, 60))}`, durationMs: Date.now() - startedAt };
   } catch (error) {
     const message = (error instanceof Error ? error.message : String(error)).slice(0, 160);
-    if (/fetch failed/iu.test(message) && !retrying) {
+    if (/fetch failed|abort|timeout|econnrefused|enotfound/iu.test(message) && !retrying) {
       await new Promise((resolve) => setTimeout(resolve, 1500));
       return probeChat(route, options, true);
     }
-    return { verdict: "fail", evidence: message, durationMs: Date.now() - startedAt };
+    // A persistent transport failure after retry is NOT a capability verdict
+    // (review 2026-07-08): the model may be fully capable; the network was just down.
+    return { verdict: "unclear", evidence: `transport error after retry: ${message}`, durationMs: Date.now() - startedAt };
   }
 }
 
@@ -295,7 +297,15 @@ async function probeVision(wire: RouteWire, fetchImpl: typeof fetch): Promise<Pr
   const startedAt = Date.now();
   const outcome = await postAdaptive(wire, visionBody(wire), fetchImpl);
   if ("transportError" in outcome) {
-    return { verdict: "fail", evidence: outcome.transportError, durationMs: Date.now() - startedAt };
+    // A transport failure (timeout/DNS/network) is NOT a capability verdict — the
+    // model may well support vision (review 2026-07-08). 'unclear' keeps the
+    // lane eligible instead of permanently disabling vision for a transient blip.
+    return { verdict: "unclear", evidence: `transport error: ${outcome.transportError}`, durationMs: Date.now() - startedAt };
+  }
+  if (outcome.status === 401 || outcome.status === 403) {
+    // Auth failure isn't a capability verdict either — an expired/revoked key
+    // shouldn't mark a model as vision-incapable.
+    return { verdict: "unclear", evidence: `HTTP ${outcome.status} (auth — not a capability verdict)`, durationMs: Date.now() - startedAt };
   }
   if (outcome.status >= 400) {
     const body = JSON.stringify(outcome.json).slice(0, 160);
@@ -372,7 +382,11 @@ async function probeThinking(wire: RouteWire, fetchImpl: typeof fetch): Promise<
     outcome = await postAdaptive(wire, { ...thinkingBody(wire), thinking: { type: "adaptive" } }, fetchImpl);
   }
   if ("transportError" in outcome) {
-    return { verdict: "fail", evidence: outcome.transportError, durationMs: Date.now() - startedAt };
+    // Transport failure ≠ capability verdict (review 2026-07-08) — see probeVision.
+    return { verdict: "unclear", evidence: `transport error: ${outcome.transportError}`, durationMs: Date.now() - startedAt };
+  }
+  if (outcome.status === 401 || outcome.status === 403) {
+    return { verdict: "unclear", evidence: `HTTP ${outcome.status} (auth — not a capability verdict)`, durationMs: Date.now() - startedAt };
   }
   if (outcome.status >= 400) {
     const body = JSON.stringify(outcome.json).slice(0, 160);

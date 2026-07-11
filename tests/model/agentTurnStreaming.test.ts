@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { directAgentTurn } from "../../src/model/agentTurn.js";
+import { RetryConfigSchema } from "../../src/model/retryPolicy.js";
 import { defineProviderRoute } from "../../src/providers/registry.js";
 
 const env = { TEST_CHAT_KEY: "test-secret" };
@@ -7,6 +8,42 @@ const env = { TEST_CHAT_KEY: "test-secret" };
 function sseResponse(lines: readonly string[]): Response {
   const body = lines.map((line) => `${line}\n\n`).join("");
   return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+}
+
+function chunkedSseResponse(chunks: readonly string[]): Response {
+  const encoder = new TextEncoder();
+  return new Response(
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const chunk of chunks) {
+          controller.enqueue(encoder.encode(chunk));
+        }
+        controller.close();
+      }
+    }),
+    { status: 200, headers: { "content-type": "text/event-stream" } }
+  );
+}
+
+function sseResponseThenFailure(contentBeforeFailure: string): Response {
+  const encoder = new TextEncoder();
+  let sent = false;
+  return new Response(
+    new ReadableStream<Uint8Array>(
+      {
+        pull(controller) {
+          if (!sent) {
+            sent = true;
+            controller.enqueue(encoder.encode(contentBeforeFailure));
+            return;
+          }
+          controller.error(new TypeError("socket reset mid-stream"));
+        }
+      },
+      { highWaterMark: 0 }
+    ),
+    { status: 200, headers: { "content-type": "text/event-stream" } }
+  );
 }
 
 const chatRoute = defineProviderRoute({
@@ -35,7 +72,39 @@ const anthropicRoute = defineProviderRoute({
   allowedRouterFallback: true
 });
 
+const responsesRoute = defineProviderRoute({
+  providerId: "openai",
+  modelId: "gpt-test",
+  routeId: "openai/gpt-test-responses",
+  routeType: "direct-api",
+  apiFamily: "openai-responses",
+  baseUrl: "https://example.test/api",
+  credentialSource: { type: "env-var", envVarName: "TEST_CHAT_KEY", envVarNames: [] },
+  status: "ready-unverified",
+  directFirstRank: 3,
+  allowedRouterFallback: true
+});
+
 describe("streaming: openai-chat-completions", () => {
+  it("parses CRLF event boundaries split across transport chunks", async () => {
+    const result = await directAgentTurn(chatRoute, [{ role: "user", content: "hi" }], {
+      env,
+      tools: [],
+      executeTool: async () => ({ toolId: "x", status: "succeeded", startedAt: "", endedAt: "", durationMs: 0 }),
+      approveTool: () => true,
+      onToken: () => undefined,
+      fetchImpl: (async () =>
+        chunkedSseResponse([
+          'data: {"choices":[{"delta":{"content":"Hel"}}]}\r',
+          "\n\r",
+          '\ndata: {"choices":[{"delta":{"content":"lo"}}]}\r\n\r',
+          "\ndata: [DONE]\r\n\r\n"
+        ])) as typeof fetch
+    });
+
+    expect(result.text).toBe("Hello");
+  });
+
   it("emits incremental tokens and assembles the final text", async () => {
     const tokens: string[] = [];
     let sawStreamFlag = false;
@@ -121,6 +190,41 @@ describe("streaming: openai-chat-completions", () => {
     expect(calls).toBe(1); // NOT 2 — the request was not re-sent
   });
 
+  it.each([
+    ["HTTP 429", () => new Response("busy", { status: 429 })],
+    ["HTTP 503", () => new Response("unavailable", { status: 503 })],
+    ["a network failure", () => Promise.reject(new TypeError("socket reset"))]
+  ])("retries a streaming open after %s", async (_label, firstAttempt) => {
+    let calls = 0;
+    const streamFlags: boolean[] = [];
+    const sleeps: number[] = [];
+    const result = await directAgentTurn(chatRoute, [{ role: "user", content: "hi" }], {
+      env,
+      tools: [],
+      executeTool: async () => ({ toolId: "x", status: "succeeded", startedAt: "", endedAt: "", durationMs: 0 }),
+      approveTool: () => true,
+      onToken: () => undefined,
+      retrySleep: (ms) => {
+        sleeps.push(ms);
+        return Promise.resolve();
+      },
+      retryRandom: () => 0,
+      fetchImpl: (async (_url: unknown, init: { body?: string }) => {
+        calls += 1;
+        streamFlags.push((JSON.parse(init.body ?? "{}") as { stream?: boolean }).stream === true);
+        if (calls === 1) {
+          return firstAttempt();
+        }
+        return sseResponse(['data: {"choices":[{"delta":{"content":"recovered"}}]}', "data: [DONE]"]);
+      }) as typeof fetch
+    });
+
+    expect(result.text).toBe("recovered");
+    expect(calls).toBe(2);
+    expect(streamFlags).toEqual([true, true]);
+    expect(sleeps).toHaveLength(1);
+  });
+
   it("falls back to non-streaming only on streaming-unsupported statuses (415/405/501)", async () => {
     let calls = 0;
     const result = await directAgentTurn(chatRoute, [{ role: "user", content: "hi" }], {
@@ -168,34 +272,234 @@ describe("streaming: anthropic-messages", () => {
   });
 });
 
-describe("streaming: network-level failure fallback", () => {
-  it("falls back to non-streaming when the SSE fetch rejects (shakedown fix)", async () => {
+describe("streaming: partial response retention", () => {
+  it.each([
+    {
+      family: "openai-chat-completions",
+      route: chatRoute,
+      sse: 'data: {"choices":[{"delta":{"content":"visible partial"}}]}\n\n'
+    },
+    {
+      family: "openai-responses",
+      route: responsesRoute,
+      sse: 'data: {"type":"response.output_text.delta","delta":"visible partial"}\n\n'
+    },
+    {
+      family: "anthropic-messages",
+      route: anthropicRoute,
+      sse:
+        'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n' +
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"visible partial"}}\n\n'
+    }
+  ])("returns accumulated $family text after a body read failure", async ({ route, sse }) => {
     const tokens: string[] = [];
-    let calls = 0;
-    const result = await directAgentTurn(chatRoute, [{ role: "user", content: "hi" }], {
+    const result = await directAgentTurn(route, [{ role: "user", content: "hi" }], {
       env,
       tools: [],
       executeTool: async () => ({ toolId: "x", status: "succeeded", startedAt: "", endedAt: "", durationMs: 0 }),
       approveTool: () => true,
-      onToken: (chunk) => tokens.push(chunk),
-      fetchImpl: (async (_url: unknown, init: { body?: string }) => {
-        calls += 1;
-        const body = JSON.parse(init.body ?? "{}") as { stream?: boolean };
-        if (body.stream === true) {
-          throw new TypeError("fetch failed"); // socket reset / DNS blip on the stream attempt
+      onToken: (token) => tokens.push(token),
+      fetchImpl: (async () => sseResponseThenFailure(sse)) as typeof fetch
+    });
+
+    expect(tokens.join("")).toBe("visible partial");
+    expect(result.text).toBe("visible partial");
+  });
+
+  it("discards an unfinished OpenAI tool call instead of executing it with empty arguments", async () => {
+    let requests = 0;
+    let executions = 0;
+    const result = await directAgentTurn(chatRoute, [{ role: "user", content: "inspect" }], {
+      env,
+      tools: [
+        {
+          id: "repo.context.resolve",
+          title: "Repo",
+          description: "Resolve repository context",
+          inputSchema: (await import("zod")).z.object({ cwd: (await import("zod")).z.string() }),
+          outputSchema: (await import("zod")).z.object({}).passthrough(),
+          execute: () => ({})
         }
-        return new Response(
-          JSON.stringify({ choices: [{ message: { content: "recovered" } }], usage: { prompt_tokens: 3, completion_tokens: 1 } }),
-          { status: 200, headers: { "content-type": "application/json" } }
-        );
+      ],
+      executeTool: async () => {
+        executions += 1;
+        return { toolId: "repo.context.resolve", status: "succeeded", startedAt: "", endedAt: "", durationMs: 0 };
+      },
+      approveTool: () => true,
+      onToken: () => undefined,
+      fetchImpl: (async () => {
+        requests += 1;
+        if (requests === 1) {
+          return sseResponseThenFailure(
+            'data: {"choices":[{"delta":{"content":"visible partial"}}]}\n\n' +
+              'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"repo__context__resolve","arguments":"{\\"cwd\\":"}}]}}]}\n\n'
+          );
+        }
+        return sseResponse(['data: {"choices":[{"delta":{"content":"unexpected retry"}}]}', "data: [DONE]"]);
       }) as typeof fetch
     });
 
-    expect(calls).toBe(2); // failed stream attempt + successful non-streaming retry
-    expect(result.text).toBe("recovered");
+    expect(result.text).toBe("visible partial");
+    expect(result.toolCallCount).toBe(0);
+    expect(executions).toBe(0);
+    expect(requests).toBe(1);
   });
 
-  it("still surfaces an honest error when the non-streaming retry also fails", async () => {
+  it("discards tool calls when a stream closes cleanly without a completion marker", async () => {
+    let executions = 0;
+    const result = await directAgentTurn(chatRoute, [{ role: "user", content: "inspect" }], {
+      env,
+      tools: [
+        {
+          id: "repo.context.resolve",
+          title: "Repo",
+          description: "Resolve repository context",
+          inputSchema: (await import("zod")).z.object({}).passthrough(),
+          outputSchema: (await import("zod")).z.object({}).passthrough(),
+          execute: () => ({})
+        }
+      ],
+      executeTool: async () => {
+        executions += 1;
+        return { toolId: "repo.context.resolve", status: "succeeded", startedAt: "", endedAt: "", durationMs: 0 };
+      },
+      approveTool: () => true,
+      onToken: () => undefined,
+      fetchImpl: (async () =>
+        sseResponse([
+          'data: {"choices":[{"delta":{"content":"visible partial","tool_calls":[{"index":0,"id":"c1","function":{"name":"repo__context__resolve","arguments":"{}"}}]}}]}'
+        ])) as typeof fetch
+    });
+
+    expect(result.text).toBe("visible partial");
+    expect(result.toolCallCount).toBe(0);
+    expect(executions).toBe(0);
+  });
+
+  it("does not execute a streamed tool call after Ctrl+C aborts the turn", async () => {
+    const controller = new AbortController();
+    let approvals = 0;
+    let executions = 0;
+    const result = await directAgentTurn(chatRoute, [{ role: "user", content: "inspect" }], {
+      env,
+      signal: controller.signal,
+      tools: [
+        {
+          id: "repo.context.resolve",
+          title: "Repo",
+          description: "Resolve repository context",
+          inputSchema: (await import("zod")).z.object({}).passthrough(),
+          outputSchema: (await import("zod")).z.object({}).passthrough(),
+          execute: () => ({})
+        }
+      ],
+      executeTool: async () => {
+        executions += 1;
+        return { toolId: "repo.context.resolve", status: "succeeded", startedAt: "", endedAt: "", durationMs: 0 };
+      },
+      approveTool: () => {
+        approvals += 1;
+        return true;
+      },
+      onToken: () => controller.abort(),
+      fetchImpl: (async () =>
+        sseResponse([
+          'data: {"choices":[{"delta":{"content":"visible partial","tool_calls":[{"index":0,"id":"c1","function":{"name":"repo__context__resolve","arguments":"{}"}}]}}]}',
+          "data: [DONE]"
+        ])) as typeof fetch
+    });
+
+    expect(result.text).toBe("visible partial");
+    expect(result.toolCallCount).toBe(0);
+    expect(approvals).toBe(0);
+    expect(executions).toBe(0);
+  });
+
+  it("rechecks abort after an asynchronous approval before executing a tool", async () => {
+    const controller = new AbortController();
+    let executions = 0;
+    const result = await directAgentTurn(chatRoute, [{ role: "user", content: "inspect" }], {
+      env,
+      signal: controller.signal,
+      tools: [
+        {
+          id: "repo.context.resolve",
+          title: "Repo",
+          description: "Resolve repository context",
+          inputSchema: (await import("zod")).z.object({}).passthrough(),
+          outputSchema: (await import("zod")).z.object({}).passthrough(),
+          execute: () => ({})
+        }
+      ],
+      executeTool: async () => {
+        executions += 1;
+        return { toolId: "repo.context.resolve", status: "succeeded", startedAt: "", endedAt: "", durationMs: 0 };
+      },
+      approveTool: async () => {
+        controller.abort();
+        return true;
+      },
+      onToken: () => undefined,
+      fetchImpl: (async () =>
+        sseResponse([
+          'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"repo__context__resolve","arguments":"{}"}}]}}]}',
+          "data: [DONE]"
+        ])) as typeof fetch
+    });
+
+    expect(result.text).toBe("");
+    expect(result.toolCallCount).toBe(0);
+    expect(executions).toBe(0);
+  });
+
+  it("discards an unfinished Anthropic tool_use block after retaining partial text", async () => {
+    let requests = 0;
+    let executions = 0;
+    const result = await directAgentTurn(anthropicRoute, [{ role: "user", content: "inspect" }], {
+      env,
+      tools: [
+        {
+          id: "repo.context.resolve",
+          title: "Repo",
+          description: "Resolve repository context",
+          inputSchema: (await import("zod")).z.object({ cwd: (await import("zod")).z.string() }),
+          outputSchema: (await import("zod")).z.object({}).passthrough(),
+          execute: () => ({})
+        }
+      ],
+      executeTool: async () => {
+        executions += 1;
+        return { toolId: "repo.context.resolve", status: "succeeded", startedAt: "", endedAt: "", durationMs: 0 };
+      },
+      approveTool: () => true,
+      onToken: () => undefined,
+      fetchImpl: (async () => {
+        requests += 1;
+        if (requests === 1) {
+          return sseResponseThenFailure(
+            'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n' +
+              'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"visible partial"}}\n\n' +
+              'data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"c1","name":"repo__context__resolve"}}\n\n' +
+              'data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"cwd\\":"}}\n\n'
+          );
+        }
+        return sseResponse([
+          'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":"unexpected retry"}}'
+        ]);
+      }) as typeof fetch
+    });
+
+    expect(result.text).toBe("visible partial");
+    expect(result.toolCallCount).toBe(0);
+    expect(executions).toBe(0);
+    expect(requests).toBe(1);
+  });
+});
+
+describe("streaming: exhausted network failures", () => {
+  it("does not re-send the request non-streaming after the streaming retry budget is exhausted", async () => {
+    let calls = 0;
+    const streamFlags: boolean[] = [];
     await expect(
       directAgentTurn(chatRoute, [{ role: "user", content: "hi" }], {
         env,
@@ -203,8 +507,29 @@ describe("streaming: network-level failure fallback", () => {
         executeTool: async () => ({ toolId: "x", status: "succeeded", startedAt: "", endedAt: "", durationMs: 0 }),
         approveTool: () => true,
         onToken: () => undefined,
-        // The non-stream fallback now carries the retry policy — instant sleeps keep
-        // this deterministic; the honest error still surfaces after the retries.
+        retrySleep: () => Promise.resolve(),
+        fetchImpl: (async (_url: unknown, init: { body?: string }) => {
+          calls += 1;
+          streamFlags.push((JSON.parse(init.body ?? "{}") as { stream?: boolean }).stream === true);
+          throw new TypeError("fetch failed"); // socket reset / DNS blip on the stream attempt
+        }) as typeof fetch
+      })
+    ).rejects.toThrow(/failed/iu);
+
+    expect(calls).toBe(4); // initial attempt + the default policy's three retries
+    expect(streamFlags).toEqual([true, true, true, true]);
+  });
+
+  it("still surfaces an honest error when every streaming attempt fails", async () => {
+    await expect(
+      directAgentTurn(chatRoute, [{ role: "user", content: "hi" }], {
+        env,
+        tools: [],
+        executeTool: async () => ({ toolId: "x", status: "succeeded", startedAt: "", endedAt: "", durationMs: 0 }),
+        approveTool: () => true,
+        onToken: () => undefined,
+        // Instant sleeps keep this deterministic; the honest error still surfaces
+        // after the streaming retry policy is exhausted.
         retrySleep: () => Promise.resolve(),
         fetchImpl: (async () => {
           throw new TypeError("fetch failed");
@@ -240,6 +565,44 @@ describe("streaming: per-request timeout is terminal, not retried (review 2026-0
       })
     ).rejects.toThrow(/timed out/iu);
     expect(calls).toBe(1); // NOT retried
+  });
+});
+
+describe("streaming: body idle timeout", () => {
+  it("fails promptly when an SSE body stops producing data after headers", async () => {
+    let calls = 0;
+    const controller = new AbortController();
+    const turn = directAgentTurn(chatRoute, [{ role: "user", content: "hi" }], {
+      env,
+      tools: [],
+      executeTool: async () => ({ toolId: "x", status: "succeeded", startedAt: "", endedAt: "", durationMs: 0 }),
+      approveTool: () => true,
+      onToken: () => undefined,
+      signal: controller.signal,
+      retry: RetryConfigSchema.parse({ maxRetries: 0, provider: { timeoutMs: 20 } }),
+      fetchImpl: (async () => {
+        calls += 1;
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            pull: () => new Promise<void>(() => undefined)
+          }),
+          { status: 200, headers: { "content-type": "text/event-stream" } }
+        );
+      }) as typeof fetch
+    });
+
+    const outcome = await Promise.race([
+      turn.then(
+        () => new Error("turn unexpectedly resolved"),
+        (error: unknown) => error
+      ),
+      new Promise<Error>((resolve) => setTimeout(() => resolve(new Error("stream remained pending")), 100))
+    ]);
+    controller.abort();
+
+    expect(outcome).toBeInstanceOf(Error);
+    expect((outcome as Error).message).toMatch(/stream.*idle.*20ms/iu);
+    expect(calls).toBe(1);
   });
 });
 

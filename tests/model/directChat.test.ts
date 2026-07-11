@@ -160,6 +160,44 @@ describe("directChat", () => {
     ).rejects.toThrow();
     expect(fetchCalled).toBe(true);
   });
+
+  it("classifies network failures specifically instead of 'fetch failed' (review 2026-07-08)", async () => {
+    // A DNS failure (ENOTFOUND) must name the host from the route URL, not the
+    // opaque "fetch failed". chatRoute's baseUrl is https://example.test/api.
+    const dnsError = Object.assign(new Error("fetch failed"), {
+      cause: { code: "ENOTFOUND", message: "getaddrinfo ENOTFOUND example.test" }
+    });
+    await expect(
+      directChat(chatRoute, messages, {
+        env,
+        fetchImpl: (async () => {
+          throw dnsError;
+        }) as typeof fetch
+      })
+    ).rejects.toThrow(/could not resolve host 'example\.test'/);
+
+    // A connection refused names the host + port too.
+    const refusedError = Object.assign(new Error("fetch failed"), {
+      cause: { code: "ECONNREFUSED", message: "connect ECONNREFUSED 127.0.0.1:443" }
+    });
+    await expect(
+      directChat(chatRoute, messages, {
+        env,
+        fetchImpl: (async () => {
+          throw refusedError;
+        }) as typeof fetch
+      })
+    ).rejects.toThrow(/connection refused at example\.test/);
+  });
+
+  it("adds an auth hint to a 401 (review 2026-07-08)", async () => {
+    await expect(
+      directChat(chatRoute, messages, {
+        env,
+        fetchImpl: (async () => new Response(JSON.stringify({ error: "invalid api key" }), { status: 401 })) as typeof fetch
+      })
+    ).rejects.toThrow(/HTTP 401.*check the API key/s);
+  });
 });
 
 describe("isChatCapableFamily", () => {

@@ -2,6 +2,7 @@ import { normalizeKnownPathFields, normalizeMsysPath } from "../../src/runtime/p
 
 describe("pathNormalization", () => {
   it("should normalize MSYS absolute paths", () => {
+    expect(normalizeMsysPath("/c")).toBe("C:/");
     expect(normalizeMsysPath("/c/Users/Example/project")).toBe("C:/Users/Example/project");
     expect(normalizeMsysPath("relative/path")).toBe("relative/path");
   });
