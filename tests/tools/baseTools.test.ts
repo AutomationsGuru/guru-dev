@@ -197,6 +197,77 @@ describe("bash full-command-line handling (shakedown fixes)", () => {
     );
   });
 
+  it.each(["a&b", "%PATH%", "!PATH!", "(echo)", "^oops"])("rejects cmd metasyntax in an explicit argument: %s", async (argument) => {
+    let calls = 0;
+    const tool = createPiBashTool({
+      shellAllowlist: ["npm"],
+      executor: async () => {
+        calls += 1;
+        return { exitCode: 0, stdout: "unexpected", stderr: "", durationMs: 1 };
+      }
+    });
+    const output = await tool.execute({
+      repoRoot: process.cwd(),
+      command: "npm",
+      args: ["test", argument],
+      timeoutMs: 5000,
+      maxOutputBytes: 64000,
+      dryRun: false
+    }, {});
+
+    expect(calls).toBe(0);
+    expect(output.blockers).toContain(
+      "Shell operators are not supported by the argv command runner; issue each command as a separate tool call."
+    );
+  });
+
+  it("validates the final argv after stripping full-line quotes", async () => {
+    let calls = 0;
+    const tool = createPiBashTool({
+      shellAllowlist: ["npm"],
+      executor: async () => {
+        calls += 1;
+        return { exitCode: 0, stdout: "unexpected", stderr: "", durationMs: 1 };
+      }
+    });
+    const output = await tool.execute({
+      repoRoot: process.cwd(),
+      command: 'npm test "a&b"',
+      args: [],
+      timeoutMs: 5000,
+      maxOutputBytes: 64000,
+      dryRun: false
+    }, {});
+
+    expect(calls).toBe(0);
+    expect(output.executed).toBe(false);
+    expect(output.blockers).toContain(
+      "Shell operators are not supported by the argv command runner; issue each command as a separate tool call."
+    );
+  });
+
+  it("allows ordinary punctuation for native executables that do not need cmd.exe", async () => {
+    let seen: readonly string[] = [];
+    const tool = createPiBashTool({
+      shellAllowlist: ["node"],
+      executor: async (command) => {
+        seen = command;
+        return { exitCode: 0, stdout: "ok", stderr: "", durationMs: 1 };
+      }
+    });
+    const output = await tool.execute({
+      repoRoot: process.cwd(),
+      command: "node",
+      args: ["-e", "console.log('ok!')"],
+      timeoutMs: 5000,
+      maxOutputBytes: 64000,
+      dryRun: false
+    }, {});
+
+    expect(output.executed).toBe(true);
+    expect(seen).toEqual(["node", "-e", "console.log('ok!')"]);
+  });
+
   it("rejects an unterminated quoted argument instead of silently changing it", async () => {
     let calls = 0;
     const tool = createPiBashTool({

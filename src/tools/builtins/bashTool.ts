@@ -2,7 +2,7 @@ import { isAbsolute, relative, resolve } from "node:path";
 
 import { z } from "zod";
 
-import { executeCommand, type CommandExecutor } from "../../review/gates.js";
+import { executeCommand, requiresWindowsCommandShim, type CommandExecutor } from "../../review/gates.js";
 import { guardContent } from "../../safety/policyGuard.js";
 import type { ToolDefinition } from "../registry.js";
 import { optimizeBashOutput, DEFAULT_BASH_OPTIMIZER_CONFIG, type BashOptimizerConfig } from "../bashOptimizer.js";
@@ -65,12 +65,15 @@ export function createPiBashTool(options: PiBashToolOptions = { shellAllowlist: 
       // real-task shakedown). Quote-aware split when no separate args were given.
       const parsed = input.args.length === 0 ? parseCommandLine(input.command) : { command: [input.command, ...input.args] };
       const command = parsed.command;
-      const explicitArgsBlocker = input.args.length > 0 && command.some(containsUnsupportedShellSyntax)
+      // Validate the FINAL argv, including tokens produced by quote-aware
+      // splitting. On Windows bare npm/git/etc. run through cmd.exe to reach
+      // their .cmd shims, so stripped quotes must never expose cmd metasyntax.
+      const argvSyntaxBlocker = command[0] !== undefined && requiresWindowsCommandShim(command[0]) && command.some(containsUnsupportedShellSyntax)
         ? SHELL_SYNTAX_BLOCKER
         : undefined;
       const blockers = [
         ...(parsed.blocker ? [parsed.blocker] : []),
-        ...(explicitArgsBlocker ? [explicitArgsBlocker] : []),
+        ...(argvSyntaxBlocker ? [argvSyntaxBlocker] : []),
         ...buildBlockers(command, cwd, repoRoot, options)
       ];
       if (blockers.length > 0) {
@@ -195,7 +198,7 @@ const SHELL_SYNTAX_BLOCKER =
   "Shell operators are not supported by the argv command runner; issue each command as a separate tool call.";
 
 function containsUnsupportedShellSyntax(value: string): boolean {
-  return /[\r\n&|;<>`]/u.test(value);
+  return /[\r\n&|;<>`^%!()]/u.test(value);
 }
 
 /**

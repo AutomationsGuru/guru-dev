@@ -15,6 +15,18 @@ export function commandExists(name: string): boolean {
   }
 }
 
+const WINDOWS_COMMAND_SHIMS = new Set([
+  "npm", "npx", "pnpm", "pnpx", "yarn", "yarnpkg", "corepack",
+  "tsc", "tsx", "vitest", "eslint", "prettier"
+]);
+
+/** Whether a Windows command is a batch/.cmd shim that requires cmd.exe. */
+export function requiresWindowsCommandShim(executable: string): boolean {
+  const normalized = executable.replace(/\\/gu, "/").toLowerCase();
+  const name = normalized.slice(normalized.lastIndexOf("/") + 1);
+  return /\.(?:cmd|bat)$/u.test(name) || WINDOWS_COMMAND_SHIMS.has(name);
+}
+
 export type ReviewGateVerdict = "GREEN" | "YELLOW" | "RED";
 export type GateKind = "validation" | "review";
 export type GateStatus = "passed" | "failed";
@@ -165,12 +177,10 @@ export async function executeCommand(
     };
   }
 
-  // Only bare tool names (no path separators / absolute paths) may go through
-  // cmd.exe. Absolute or relative paths are always spawn'd as argv0 with shell:false
-  // so CodeQL js/shell-command-injection-from-environment stays quiet and a hostile
-  // path cannot ride `/c` into a different interpretation.
-  const isBareToolName = /^[A-Za-z0-9._-]+$/u.test(executable);
-  const needsCmdShell = process.platform === "win32" && isBareToolName && !/\.exe$/iu.test(executable);
+  // Native executables (node/git/pwsh/etc.) stay shell:false on Windows too.
+  // Only known package-manager/tooling .cmd shims and explicit .cmd/.bat files
+  // need cmd.exe; their argv is metasyntax-checked by the bounded bash tool.
+  const needsCmdShell = process.platform === "win32" && requiresWindowsCommandShim(executable);
 
   return new Promise<CommandExecutionResult>((resolveExecution) => {
     const child = needsCmdShell

@@ -22,7 +22,8 @@ All notable changes to GuruHarness are documented here.
 - **Idle Ctrl+C draft loss:** quitting now requires two consecutive presses inside the 1.5-second window; ordinary input disarms the pending exit.
 - **Narrow-terminal overflow:** status bars and rounded boxes now honor the available width, while `/model` shows a bounded ready-first list and leaves the exhaustive catalog to `/models`.
 - **Streaming transport stalls and resets:** SSE accepts CRLF boundaries split across chunks, retries retryable open failures, times out inactive response bodies, and preserves partial text when a stream fails after output begins.
-- **MCP session lifecycle:** configured MCP tools attach to new and resumed runtime sessions, expose per-server status, and close retained clients during session/runtime teardown.
+- **Canceled or malformed streamed actions:** Ctrl+C, clean early EOF, truncation/content filtering, and invalid JSON arguments can preserve visible partial text but never authorize or execute an uncommitted tool call.
+- **MCP session lifecycle:** configured MCP tools attach to new and resumed runtime sessions, report per-server readiness under `/tools`, and close retained clients across Guru, RPC, API, CLI, capability-smoke, and self-build owners/retries.
 - **Command execution ambiguity:** the argv command runner rejects unsupported shell operators and unterminated quotes with a recovery hint instead of silently executing a different command.
 - **Bounded UTF-8 reads:** the read tool no longer loads the whole file and never returns a replacement character when byte limits split a multibyte character; `nextOffset` identifies the safe continuation point.
 - **Hint line width on resize:** `chromeRows` passes the composer's paint width into `composerHintLine` (was `undefined` → `stdout.columns` drift vs status bar).

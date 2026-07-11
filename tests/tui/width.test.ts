@@ -106,4 +106,12 @@ describe("stringDisplayWidth — grapheme clusters", () => {
     expect(clipped).toContain(`aaaa${family}`);
     expect(visibleWidth(clipped)).toBe(7);
   });
+
+  it("keeps rounded-box titles inside a very narrow maxWidth", async () => {
+    const { roundedBox } = await import("../../src/tui/components.js");
+    const { createPainter } = await import("../../src/tui/theme.js");
+    const rows = roundedBox(createPainter({ level: "none" }), ["body"], { title: "BOOT RITUAL", maxWidth: 8 });
+
+    expect(rows.every((row) => visibleWidth(row) <= 8)).toBe(true);
+  });
 });

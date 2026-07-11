@@ -76,7 +76,7 @@ function offsetAtDisplayColumn(line: string, targetColumn: number): number {
     const end = offset + grapheme.length;
     const nextDisplayColumn = displayColumn + graphemeDisplayWidth(grapheme);
     if (targetColumn < nextDisplayColumn) {
-      return targetColumn - displayColumn < nextDisplayColumn - targetColumn ? offset : end;
+      return targetColumn - displayColumn <= nextDisplayColumn - targetColumn ? offset : end;
     }
     if (targetColumn === nextDisplayColumn) return end;
     offset = end;
