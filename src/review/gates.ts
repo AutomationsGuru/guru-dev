@@ -29,6 +29,28 @@ export function requiresWindowsCommandShim(executable: string): boolean {
   return /\.(?:cmd|bat)$/u.test(name) || WINDOWS_COMMAND_SHIMS.has(name);
 }
 
+/**
+ * Canonical (taint-free) token to hand cmd.exe for a bare allowlisted shim, or
+ * null when the command must never ride a shell. The returned string is the
+ * SET constant, not the caller's input, so env/config-tainted strings cannot
+ * reach cmd.exe's line parser (CodeQL js/shell-command-injection-from-environment).
+ * Path-qualified commands always return null — explicit .cmd/.bat paths go
+ * through resolveWindowsGateSpawn instead.
+ */
+function canonicalWindowsShim(executable: string): string | null {
+  const lower = executable.toLowerCase();
+  if (lower.includes("/") || lower.includes("\\") || /^[a-z]:/u.test(lower)) {
+    return null;
+  }
+  const bare = lower.replace(/\.(?:cmd|bat)$/u, "");
+  for (const shim of WINDOWS_COMMAND_SHIMS) {
+    if (shim === bare) {
+      return shim;
+    }
+  }
+  return null;
+}
+
 export type ReviewGateVerdict = "GREEN" | "YELLOW" | "RED";
 export type GateKind = "validation" | "review";
 export type GateStatus = "passed" | "failed";
@@ -264,14 +286,21 @@ export async function executeCommand(
   }
 
   // Native executables (node/git/pwsh/etc.) stay shell:false on Windows too.
-  // Only known package-manager/tooling .cmd shims and explicit .cmd/.bat files
-  // need cmd.exe; their argv is metasyntax-checked by the bounded bash tool.
-  const needsCmdShell = process.platform === "win32" && requiresWindowsCommandShim(executable);
+  // Only bare, allowlisted package-manager/tooling shims ride cmd.exe — and the
+  // token handed to cmd.exe is the allowlist CONSTANT (canonicalWindowsShim), so
+  // caller-tainted strings never reach the shell line parser. Explicit .cmd/.bat
+  // paths resolve through resolveWindowsGateSpawn (npm/npx → node <npm-cli.js>);
+  // argv is metasyntax-checked upstream by the bounded bash tool.
+  const shim = process.platform === "win32" ? canonicalWindowsShim(executable) : null;
+  const direct =
+    shim === null && process.platform === "win32" && requiresWindowsCommandShim(executable)
+      ? resolveWindowsGateSpawn(command)
+      : { executable, args: [...args] };
 
   return new Promise<CommandExecutionResult>((resolveExecution) => {
-    const child = needsCmdShell
-      ? spawn("cmd.exe", ["/c", executable, ...args], { cwd: context.cwd, shell: false, windowsHide: true })
-      : spawn(executable, args, { cwd: context.cwd, shell: false, windowsHide: true });
+    const child = shim !== null
+      ? spawn("cmd.exe", ["/c", shim, ...args], { cwd: context.cwd, shell: false, windowsHide: true })
+      : spawn(direct.executable, direct.args, { cwd: context.cwd, shell: false, windowsHide: true });
     let stdout = "";
     let stderr = "";
     let settled = false;

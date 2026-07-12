@@ -35,7 +35,20 @@ const defaultEstimate = (text: string): number => Math.ceil(text.length / 4);
 
 /** Matches `@path` tokens at a word boundary (start or after whitespace). */
 const REFERENCE_PATTERN = /(^|\s)@([^\s@]+)/gu;
-const TRAILING_REFERENCE_PUNCTUATION = /[,.:)]+$/u;
+const TRAILING_REFERENCE_PUNCTUATION_CHARS = ",.:)";
+
+/**
+ * Strip sentence punctuation off a captured path tail in LINEAR time — the
+ * regex form (`/[,.:)]+$/`) backtracks polynomially on long runs of `)`
+ * (CodeQL js/polynomial-redos; composer input is attacker-adjacent via paste).
+ */
+function stripTrailingReferencePunctuation(path: string): string {
+  let end = path.length;
+  while (end > 0 && TRAILING_REFERENCE_PUNCTUATION_CHARS.includes(path.charAt(end - 1))) {
+    end -= 1;
+  }
+  return path.slice(0, end);
+}
 
 interface Reference {
   readonly raw: string; // the "@path" token
@@ -49,7 +62,7 @@ function findReferences(text: string): readonly Reference[] {
     const lead = match[1] ?? "";
     // Sentence punctuation is not part of the path. Leave it outside `raw` so
     // reverse splicing naturally preserves it after the expanded block.
-    const rel = (match[2] ?? "").replace(TRAILING_REFERENCE_PUNCTUATION, "");
+    const rel = stripTrailingReferencePunctuation(match[2] ?? "");
     if (rel.length === 0) {
       continue;
     }
