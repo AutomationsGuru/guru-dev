@@ -14,7 +14,7 @@ describe("openai-codex — the ChatGPT plan lane (native OAuth, no CLI delegate)
   });
 
   it("wires the Responses endpoint via guru's OWN vaulted OAuth token — no ~/.codex cache", () => {
-    const route = catalog.find((candidate) => candidate.routeId === "openai-codex/gpt-5.5");
+    const route = catalog.find((candidate) => candidate.routeId === "openai-codex/gpt-5.6-sol");
     expect(route).toBeDefined();
     expect(route?.apiFamily).toBe("openai-responses");
     expect(route?.baseUrl).toBe("https://chatgpt.com/backend-api/codex");
@@ -28,9 +28,9 @@ describe("openai-codex — the ChatGPT plan lane (native OAuth, no CLI delegate)
     expect(accountHeader?.filePath).toBeUndefined();
   });
 
-  it("openai-codex/gpt-5.5 is the #1 auto-connect pick (delegate no longer squats rank 1)", () => {
+  it("openai-codex/gpt-5.6-sol is the #1 auto-connect pick", () => {
     const sorted = [...catalog].sort((a, b) => (a.directFirstRank ?? 999) - (b.directFirstRank ?? 999));
-    expect(sorted[0]?.routeId).toBe("openai-codex/gpt-5.5");
+    expect(sorted[0]?.routeId).toBe("openai-codex/gpt-5.6-sol");
   });
 
   it("grok carries its Phase B wire; zai-coding flipped active on probe", () => {

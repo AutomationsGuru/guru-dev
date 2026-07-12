@@ -1,6 +1,6 @@
 import { visibleWidth } from "./components.js";
 import type { Painter } from "./theme.js";
-import { charDisplayWidth } from "./width.js";
+import { graphemeDisplayWidth, segmentGraphemes, stringDisplayWidth } from "./width.js";
 
 /**
  * The composer editor (P1 wave, ADR 2026-07-05-composer-editor): a pure
@@ -68,63 +68,60 @@ function clamp(value: number, low: number, high: number): number {
   return Math.max(low, Math.min(high, value));
 }
 
-/**
- * Snap a UTF-16 offset to a code-point boundary. The ↑/↓ column clamp can land
- * between a surrogate pair (the previous line's col falls mid-emoji on the next
- * line); the next insert/backspace there corrupted the character into U+FFFD.
- */
-function snapToCharBoundary(line: string, col: number): number {
-  if (col > 0 && col < line.length) {
-    const high = line.charCodeAt(col - 1);
-    const low = line.charCodeAt(col);
-    if (high >= 0xd800 && high <= 0xdbff && low >= 0xdc00 && low <= 0xdfff) {
-      return col - 1;
+/** Map a display-cell column to the nearest UTF-16 grapheme boundary. */
+function offsetAtDisplayColumn(line: string, targetColumn: number): number {
+  let offset = 0;
+  let displayColumn = 0;
+  for (const grapheme of segmentGraphemes(line)) {
+    const end = offset + grapheme.length;
+    const nextDisplayColumn = displayColumn + graphemeDisplayWidth(grapheme);
+    if (targetColumn < nextDisplayColumn) {
+      return targetColumn - displayColumn <= nextDisplayColumn - targetColumn ? offset : end;
     }
+    if (targetColumn === nextDisplayColumn) return end;
+    offset = end;
+    displayColumn = nextDisplayColumn;
   }
-  return col;
+  return line.length;
+}
+
+function displayColumnAtOffset(line: string, col: number): number {
+  return stringDisplayWidth(line.slice(0, col));
 }
 
 // ---------------------------------------------------------------------------
-// Code-point + display-width helpers (adversarial review 2026-07-05): editing
-// steps whole code points (never splits a surrogate pair), and wrapping counts
+// Grapheme + display-width helpers: editing steps user-perceived characters, and wrapping counts
 // DISPLAY columns (CJK/emoji are 2 cells) so the relative-move row accounting
 // matches what the terminal actually draws.
 // ---------------------------------------------------------------------------
 
-/** Length in UTF-16 units of the code point ENDING at `col` (for backspace/←). */
-function prevCharLength(line: string, col: number): number {
-  if (col >= 2) {
-    const high = line.charCodeAt(col - 2);
-    const low = line.charCodeAt(col - 1);
-    if (high >= 0xd800 && high <= 0xdbff && low >= 0xdc00 && low <= 0xdfff) {
-      return 2;
+/** Length in UTF-16 units of the grapheme ENDING at `col` (for backspace/←). */
+function prevGraphemeLength(line: string, col: number): number {
+  let offset = 0;
+  for (const grapheme of segmentGraphemes(line)) {
+    const end = offset + grapheme.length;
+    if (col <= end) {
+      return col - offset;
     }
+    offset = end;
   }
-  return col > 0 ? 1 : 0;
+  return 0;
 }
 
-/** Length in UTF-16 units of the code point STARTING at `col` (for delete/→). */
-function nextCharLength(line: string, col: number): number {
-  const code = line.charCodeAt(col);
-  if (code >= 0xd800 && code <= 0xdbff && col + 1 < line.length) {
-    const low = line.charCodeAt(col + 1);
-    if (low >= 0xdc00 && low <= 0xdfff) {
-      return 2;
+/** Length in UTF-16 units of the grapheme STARTING at `col` (for delete/→). */
+function nextGraphemeLength(line: string, col: number): number {
+  let offset = 0;
+  for (const grapheme of segmentGraphemes(line)) {
+    const end = offset + grapheme.length;
+    if (col < end) {
+      return end - col;
     }
+    offset = end;
   }
-  return col < line.length ? 1 : 0;
+  return 0;
 }
-// Re-export from the shared width module (single source of truth — 2026-07-09 audit).
-export { charDisplayWidth } from "./width.js";
-
-/** Total display width of a plain (unstyled) string. */
-export function stringDisplayWidth(text: string): number {
-  let width = 0;
-  for (const char of text) {
-    width += charDisplayWidth(char.codePointAt(0) ?? 0);
-  }
-  return width;
-}
+// Re-export from the shared width module for compatibility with existing callers.
+export { charDisplayWidth, stringDisplayWidth } from "./width.js";
 
 function currentLine(state: EditorState): string {
   return state.lines[state.row] ?? "";
@@ -192,7 +189,7 @@ function insertPaste(state: EditorState, text: string): EditorState {
 function backspace(state: EditorState): EditorState {
   if (state.col > 0) {
     const line = currentLine(state);
-    const step = prevCharLength(line, state.col); // whole code point, never half a surrogate
+    const step = prevGraphemeLength(line, state.col);
     const next = line.slice(0, state.col - step) + line.slice(state.col);
     return { ...state, lines: replaceLine(state.lines, state.row, next), col: state.col - step };
   }
@@ -209,7 +206,7 @@ function backspace(state: EditorState): EditorState {
 function forwardDelete(state: EditorState): EditorState {
   const line = currentLine(state);
   if (state.col < line.length) {
-    const step = nextCharLength(line, state.col);
+    const step = nextGraphemeLength(line, state.col);
     return { ...state, lines: replaceLine(state.lines, state.row, line.slice(0, state.col) + line.slice(state.col + step)) };
   }
   if (state.row < state.lines.length - 1) {
@@ -222,7 +219,7 @@ function forwardDelete(state: EditorState): EditorState {
 
 function moveLeft(state: EditorState): EditorState {
   if (state.col > 0) {
-    return { ...state, col: state.col - prevCharLength(currentLine(state), state.col) };
+    return { ...state, col: state.col - prevGraphemeLength(currentLine(state), state.col) };
   }
   if (state.row > 0) {
     return { ...state, row: state.row - 1, col: (state.lines[state.row - 1] ?? "").length };
@@ -233,7 +230,7 @@ function moveLeft(state: EditorState): EditorState {
 function moveRight(state: EditorState): EditorState {
   const line = currentLine(state);
   if (state.col < line.length) {
-    return { ...state, col: state.col + nextCharLength(line, state.col) };
+    return { ...state, col: state.col + nextGraphemeLength(line, state.col) };
   }
   if (state.row < state.lines.length - 1) {
     return { ...state, row: state.row + 1, col: 0 };
@@ -246,16 +243,15 @@ function deleteWordBack(state: EditorState): EditorState {
   if (state.col === 0) {
     return backspace(state); // join lines, readline-compatible enough
   }
-  // Step back whole code points (never split a surrogate pair — adversarial
-  // review 2026-07-08 found the old `cut -= 1` corrupted emoji/CJK mid-word).
+  // Step back whole graphemes so composed emoji and combining sequences stay intact.
   let cut = state.col;
   while (cut > 0) {
-    const step = prevCharLength(line, cut);
+    const step = prevGraphemeLength(line, cut);
     if (!/\s/u.test(line.slice(cut - step, cut) ?? "")) break;
     cut -= step;
   }
   while (cut > 0) {
-    const step = prevCharLength(line, cut);
+    const step = prevGraphemeLength(line, cut);
     if (/\s/u.test(line.slice(cut - step, cut) ?? "")) break;
     cut -= step;
   }
@@ -361,7 +357,8 @@ export function editorReduce(state: EditorState, key: EditorKey): EditorStep {
     if (state.row > 0) {
       const row = state.row - 1;
       const line = state.lines[row] ?? "";
-      return render({ ...state, row, col: snapToCharBoundary(line, clamp(state.col, 0, line.length)) });
+      const displayColumn = displayColumnAtOffset(currentLine(state), state.col);
+      return render({ ...state, row, col: offsetAtDisplayColumn(line, displayColumn) });
     }
     return render(recallHistory(state, -1)); // first row → history, readline-style
   }
@@ -369,7 +366,8 @@ export function editorReduce(state: EditorState, key: EditorKey): EditorStep {
     if (state.row < state.lines.length - 1) {
       const row = state.row + 1;
       const line = state.lines[row] ?? "";
-      return render({ ...state, row, col: snapToCharBoundary(line, clamp(state.col, 0, line.length)) });
+      const displayColumn = displayColumnAtOffset(currentLine(state), state.col);
+      return render({ ...state, row, col: offsetAtDisplayColumn(line, displayColumn) });
     }
     return render(recallHistory(state, 1)); // last row → toward the draft
   }
@@ -426,7 +424,7 @@ export function renderEditorFrame(
   let cursorCol = 1;
 
   state.lines.forEach((line, index) => {
-    // Split into DISPLAY-width chunks, stepping whole code points: CJK/emoji
+    // Split into DISPLAY-width chunks, stepping whole graphemes: CJK/emoji
     // occupy 2 terminal cells, and slicing UTF-16 units would let the terminal
     // hard-wrap rows the renderer doesn't know about, breaking the relative-move
     // accounting (adversarial review 2026-07-05).
@@ -446,17 +444,17 @@ export function renderEditorFrame(
       }
     };
     placeCursorIfHere();
-    for (const char of line) {
-      const width = charDisplayWidth(char.codePointAt(0) ?? 0);
+    for (const grapheme of segmentGraphemes(line)) {
+      const width = graphemeDisplayWidth(grapheme);
       if (currentWidth + width > contentWidth && current.length > 0) {
         chunks.push(current);
         current = "";
         currentWidth = 0;
         placeCursorIfHere(); // exact-boundary cursor lands on the NEW row
       }
-      current += char;
+      current += grapheme;
       currentWidth += width;
-      offset += char.length;
+      offset += grapheme.length;
       placeCursorIfHere();
     }
     chunks.push(current);

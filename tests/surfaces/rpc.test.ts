@@ -12,6 +12,7 @@ import { sanitizeToolOutput } from "../../src/safety/outputSanitizer.js";
 import { clearRegisteredSecretValues } from "../../src/safety/secretSafety.js";
 import { createFileMemoryStore } from "../../src/memory/store.js";
 import type { AgentTurnResult } from "../../src/model/agentTurn.js";
+import { createHarnessRuntime } from "../../src/runtime/session.js";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -113,6 +114,24 @@ describe("RPC dispatch — on the unified AgentSession engine", () => {
 });
 
 describe("runRpcMode — request ordering", () => {
+  it("closes the runtime it bootstraps when input ends", async () => {
+    const runtime = createHarnessRuntime();
+    const closeRuntime = runtime.close.bind(runtime);
+    let closeCalls = 0;
+    runtime.close = async () => {
+      closeCalls += 1;
+      await closeRuntime();
+    };
+    const input = new PassThrough();
+    const output = new PassThrough();
+    input.end();
+
+    await runRpcMode({ input, output, createRuntime: () => runtime });
+
+    expect(closeCalls).toBe(1);
+    await expect(runtime.startSession()).rejects.toThrow("Harness runtime is closed");
+  });
+
   it("processes follow_up immediately while a prompt is still running", async () => {
     let releasePrompt: (() => void) | undefined;
     const promptGate = new Promise<void>((resolve) => {

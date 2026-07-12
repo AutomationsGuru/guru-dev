@@ -9,16 +9,16 @@ import { LITELLM_BASELINE_ALIASES, LITELLM_PROVIDER_GROUPS } from "../../src/rou
 const fixturePath = join(process.cwd(), "tests", "fixtures", "litellm.config.yaml");
 
 describe("parseLiteLlmConfigYaml", () => {
-  it("should parse the sanitized LiteLLM fixture into the 37 alias / 10 group baseline", () => {
+  it("should parse the sanitized LiteLLM fixture into the 39 alias / 11 group baseline", () => {
     const manifest = parseLiteLlmConfigYaml(readFileSync(fixturePath, "utf8"));
 
-    expect(manifest.aliases).toHaveLength(37);
-    expect(manifest.providerGroups).toHaveLength(10);
+    expect(manifest.aliases).toHaveLength(39);
+    expect(manifest.providerGroups).toHaveLength(11);
     expect(manifest.baseline).toMatchObject({
-      expectedAliasCount: 37,
-      expectedProviderGroupCount: 10,
-      aliasCount: 37,
-      providerGroupCount: 10,
+      expectedAliasCount: 39,
+      expectedProviderGroupCount: 11,
+      aliasCount: 39,
+      providerGroupCount: 11,
       missingAliases: [],
       extraAliases: [],
       missingProviderGroups: [],
@@ -38,7 +38,7 @@ describe("parseLiteLlmConfigYaml", () => {
       alias: "router-openai-gpt-5-5",
       providerGroup: "openai-platform",
       provider: "openai",
-      model: "openai/gpt-5.5",
+      model: "openai/gpt-5.6-sol",
       apiBase: "https://api.openai.com/v1",
       credentialEnvVarNames: ["OPENAI_API_KEY"],
       metadata: { router_aliases: ["router-openai-gpt-5-5"] }
@@ -55,8 +55,8 @@ describe("parseLiteLlmConfigYaml", () => {
   it("should preserve aggregate metadata.router_aliases for downstream parity manifests", () => {
     const manifest = parseLiteLlmConfigYaml(readFileSync(fixturePath, "utf8"));
 
-    expect(manifest.metadata.router_aliases).toHaveLength(37);
-    expect(manifest.metadata.router_aliases).toContain("router-minimax-codex");
+    expect(manifest.metadata.router_aliases).toHaveLength(39);
+    expect(manifest.metadata.router_aliases).toContain("router-minimax-m27");
     expect(manifest.metadata.router_aliases).toContain("router-vertex-claude-sonnet-4-6");
   });
 

@@ -3,15 +3,18 @@ import { Readable } from "node:stream";
 import {
   approvalChoiceFromAnswer,
   completeSlashCommand,
+  createIdleInterruptGuard,
   evaluateSlashGuess,
   filterSlashCommands,
+  formatMcpStatusLines,
   formatApprovalOutcome,
   injectRepoRoot,
   parseSlashCommand,
   readApprovalAnswer,
   resolveRouteSelector,
   sortedRoutes,
-  SLASH_COMMANDS
+  SLASH_COMMANDS,
+  withRuntimeCleanup
 } from "../../src/guru.js";
 import { createDirectProviderCatalog } from "../../src/providers/catalog.js";
 
@@ -26,6 +29,77 @@ describe("parseSlashCommand", () => {
   it("returns null for chat text", () => {
     expect(parseSlashCommand("hello there")).toBeNull();
     expect(parseSlashCommand("  what is 2+2?")).toBeNull();
+  });
+});
+
+describe("idle Ctrl+C exit guard", () => {
+  it("exits only on a second consecutive interrupt inside the quit window", () => {
+    let now = 1_000;
+    const guard = createIdleInterruptGuard({ windowMs: 1_500, now: () => now });
+
+    expect(guard.interrupt()).toBe("arm");
+    now += 500;
+    expect(guard.interrupt()).toBe("exit");
+  });
+
+  it("normal input disarms a pending exit", () => {
+    const guard = createIdleInterruptGuard();
+
+    expect(guard.interrupt()).toBe("arm");
+    guard.activity();
+    expect(guard.interrupt()).toBe("arm");
+  });
+
+  it("an expired quit window requires a fresh first interrupt", () => {
+    let now = 1_000;
+    const guard = createIdleInterruptGuard({ windowMs: 1_500, now: () => now });
+
+    expect(guard.interrupt()).toBe("arm");
+    now += 1_501;
+    expect(guard.interrupt()).toBe("arm");
+  });
+});
+
+describe("runtime cleanup", () => {
+  it("closes runtime resources after a normal interactive run", async () => {
+    const close = vi.fn(async () => {});
+
+    await expect(withRuntimeCleanup(async () => "done", close)).resolves.toBe("done");
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("closes runtime resources when the interactive run throws", async () => {
+    const close = vi.fn(async () => {});
+    const failure = new Error("composer failed");
+
+    await expect(withRuntimeCleanup(async () => Promise.reject(failure), close)).rejects.toBe(failure);
+    expect(close).toHaveBeenCalledOnce();
+  });
+});
+
+describe("MCP status visibility", () => {
+  it("formats missing and broken configured servers for the /tools surface", () => {
+    const lines = formatMcpStatusLines([
+      {
+        serverId: "docs",
+        status: "missing-env",
+        transport: "stdio",
+        missingEnvNames: ["DOCS_TOKEN"],
+        summary: "Missing required environment variable."
+      },
+      {
+        serverId: "broken",
+        status: "error",
+        transport: "stdio",
+        missingEnvNames: [],
+        summary: "Discovery failed."
+      }
+    ]);
+
+    expect(lines).toEqual([
+      "docs · missing-env · Missing required environment variable. · missing: DOCS_TOKEN",
+      "broken · error · Discovery failed."
+    ]);
   });
 });
 
@@ -200,6 +274,14 @@ describe("evaluateSlashGuess — Enter-on-slash policy", () => {
     expect(evaluateSlashGuess({ command: "/com", args: [] })).toEqual({
       kind: "blocked",
       command: "/compact",
+      reason: "no-guess-run"
+    });
+  });
+
+  it("/rewind (side-effect: session fork) → blocked on /rew prefix", () => {
+    expect(evaluateSlashGuess({ command: "/rew", args: [] })).toEqual({
+      kind: "blocked",
+      command: "/rewind",
       reason: "no-guess-run"
     });
   });

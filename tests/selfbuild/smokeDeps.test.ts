@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { makeSmokeDeps } from "../../src/selfbuild/smokeDeps.js";
+import { createHarnessRuntime } from "../../src/runtime/session.js";
+import { defaultSmokeSelfCall, makeSmokeDeps } from "../../src/selfbuild/smokeDeps.js";
 
 describe("makeSmokeDeps (P7) — live SMOKE deps from capability-smoke", () => {
   it("runSmoke returns the capability-smoke verdict", async () => {
@@ -31,5 +32,35 @@ describe("makeSmokeDeps (P7) — live SMOKE deps from capability-smoke", () => {
   it("skipSelfCall leaves selfCall undefined", () => {
     const deps = makeSmokeDeps({ skipSelfCall: true });
     expect(deps.selfCall).toBeUndefined();
+  });
+
+  it("default self-call closes its runtime after success", async () => {
+    const runtime = createHarnessRuntime();
+    const closeRuntime = runtime.close.bind(runtime);
+    let closeCalls = 0;
+    runtime.close = async () => {
+      closeCalls += 1;
+      await closeRuntime();
+    };
+
+    await defaultSmokeSelfCall(new AbortController().signal, process.cwd(), () => runtime);
+
+    expect(closeCalls).toBe(1);
+  });
+
+  it("default self-call closes its runtime when tool execution throws", async () => {
+    const runtime = createHarnessRuntime();
+    const closeRuntime = runtime.close.bind(runtime);
+    let closeCalls = 0;
+    runtime.close = async () => {
+      closeCalls += 1;
+      await closeRuntime();
+    };
+    runtime.executeTool = async () => {
+      throw new Error("smoke tool failed");
+    };
+
+    await expect(defaultSmokeSelfCall(new AbortController().signal, process.cwd(), () => runtime)).rejects.toThrow("smoke tool failed");
+    expect(closeCalls).toBe(1);
   });
 });

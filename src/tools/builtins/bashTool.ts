@@ -2,7 +2,7 @@ import { isAbsolute, relative, resolve } from "node:path";
 
 import { z } from "zod";
 
-import { executeCommand, type CommandExecutor } from "../../review/gates.js";
+import { executeCommand, requiresWindowsCommandShim, type CommandExecutor } from "../../review/gates.js";
 import { guardContent } from "../../safety/policyGuard.js";
 import type { ToolDefinition } from "../registry.js";
 import { optimizeBashOutput, DEFAULT_BASH_OPTIMIZER_CONFIG, type BashOptimizerConfig } from "../bashOptimizer.js";
@@ -48,9 +48,10 @@ export function createPiBashTool(options: PiBashToolOptions = { shellAllowlist: 
   const executor = options.executor ?? executeCommand;
   return {
     id: "bash",
-    title: "Run bash command",
+    title: "Run command (argv)",
     description:
-      "Bounded command runner (cwd containment, allowlist, timeout, truncation). Pass the full command line in `command` (e.g. \"npm test\") or executable + args separately. " +
+      "Bounded single-process argv runner (cwd containment, allowlist, timeout, truncation). Pass a simple command line (e.g. \"npm test\") or executable + args separately. " +
+      "Shell operators, redirects, pipes, expansion, and command chaining are intentionally unsupported; issue separate tool calls instead. " +
       "Before any destructive/delete command (rm, a truncating `>` redirect, git reset --hard, force-push), ask: does this really need to go? (yes/no) " +
       "Preserve, rename-aside, or enhance before you delete — destructive commands are double-checked even in YOLO.",
     inputSchema: PiBashToolInputSchema,
@@ -62,11 +63,19 @@ export function createPiBashTool(options: PiBashToolOptions = { shellAllowlist: 
       // Without this, "npm test" is treated as an executable NAME and blocked by the
       // allowlist — a silent no-op the model cannot diagnose (found in the 2026-07-02
       // real-task shakedown). Quote-aware split when no separate args were given.
-      const command =
-        input.args.length === 0 && /\s/u.test(input.command.trim())
-          ? splitCommandLine(input.command)
-          : [input.command, ...input.args];
-      const blockers = buildBlockers(command, cwd, repoRoot, options);
+      const parsed = input.args.length === 0 ? parseCommandLine(input.command) : { command: [input.command, ...input.args] };
+      const command = parsed.command;
+      // Validate the FINAL argv, including tokens produced by quote-aware
+      // splitting. On Windows bare npm/git/etc. run through cmd.exe to reach
+      // their .cmd shims, so stripped quotes must never expose cmd metasyntax.
+      const argvSyntaxBlocker = command[0] !== undefined && requiresWindowsCommandShim(command[0]) && command.some(containsUnsupportedShellSyntax)
+        ? SHELL_SYNTAX_BLOCKER
+        : undefined;
+      const blockers = [
+        ...(parsed.blocker ? [parsed.blocker] : []),
+        ...(argvSyntaxBlocker ? [argvSyntaxBlocker] : []),
+        ...buildBlockers(command, cwd, repoRoot, options)
+      ];
       if (blockers.length > 0) {
         return { executed: false, dryRun: input.dryRun, command: redactCommand(command), truncated: false, cancelled: false, blockers, summary: `Bash command blocked by ${blockers.length} policy check(s).` };
       }
@@ -185,12 +194,26 @@ function truncate(value: string, maxBytes: number): { readonly value: string; re
   return { value: buffer.subarray(0, cut).toString("utf8"), truncated: true };
 }
 
-/** Quote-aware whitespace tokenizer for full command lines ("npm test", 'git commit -m "x y"'). */
-function splitCommandLine(line: string): string[] {
+const SHELL_SYNTAX_BLOCKER =
+  "Shell operators are not supported by the argv command runner; issue each command as a separate tool call.";
+
+function containsUnsupportedShellSyntax(value: string): boolean {
+  return /[\r\n&|;<>`^%!()]/u.test(value);
+}
+
+/**
+ * Quote-aware tokenizer for one executable invocation. This is deliberately not
+ * a shell parser: syntax whose meaning depends on a shell is rejected rather
+ * than silently passed as ordinary argv (the old `&&` failure mode).
+ */
+function parseCommandLine(line: string): { readonly command: string[]; readonly blocker?: string } {
   const tokens: string[] = [];
   let current = "";
   let quote: '"' | "'" | null = null;
-  for (const char of line.trim()) {
+  let tokenStarted = false;
+  const trimmed = line.trim();
+  for (let index = 0; index < trimmed.length; index += 1) {
+    const char = trimmed[index] as string;
     if (quote) {
       if (char === quote) {
         quote = null;
@@ -199,17 +222,25 @@ function splitCommandLine(line: string): string[] {
       }
     } else if (char === '"' || char === "'") {
       quote = char;
+      tokenStarted = true;
+    } else if (char === "\n" || char === "\r" || char === "&" || char === "|" || char === ";" || char === "<" || char === ">" || char === "`") {
+      return { command: tokens.length > 0 ? tokens : current.length > 0 ? [current] : [], blocker: SHELL_SYNTAX_BLOCKER };
     } else if (/\s/u.test(char)) {
-      if (current.length > 0) {
+      if (tokenStarted || current.length > 0) {
         tokens.push(current);
         current = "";
+        tokenStarted = false;
       }
     } else {
       current += char;
+      tokenStarted = true;
     }
   }
-  if (current.length > 0) {
+  if (quote) {
+    return { command: tokens.length > 0 ? tokens : current.length > 0 ? [current] : [], blocker: "Command line has an unterminated quote; correct the quoting and retry." };
+  }
+  if (tokenStarted || current.length > 0) {
     tokens.push(current);
   }
-  return tokens;
+  return { command: tokens };
 }

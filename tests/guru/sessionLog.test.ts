@@ -12,6 +12,7 @@ const dirs: string[] = [];
 function freshStore() {
   const directory = join(tmpdir(), `guru-log-${process.pid}-${counter}`);
   dirs.push(directory);
+  rmSync(directory, { recursive: true, force: true });
   mkdirSync(directory, { recursive: true });
   let idN = 0;
   let ms = 0;

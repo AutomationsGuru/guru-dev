@@ -183,7 +183,7 @@ const frame = [
   `${mut("fgFaint", "›")} ${mut("fg", "/")}`,
   ...buildMenuOverlayRows(paint, menu),
   buildStatusBar(sessionState, COLS),
-  composerHintLine(paint, ["ctrl+j newline", "@ files", "tab paths"])
+  composerHintLine(paint, ["ctrl+j newline", "@ files", "tab paths"], { mode: "idle" })
 ];
 
 // ---------------------------------------------------------------------------

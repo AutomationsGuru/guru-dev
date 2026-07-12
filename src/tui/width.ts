@@ -74,6 +74,13 @@ function isWideSymbol(codePoint: number): boolean {
   return false;
 }
 
+const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+/** Split text at user-perceived character boundaries (emoji sequences stay whole). */
+export function segmentGraphemes(text: string): readonly string[] {
+  return [...GRAPHEME_SEGMENTER.segment(text)].map(({ segment }) => segment);
+}
+
 /** Display width of one code point: 0 for combining/zero-width, 2 for wide (CJK/emoji), else 1. */
 export function charDisplayWidth(codePoint: number): number {
   if (
@@ -99,4 +106,41 @@ export function charDisplayWidth(codePoint: number): number {
     return 2;
   }
   return 1;
+}
+
+/** Display width of one grapheme cluster. */
+export function graphemeDisplayWidth(grapheme: string): number {
+  let width = 0;
+  let regionalIndicators = 0;
+  let emojiPresentation = false;
+  for (const char of grapheme) {
+    const codePoint = char.codePointAt(0) ?? 0;
+    width = Math.max(width, charDisplayWidth(codePoint));
+    if (codePoint === 0xfe0f || codePoint === 0x20e3) {
+      emojiPresentation = true;
+    }
+    if (codePoint >= 0x1f1e6 && codePoint <= 0x1f1ff) {
+      regionalIndicators += 1;
+    }
+  }
+  // Regional indicators are individually narrow, but a paired flag occupies
+  // one emoji glyph.
+  if (regionalIndicators >= 2) {
+    return 2;
+  }
+  // VS16 explicitly requests emoji presentation; keycap clusters use U+20E3.
+  // Both occupy two terminal cells even when their ASCII/BMP base is narrow.
+  if (emojiPresentation) {
+    return Math.max(2, width);
+  }
+  return width;
+}
+
+/** Total terminal-cell width of plain text, measured by grapheme cluster. */
+export function stringDisplayWidth(text: string): number {
+  let width = 0;
+  for (const grapheme of segmentGraphemes(text)) {
+    width += graphemeDisplayWidth(grapheme);
+  }
+  return width;
 }

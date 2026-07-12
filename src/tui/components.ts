@@ -1,6 +1,6 @@
 import { gradientLine } from "./gradient.js";
 import type { Painter, ThemeTokens } from "./theme.js";
-import { charDisplayWidth } from "./width.js";
+import { charDisplayWidth, graphemeDisplayWidth, segmentGraphemes, stringDisplayWidth } from "./width.js";
 
 /** Component recipes per spec §5. */
 
@@ -24,20 +24,19 @@ export const GLYPHS = {
 export function visibleWidth(text: string): number {
   // eslint-disable-next-line no-control-regex
   const stripped = text.replace(/\x1b\[[0-9;]*m/gu, "");
-  let width = 0;
-  for (const char of stripped) {
-    width += charDisplayWidth(char.codePointAt(0) ?? 0);
-  }
-  return width;
+  return stringDisplayWidth(stripped);
 }
 
-/** ANSI-aware clip to a display-cell budget; ellipsis when cut (escapes kept). */
-function clipVisible(text: string, width: number): string {
+/** ANSI-aware clip to a display-cell budget; ellipsis by default (escapes kept). */
+export function clipVisible(text: string, width: number, options: { readonly ellipsis?: boolean } = {}): string {
   if (visibleWidth(text) <= width) {
     return text;
   }
   let out = "";
   let used = 0;
+  const withEllipsis = options.ellipsis ?? true;
+  const budget = Math.max(0, width - (withEllipsis ? 1 : 0));
+  let clipped = false;
   for (let at = 0; at < text.length; ) {
     if (text[at] === "\x1b") {
       const match = /^\x1b\[[0-9;]*m/u.exec(text.slice(at));
@@ -47,20 +46,28 @@ function clipVisible(text: string, width: number): string {
         continue;
       }
     }
-    const codePoint = text.codePointAt(at) ?? 0;
-    const char = String.fromCodePoint(codePoint);
-    const cells = charDisplayWidth(codePoint);
-    if (used + cells > width - 1) {
-      break; // reserve one cell for the ellipsis
+    const nextEscape = text.indexOf("\x1b", at);
+    const plainEnd = nextEscape === -1 ? text.length : nextEscape;
+    const plain = text.slice(at, plainEnd);
+    for (const grapheme of segmentGraphemes(plain)) {
+      const cells = graphemeDisplayWidth(grapheme);
+      if (used + cells > budget) {
+        clipped = true;
+        break;
+      }
+      out += grapheme;
+      used += cells;
     }
-    out += char;
-    used += cells;
-    at += char.length;
+    if (clipped) {
+      break;
+    }
+    at = plainEnd;
   }
   // Re-arm styling only when the clipped text actually used escapes (plain
   // no-color output must stay escape-free).
-  return `${out}…${out.includes("\x1b[") ? "\x1b[0m" : ""}`;
+  return `${out}${withEllipsis ? "…" : ""}${out.includes("\x1b[") ? "\x1b[0m" : ""}`;
 }
+
 
 export type BadgeKind = "brand" | "success" | "warning" | "error" | "ghost";
 
@@ -88,14 +95,16 @@ export function roundedBox(painter: Painter, lines: readonly string[], options: 
   // hard-wrap, shattering the box on every 80-col boot. Non-TTY callers and
   // tests see no clamp unless they pass maxWidth.
   const maxWidth = options.maxWidth ?? (process.stdout.isTTY && process.stdout.columns ? process.stdout.columns - 1 : Number.POSITIVE_INFINITY);
-  const maxContent = Math.max(8, maxWidth - 4);
+  const maxContent = Math.max(1, maxWidth - 4);
   const clipped = Number.isFinite(maxContent) ? lines.map((line) => clipVisible(line, maxContent)) : [...lines];
   const contentWidth = Math.min(maxContent, Math.max(options.width ?? 0, ...clipped.map(visibleWidth), options.title ? visibleWidth(options.title) + 4 : 0));
   const borderToken: keyof ThemeTokens = options.focused ? "accent" : "border";
   const edge = (text: string): string => painter.fg(borderToken, text);
+  const titleBudget = Math.max(0, contentWidth - 1);
+  const visibleTitle = options.title && titleBudget > 0 ? clipVisible(options.title, titleBudget) : undefined;
   // Title row chrome: "╭─ " + title + " " + dashes + "╮" must total contentWidth + 4.
-  const title = options.title
-    ? `${edge("╭─ ")}${painter.bold(painter.fg("muted", options.title))}${edge(` ${"─".repeat(Math.max(0, contentWidth - visibleWidth(options.title) - 1))}╮`)}`
+  const title = visibleTitle
+    ? `${edge("╭─ ")}${painter.bold(painter.fg("muted", visibleTitle))}${edge(` ${"─".repeat(Math.max(0, contentWidth - visibleWidth(visibleTitle) - 1))}╮`)}`
     : edge(`╭${"─".repeat(contentWidth + 2)}╮`);
 
   return [

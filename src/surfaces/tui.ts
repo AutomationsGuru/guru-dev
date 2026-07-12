@@ -116,7 +116,12 @@ export function runInteractiveTui(context: TuiContext = {}): Promise<void> {
     };
 
     rl.on("line", (line) => {
-      void handleLine(line);
+      // A rejected command (zod parse error, handler throw) must print + re-prompt,
+      // not kill the whole shell with an unhandled rejection.
+      handleLine(line).catch((error: unknown) => {
+        console.error(error instanceof Error ? error.message : String(error));
+        rl.prompt();
+      });
     });
 
     rl.on("close", () => {

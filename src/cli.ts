@@ -118,16 +118,20 @@ if (command === "self-build-plan") {
   const inputJson = getFlagValue(args, "--input-json");
   const inputFile = getFlagValue(args, "--input-file");
   const runtime = createHarnessRuntime();
-  const session = await runtime.startSession({
-    ...(configPath ? { configPath } : {}),
-    ...(cwd ? { cwd } : {}),
-    ...(targetPath ? { targetPath } : {}),
-    ...(taskId ? { taskId } : {}),
-    skillIds
-  });
-  const observation = await runtime.executeTool(session.id, toolId, normalizeKnownPathFields(parseToolRunInput(inputJson, inputFile)));
+  try {
+    const session = await runtime.startSession({
+      ...(configPath ? { configPath } : {}),
+      ...(cwd ? { cwd } : {}),
+      ...(targetPath ? { targetPath } : {}),
+      ...(taskId ? { taskId } : {}),
+      skillIds
+    });
+    const observation = await runtime.executeTool(session.id, toolId, normalizeKnownPathFields(parseToolRunInput(inputJson, inputFile)));
 
-  console.log(JSON.stringify({ session, observation }, null, 2));
+    console.log(JSON.stringify({ session, observation }, null, 2));
+  } finally {
+    await runtime.close();
+  }
 } else if (command === "session-inspect") {
   if (hasFlag(args, "--help") || hasFlag(args, "-h")) {
     console.log(renderSessionInspectHelp());
@@ -378,6 +382,10 @@ if (command === "self-build-plan") {
     });
   }
 } else if (command === "tui") {
+  if (hasFlag(args, "--help") || hasFlag(args, "-h")) {
+    console.log(renderGuruharnessTuiHelp());
+    process.exit(0);
+  }
   const configPath = getFlagValue(args, "--config");
   const cwd = getFlagValue(args, "--cwd");
   const commandText = getFlagValue(args, "--command");
@@ -586,14 +594,15 @@ function renderGeneralHelp(runtimeInfo: ReturnType<typeof getRuntimeInfo>): stri
     "  session-continue    Suggest safe continuation commands for a session",
     "  run                 Execute the practical run lifecycle",
     "  api                 Start the local API surface",
-    "  tui                 Run the TUI command surface",
+    "  tui                 Legacy plan/session shell (daily-driver REPL: use `guru`)",
     "  maintenance-audit   Run repository/config/policy audit",
     "  skills-list         List configured skills",
     "  skill-load          Load a configured skill by id",
     "  capability-smoke Prove the core reference-equivalent harness nucleus in one run",
     "  capability-probe   Empirically probe chat/tools/vision/thinking per catalog route",
     "",
-    "Run 'guruharness run --help' for runtime lifecycle flags."
+    "Run 'guruharness run --help' for runtime lifecycle flags.",
+    "Run 'guru' for the interactive daily-driver harness (composer, steer, slash menu)."
   ].join("\n");
 }
 
@@ -682,5 +691,21 @@ function renderRunHelp(): string {
     "  --git-title <title>            PR title",
     "  --git-body <body>              PR body",
     "  --git-path <path>              Path to stage; repeat for multiple paths"
+  ].join("\n");
+}
+
+function renderGuruharnessTuiHelp(): string {
+  return [
+    "Usage: guruharness tui [--interactive | --command <text>] [options]",
+    "",
+    "Legacy plan/session shell (JSON plan, direction, session, run).",
+    "For the daily-driver interactive harness (composer, steer, slash menu), run: guru",
+    "",
+    "Options:",
+    "  --interactive           Run the legacy readline shell",
+    "  --command <text>        Run one legacy TUI command and print JSON output",
+    "  --config <path>         Use alternate config file",
+    "  --cwd <path>            Set working directory",
+    "  -h, --help              Show this help"
   ].join("\n");
 }

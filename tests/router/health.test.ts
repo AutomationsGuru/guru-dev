@@ -35,8 +35,8 @@ describe("router health/status manager", () => {
       }
     });
 
-    expect(report.aliasCount).toBe(37);
-    expect(report.providerGroupCount).toBe(10);
+    expect(report.aliasCount).toBe(39);
+    expect(report.providerGroupCount).toBe(11);
     expect(report.processGuess).toEqual([{ pid: 123, command: "python -m litellm --config C:/Users/user/.config/ai-router/litellm.config.yaml", source: "process-list" }]);
     expect(report.missingEnvVarNames).toContain("GEMINI_API_KEY");
     expect(JSON.stringify(report)).not.toContain("\"x\"");

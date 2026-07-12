@@ -42,13 +42,24 @@ export function discoverSkills(options: Partial<SkillLoaderOptions> = {}): Skill
     manifests.push(...discoverSkillsInDirectory(root, parsedOptions.skillFileName, parsedOptions.maxDepth, diagnostics));
   }
 
-  const duplicateIds = findDuplicateSkillIds(manifests);
-  if (duplicateIds.length > 0) {
-    throw new Error(`Duplicate skill id(s): ${duplicateIds.join(", ")}`);
+  // First-wins dedup (review 2026-07-08): the old code THREW on any duplicate id,
+  // wiping the ENTIRE catalog for one collision (a bridge skill borrowed from two
+  // harnesses, or a user+project name clash) — every good skill disappeared. Roots
+  // are ordered project→user→role, so first-wins keeps the most-specific root's
+  // skill and drops later collisions with a diagnostic instead of nuking the load.
+  const seenIds = new Set<string>();
+  const deduped: SkillManifest[] = [];
+  for (const manifest of manifests) {
+    if (seenIds.has(manifest.id)) {
+      diagnostics.push(`Duplicate skill id '${manifest.id}' — kept the first (from an earlier root), dropped this one (${manifest.skillFile}).`);
+      continue;
+    }
+    seenIds.add(manifest.id);
+    deduped.push(manifest);
   }
 
   return SkillCatalogSchema.parse({
-    skills: manifests.sort((a, b) => a.id.localeCompare(b.id)),
+    skills: deduped.sort((a, b) => a.id.localeCompare(b.id)),
     directories: roots,
     diagnostics
   });
@@ -273,21 +284,6 @@ function readFirstParagraph(body: string): string | undefined {
     .find((block) => block.length > 0 && !block.startsWith("#"));
 
   return paragraph;
-}
-
-function findDuplicateSkillIds(skills: readonly SkillManifest[]): string[] {
-  const seen = new Set<string>();
-  const duplicates = new Set<string>();
-
-  for (const skill of skills) {
-    if (seen.has(skill.id)) {
-      duplicates.add(skill.id);
-    }
-
-    seen.add(skill.id);
-  }
-
-  return [...duplicates].sort();
 }
 
 function formatError(error: unknown): string {

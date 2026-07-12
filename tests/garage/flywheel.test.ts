@@ -78,6 +78,18 @@ describe("INJECT (decay-ranked)", () => {
     const picked = rankForInjection(many, { now: NOW, budget: { maxLines: 5, maxChars: 10_000 } });
     expect(picked).toHaveLength(5);
   });
+
+  it("rankForInjection drops non-finite scores (bad dates) without blanking good learnings", () => {
+    const good = learning({ statement: "Valid finance path learning here.", subject: "finance", createdAt: daysAgo(1) });
+    const badDate = learning({
+      statement: "Malformed date learning still has a long enough statement.",
+      subject: "broken",
+      createdAt: "not-a-date"
+    });
+    const picked = rankForInjection([badDate, good], { now: NOW, budget: { maxLines: 8, maxChars: 10_000 } });
+    expect(picked.map((item) => item.id)).toEqual([good.id]);
+    expect(picked).toHaveLength(1);
+  });
 });
 
 describe("CITE", () => {

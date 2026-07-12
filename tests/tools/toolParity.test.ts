@@ -93,6 +93,7 @@ describe("tool parity map", () => {
 
   it("should summarize RED/YELLOW/GREEN counts", () => {
     // No RED rows remain; perplexity + repo stay YELLOW partials.
-    expect(getToolParityVerdictCounts()).toEqual({ GREEN: 22, YELLOW: 2, RED: 0 });
+    // 22 remote rows + schedule + manage_task from the 2026-07-10 wave.
+    expect(getToolParityVerdictCounts()).toEqual({ GREEN: 24, YELLOW: 2, RED: 0 });
   });
 });

@@ -1,6 +1,6 @@
 import { defineProviderRoute } from "./registry.js";
 import type { ProviderRouteDescriptor } from "./schemas.js";
-import { BEDROCK_SHEET, MODEL_SHEET, type SheetModel } from "./modelSheet.js";
+import { BEDROCK_SHEET, K, M, MODEL_SHEET, type SheetModel } from "./modelSheet.js";
 
 /**
  * Direct-first provider catalog, generated from the operator model sheet
@@ -41,7 +41,7 @@ const LANES: Readonly<Record<string, ProviderLane>> = {
     routeType: "direct-api",
     apiFamily: "openai-chat-completions",
     baseUrl: "https://bedrock-mantle.us-east-1.api.aws/v1",
-    credentialSource: { type: "env-var", envVarName: "BEDROCK_API_KEY", envVarNames: [] },
+    credentialSource: { type: "env-var", envVarName: "BEDROCK_API_KEY", envVarNames: ["AWS_BEARER_TOKEN_BEDROCK"] },
     supportsTools: true,
     status: "ready-unverified",
     rankBase: 70,
@@ -56,7 +56,7 @@ const LANES: Readonly<Record<string, ProviderLane>> = {
     routeType: "direct-api",
     apiFamily: "openai-chat-completions",
     baseUrl: "https://bedrock-mantle.us-east-1.api.aws/openai/v1",
-    credentialSource: { type: "env-var", envVarName: "BEDROCK_API_KEY", envVarNames: [] },
+    credentialSource: { type: "env-var", envVarName: "BEDROCK_API_KEY", envVarNames: ["AWS_BEARER_TOKEN_BEDROCK"] },
     supportsTools: true,
     status: "ready-unverified",
     rankBase: 72,
@@ -70,7 +70,7 @@ const LANES: Readonly<Record<string, ProviderLane>> = {
     routeType: "direct-api",
     apiFamily: "anthropic-messages",
     baseUrl: "https://bedrock-mantle.us-east-1.api.aws/anthropic",
-    credentialSource: { type: "env-var", envVarName: "BEDROCK_API_KEY", envVarNames: [] },
+    credentialSource: { type: "env-var", envVarName: "BEDROCK_API_KEY", envVarNames: ["AWS_BEARER_TOKEN_BEDROCK"] },
     supportsTools: true,
     status: "needs-login",
     rankBase: 75,
@@ -97,7 +97,7 @@ const LANES: Readonly<Record<string, ProviderLane>> = {
   "azure-foundry": {
     routeType: "direct-api",
     apiFamily: "openai-chat-completions",
-    baseUrl: "os.environ/AZURE_OPENAI_API_ENDPOINT",
+    baseUrl: "os.environ/AZURE_AI_FOUNDRY_PROJECT_ENDPOINT",
     credentialSource: { type: "env-var", envVarName: "AZURE_FOUNDRY_API_KEY", envVarNames: [] },
     supportsTools: true,
     status: "ready-unverified",
@@ -173,7 +173,7 @@ const LANES: Readonly<Record<string, ProviderLane>> = {
     },
     caveats: [
       "SuperGrok PLAN lane — guru-native OAuth (auth.x.ai loopback via `/login grok`) OR the ~/.grok/auth.json SHORTCUT if the grok CLI is already signed in; token lives in guru's encrypted vault (never a guru file, never a CLI dependency). Chat @ cli-chat-proxy.grok.com/v1 (openai-responses) + the x-grok-client-version header.",
-      "Standard SuperGrok may SIGN IN but 403 at inference — xAI entitlement-gates the API surface (grok-build = SuperGrok/X-Premium+, higher models need SuperGrok Heavy). Status stays needs-login until a live turn passes; the 'xai' api.x.ai key lane is the sanctioned per-token fallback.",
+      "Grok 4.5 (2026-07): added to SuperGrok — probe-verify availability at the plan tier. Standard SuperGrok may 403 at inference for higher models; the 'xai' api.x.ai key lane is the sanctioned per-token fallback.",
       "compat.supportsReasoningEffort false per the reference working config."
     ],
     compat: { supportsReasoningEffort: false }
@@ -290,10 +290,12 @@ const LANES: Readonly<Record<string, ProviderLane>> = {
 const RANK_OVERRIDES: Readonly<Record<string, number>> = {
   "sakana/fugu-ultra": 3,
   "sakana/fugu": 4,
+  "openai/gpt-5.6-sol": 5,
   "anthropic/claude-fable-5": 10,
   "anthropic/claude-sonnet-5": 11,
   "anthropic/claude-opus-4-8": 12,
   "anthropic/claude-haiku-4-5": 13,
+  "xai/grok-4.5": 16,
   "gemini/gemini-3.5-flash": 20,
   "gemini/gemini-3.1-flash-lite": 21,
   "gemini/gemini-3.1-pro-preview": 22,
@@ -372,8 +374,8 @@ function codexDirectRoute(model: string, contextTokens: number, maxOutputTokens:
     compat: { supportsDeveloperRole: true, supportsReasoningEffort: true, requiresMaxCompletionTokens: true },
     status: "active",
     caveats: [
-      "Direct Responses lane to chatgpt.com/backend-api/codex; Bearer access_token + ChatGPT-Account-Id from ~/.codex/auth.json, OpenAI-Beta + originator headers, store=false + stream=true + no max_output_tokens (codex backend requirements). Delegate lane (openai-codex/*) stays reachable.",
-      "VERIFIED 2026-07-04 (Finale Wave): chat PASS on gpt-5.5 + gpt-5.3-codex-spark. Codex streams text only via output_text.delta and sends a response.completed with an EMPTY output[] — the stream parser now backfills the accumulated delta text. Flipped to active on probe evidence."
+      "Direct Responses lane to chatgpt.com/backend-api/codex; Bearer access_token + ChatGPT-Account-Id from ~/.codex/auth.json, OpenAI-Beta + originator headers, store=false + stream=true + no max_output_tokens (codex backend requirements).",
+      "GPT-5.6 generation (2026-07): Sol (flagship), Luna (balanced), Terra (fast). Model sheet is authoritative; probe-verify each on the codex plan."
     ],
     wire: CODEX_DIRECT_WIRE,
     directFirstRank: rank,
@@ -382,10 +384,10 @@ function codexDirectRoute(model: string, contextTokens: number, maxOutputTokens:
 }
 
 const CODEX_DIRECT_ROUTES: readonly ProviderRouteDescriptor[] = [
-  // ChatGPT-plan native lanes ranked #1/#2 (2026-07): with the codex CLI-delegate lane
-  // gone, these are the top auto-connect picks once you /login to your ChatGPT plan.
-  codexDirectRoute("gpt-5.5", 272 * 1024, 128 * 1024, 1),
-  codexDirectRoute("gpt-5.3-codex-spark", 128 * 1024, 128 * 1024, 2)
+  // ChatGPT-plan native lanes ranked #1/#2 (2026-07): the top auto-connect picks
+  // once you /login to your ChatGPT plan.
+  codexDirectRoute("gpt-5.6-sol", 2048 * 1024, 128 * 1024, 1),
+  codexDirectRoute("gpt-5.6-luna", 1024 * 1024, 128 * 1024, 2)
 ];
 
 /** Local bonus lane — not on the operator sheet, kept because it needs no credentials. */

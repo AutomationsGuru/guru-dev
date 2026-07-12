@@ -107,6 +107,22 @@ describe("C1 — quoted assignment values with spaces are fully redacted", () =>
     expect(containsSecretValue("token: 'multi word secret'")).toBe(true);
   });
 
+
+  it("C1 short-token: unquoted secret values with a spaced remainder are fully redacted", () => {
+    const a = scrubSecretValues("API_KEY=x supersecretvalue");
+    expect(a).not.toContain("supersecretvalue");
+    expect(a).toContain("API_KEY=[redacted:credential]");
+    const b = scrubSecretValues("SECRET=ab cdefghijklmnop");
+    expect(b).not.toContain("cdefghijklmnop");
+    expect(b).toContain("SECRET=[redacted:credential]");
+  });
+
+  it("unquoted secret values still stop at shell delimiters", () => {
+    const text = scrubSecretValues("PASSWORD=foo; echo hi");
+    expect(text).not.toContain("foo");
+    expect(text).toContain("echo hi");
+  });
+
   it("does NOT redact multi-word values under non-secret keys", () => {
     const text = scrubSecretValues('GREETING="hello there world"');
     expect(text).toContain('GREETING="hello there world"');

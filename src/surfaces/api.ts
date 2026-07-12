@@ -172,6 +172,8 @@ export interface ApiServerOptions {
   readonly port?: number;
   readonly handlers?: ApiHandlers;
   readonly runtime?: HarnessRuntime;
+  /** Construct a server-owned runtime. Ignored when `runtime` is supplied. */
+  readonly runtimeFactory?: () => HarnessRuntime;
   readonly allowRunSafetyOverrides?: boolean;
   /**
    * Mandate for headless tool execution (ADR 2026-07-05-composer-completion).
@@ -215,7 +217,8 @@ export async function startHarnessApiServer(options: ApiServerOptions = {}): Pro
   const port = options.port ?? DEFAULT_PORT;
   // Headless surface: attach the mandate floor so /tool-run cannot run a
   // mutating tool without a grant (the REPL-only enforcement hole, closed).
-  const runtime = options.runtime ?? createHarnessRuntime({ mandatePolicy: headlessMandatePolicy(options.mandate) });
+  const ownsRuntime = options.runtime === undefined;
+  const runtime = options.runtime ?? options.runtimeFactory?.() ?? createHarnessRuntime({ mandatePolicy: headlessMandatePolicy(options.mandate) });
   const defaultHandlers = createDefaultApiHandlers(runtime);
   const handlers = {
     buildPlan: options.handlers?.buildPlan ?? defaultHandlers.buildPlan,
@@ -236,17 +239,24 @@ export async function startHarnessApiServer(options: ApiServerOptions = {}): Pro
     await routeRequest(request, response, handlers, routeOptions);
   });
 
-  await new Promise<void>((resolve, reject) => {
-    const onError = (error: Error) => {
-      reject(error);
-    };
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const onError = (error: Error) => {
+        reject(error);
+      };
 
-    server.once("error", onError);
-    server.listen(port, host, () => {
-      server.off("error", onError);
-      resolve();
+      server.once("error", onError);
+      server.listen(port, host, () => {
+        server.off("error", onError);
+        resolve();
+      });
     });
-  });
+  } catch (error) {
+    if (ownsRuntime) {
+      await runtime.close();
+    }
+    throw error;
+  }
 
   const address = server.address();
   const actualPort = isAddressInfo(address) ? address.port : port;
@@ -256,18 +266,24 @@ export async function startHarnessApiServer(options: ApiServerOptions = {}): Pro
     port: actualPort,
     url: `http://${host}:${actualPort}`,
     server,
-    close() {
-      return new Promise((resolve, reject) => {
+    async close() {
+      try {
+        await new Promise<void>((resolve, reject) => {
         // Drop keep-alive clients so close() does not hang the next test.
-        server.closeAllConnections?.();
-        server.close((error) => {
-          if (error) {
-            reject(error);
-          } else {
-            resolve();
-          }
+          server.closeAllConnections?.();
+          server.close((error) => {
+            if (error) {
+              reject(error);
+            } else {
+              resolve();
+            }
+          });
         });
-      });
+      } finally {
+        if (ownsRuntime) {
+          await runtime.close();
+        }
+      }
     }
   };
 }
@@ -618,7 +634,7 @@ function normalizePlanContext(params: URLSearchParams): ApiSelfBuildPlanRequest 
     request.cwd = cwd;
   }
 
-  return request;
+  return normalizeKnownPathFields(request);
 }
 
 async function parseJsonBody(request: IncomingMessage): Promise<unknown> {
@@ -712,7 +728,7 @@ function normalizeSessionRequest(value: unknown): ApiSessionStartRequest {
     request.projectSlug = value.projectSlug;
   }
 
-  return request;
+  return normalizeKnownPathFields(request);
 }
 
 function normalizeToolRunRequest(value: unknown): ApiToolRunRequest {
@@ -754,7 +770,7 @@ function normalizeToolRunRequest(value: unknown): ApiToolRunRequest {
     request.input = normalizeKnownPathFields(value.input);
   }
 
-  return request;
+  return normalizeKnownPathFields(request);
 }
 
 function normalizeRunRequest(value: unknown, options: { readonly allowRunSafetyOverrides: boolean }): ApiRunRequest {
@@ -826,7 +842,7 @@ function normalizeRunRequest(value: unknown, options: { readonly allowRunSafetyO
     };
   }
 
-  return request;
+  return normalizeKnownPathFields(request);
 }
 
 function buildSessionContinuationCommands(sessionId: string): readonly ApiSessionContinuationCommand[] {

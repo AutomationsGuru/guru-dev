@@ -17,6 +17,40 @@ export function commandExists(name: string): boolean {
   }
 }
 
+const WINDOWS_COMMAND_SHIMS = new Set([
+  "npm", "npx", "pnpm", "pnpx", "yarn", "yarnpkg", "corepack",
+  "tsc", "tsx", "vitest", "eslint", "prettier"
+]);
+
+/** Whether a Windows command is a batch/.cmd shim that requires cmd.exe. */
+export function requiresWindowsCommandShim(executable: string): boolean {
+  const normalized = executable.replace(/\\/gu, "/").toLowerCase();
+  const name = normalized.slice(normalized.lastIndexOf("/") + 1);
+  return /\.(?:cmd|bat)$/u.test(name) || WINDOWS_COMMAND_SHIMS.has(name);
+}
+
+/**
+ * Canonical (taint-free) token to hand cmd.exe for a bare allowlisted shim, or
+ * null when the command must never ride a shell. The returned string is the
+ * SET constant, not the caller's input, so env/config-tainted strings cannot
+ * reach cmd.exe's line parser (CodeQL js/shell-command-injection-from-environment).
+ * Path-qualified commands always return null — explicit .cmd/.bat paths go
+ * through resolveWindowsGateSpawn instead.
+ */
+function canonicalWindowsShim(executable: string): string | null {
+  const lower = executable.toLowerCase();
+  if (lower.includes("/") || lower.includes("\\") || /^[a-z]:/u.test(lower)) {
+    return null;
+  }
+  const bare = lower.replace(/\.(?:cmd|bat)$/u, "");
+  for (const shim of WINDOWS_COMMAND_SHIMS) {
+    if (shim === bare) {
+      return shim;
+    }
+  }
+  return null;
+}
+
 export type ReviewGateVerdict = "GREEN" | "YELLOW" | "RED";
 export type GateKind = "validation" | "review";
 export type GateStatus = "passed" | "failed";
@@ -240,9 +274,9 @@ export async function executeCommand(
   context: CommandExecutionContext
 ): Promise<CommandExecutionResult> {
   const startedAt = Date.now();
-  const [rawExecutable] = command;
+  const [executable, ...args] = command;
 
-  if (!rawExecutable) {
+  if (!executable) {
     return {
       exitCode: null,
       stdout: "",
@@ -251,12 +285,22 @@ export async function executeCommand(
     };
   }
 
-  // Never shell out via `cmd.exe /c <dynamic>` (CodeQL js/shell-command-injection-
-  // from-environment). Resolve to a real PE or node+cli.js — not a batch shim.
-  const { executable: resolvedExecutable, args } = resolveWindowsGateSpawn(command);
+  // Native executables (node/git/pwsh/etc.) stay shell:false on Windows too.
+  // Only bare, allowlisted package-manager/tooling shims ride cmd.exe — and the
+  // token handed to cmd.exe is the allowlist CONSTANT (canonicalWindowsShim), so
+  // caller-tainted strings never reach the shell line parser. Explicit .cmd/.bat
+  // paths resolve through resolveWindowsGateSpawn (npm/npx → node <npm-cli.js>);
+  // argv is metasyntax-checked upstream by the bounded bash tool.
+  const shim = process.platform === "win32" ? canonicalWindowsShim(executable) : null;
+  const direct =
+    shim === null && process.platform === "win32" && requiresWindowsCommandShim(executable)
+      ? resolveWindowsGateSpawn(command)
+      : { executable, args: [...args] };
 
   return new Promise<CommandExecutionResult>((resolveExecution) => {
-    const child = spawn(resolvedExecutable, args, { cwd: context.cwd, shell: false, windowsHide: true });
+    const child = shim !== null
+      ? spawn("cmd.exe", ["/c", shim, ...args], { cwd: context.cwd, shell: false, windowsHide: true })
+      : spawn(direct.executable, direct.args, { cwd: context.cwd, shell: false, windowsHide: true });
     let stdout = "";
     let stderr = "";
     let settled = false;

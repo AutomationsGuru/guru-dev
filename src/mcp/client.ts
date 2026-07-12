@@ -151,7 +151,15 @@ export async function connectMcpServer(options: ConnectMcpServerOptions): Promis
           cursor !== undefined ? { cursor } : {},
           listOptions?.timeoutMs !== undefined ? { timeoutMs: listOptions.timeoutMs } : {}
         );
-        const parsed = ToolsListResultSchema.parse(raw);
+        const parsedResult = ToolsListResultSchema.safeParse(raw);
+        if (!parsedResult.success) {
+          // A malformed tools/list response shouldn't crash discovery (review
+          // 2026-07-08): the old .parse() threw a raw ZodError whose path dump
+          // leaked to the model as a tool failure. Stop paginating + return what
+          // we have so far.
+          break;
+        }
+        const parsed = parsedResult.data;
         for (const tool of parsed.tools) {
           tools.push(
             McpToolDescriptorSchema.parse({
@@ -179,7 +187,15 @@ export async function connectMcpServer(options: ConnectMcpServerOptions): Promis
           ...(callOptions?.signal !== undefined ? { signal: callOptions.signal } : {})
         }
       );
-      const parsed = ToolsCallResultSchema.parse(raw);
+      const parsedResult = ToolsCallResultSchema.safeParse(raw);
+      if (!parsedResult.success) {
+        // A malformed tools/call response (review 2026-07-08): the old .parse()
+        // threw a raw ZodError whose path dump leaked to the model. Return a clean
+        // isError result so the model knows the server replied badly (not that the
+        // call itself crashed), and can react (retry / report / give up).
+        return { text: `[MCP server '${config.id}' returned a malformed tools/call response — its output did not match the expected shape.]`, isError: true };
+      }
+      const parsed = parsedResult.data;
       const text = parsed.content
         .filter((part) => part.type === "text" && typeof part.text === "string")
         .map((part) => part.text)

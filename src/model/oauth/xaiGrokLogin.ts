@@ -63,6 +63,23 @@ export function resolveXaiOAuthConfig(env: NodeJS.ProcessEnv = process.env): Xai
 
 type FetchImpl = typeof globalThis.fetch;
 
+/**
+ * Fetch with a hard per-request timeout (review 2026-07-08): a blackholed token
+ * endpoint (flaky Wi-Fi, captive portal, transient DNS) used to hang /login
+ * forever because the device-code expiry was only checked BETWEEN polls. This
+ * bounds every OAuth fetch so a stalled connection aborts instead of freezing.
+ */
+async function fetchWithTimeout(fetchImpl: FetchImpl, url: string, init: RequestInit & { readonly timeoutMs?: number }): Promise<Response> {
+  const { timeoutMs = 15_000, ...rest } = init;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetchImpl(url, { ...rest, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // expiryFromAccessToken, safeReadFile, defaultOpenBrowser are shared with the ChatGPT
 // login and imported from openaiCodexLogin.ts (single source of truth).
 
@@ -142,7 +159,7 @@ export async function refreshXaiToken(
   now = Date.now()
 ): Promise<GuruOAuthToken> {
   const body = new URLSearchParams({ grant_type: "refresh_token", client_id: config.clientId, refresh_token: previous.refreshToken });
-  const res = await fetchImpl(`${config.issuer}${config.tokenPath}`, {
+  const res = await fetchWithTimeout(fetchImpl, `${config.issuer}${config.tokenPath}`, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: body.toString()
@@ -184,7 +201,7 @@ export async function requestXaiDeviceCode(
   now = Date.now()
 ): Promise<DeviceCodeGrant> {
   const body = new URLSearchParams({ client_id: config.clientId, scope: config.scope });
-  const res = await fetchImpl(`${config.issuer}${config.deviceCodePath}`, {
+  const res = await fetchWithTimeout(fetchImpl, `${config.issuer}${config.deviceCodePath}`, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: body.toString()
@@ -244,11 +261,23 @@ export async function loginViaXaiDeviceCode(deps: XaiDeviceLoginDeps = {}): Prom
     }
     await sleep(intervalMs);
     const body = new URLSearchParams({ grant_type: DEVICE_CODE_GRANT_TYPE, device_code: grant.deviceCode, client_id: config.clientId });
-    const res = await fetchImpl(`${config.issuer}${config.tokenPath}`, {
-      method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: body.toString()
-    });
+    // Per-poll timeout (review 2026-07-08): a stalled token endpoint used to hang
+    // the poll forever — the device-code expiry was only checked BETWEEN fetches.
+    let res: Response;
+    try {
+      res = await fetchWithTimeout(fetchImpl, `${config.issuer}${config.tokenPath}`, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: body.toString()
+      });
+    } catch (error) {
+      // A transient network failure (incl. the per-poll timeout abort) isn't fatal —
+      // re-check the device-code deadline and keep polling while the grant is valid.
+      if (now() < grant.expiresAt) {
+        continue;
+      }
+      throw new Error(`device sign-in poll failed (network): ${error instanceof Error ? error.message : String(error)}`);
+    }
     if (res.ok) {
       return tokenFromResponse((await res.json()) as Record<string, unknown>, undefined, now());
     }

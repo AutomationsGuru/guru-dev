@@ -17,7 +17,7 @@ import {
   type SessionObservabilitySummary,
   type SessionPersistenceStore
 } from "../runtime/persistence.js";
-import { createHarnessRuntime } from "../runtime/session.js";
+import { createHarnessRuntime, type HarnessRuntime, type HarnessRuntimeDependencies } from "../runtime/session.js";
 import type { MandateDecision } from "../mandates/evaluate.js";
 import type { HarnessSession, StartHarnessSessionOptions } from "../runtime/schemas.js";
 import { detectPotentialSecrets, isRiskyPath } from "../safety/policyGuard.js";
@@ -69,6 +69,8 @@ export interface RunSelfBuildExecutorOptions {
   readonly allowDirtyWorkspace?: boolean;
   readonly allowRiskyPaths?: boolean;
   readonly resumeSessionId?: string;
+  /** Construct executor/planner runtimes owned and closed by this invocation. */
+  readonly runtimeFactory?: (dependencies: HarnessRuntimeDependencies) => HarnessRuntime;
 }
 
 export interface PlannerFallbackAttempt {
@@ -132,13 +134,18 @@ export async function runSelfBuildExecutor(options: RunSelfBuildExecutorOptions)
     ...(options.configPath ? { configPath: options.configPath } : {})
   });
 
-  const runtime = createHarnessRuntime({
+  const runtimeFactory = options.runtimeFactory ?? createHarnessRuntime;
+  const runtime = runtimeFactory({
     operationalStore,
     sessionPersistenceStore,
     ...(options.commandExecutor ? { commandExecutor: options.commandExecutor } : {}),
     ...(options.mandatePolicy ? { mandatePolicy: options.mandatePolicy } : {})
   });
-  return runSelfBuildExecutorWithRuntime(runtime, configResult, options, { cwd, projectSlug, operationalStore, sessionPersistenceStore });
+  try {
+    return await runSelfBuildExecutorWithRuntime(runtime, configResult, options, { cwd, projectSlug, operationalStore, sessionPersistenceStore });
+  } finally {
+    await runtime.close();
+  }
 }
 
 interface ExecutorRuntimeContext {
@@ -268,6 +275,7 @@ async function runSelfBuildExecutorWithRuntime(
     sameProviderRetries: options.maxPlannerRetries ?? configResult.config.runtimeHardening.plannerMaxRetries,
     operationalStore,
     sessionPersistenceStore,
+    runtimeFactory: options.runtimeFactory ?? createHarnessRuntime,
     ...(options.commandExecutor ? { commandExecutor: options.commandExecutor } : {}),
     ...(options.mandatePolicy ? { mandatePolicy: options.mandatePolicy } : {})
   });
@@ -504,6 +512,7 @@ async function runPlannerWithRetries(options: {
   readonly sessionPersistenceStore: SessionPersistenceStore;
   readonly commandExecutor?: CommandExecutor;
   readonly mandatePolicy?: MandatePolicyFn;
+  readonly runtimeFactory: (dependencies: HarnessRuntimeDependencies) => HarnessRuntime;
 }): Promise<{ readonly report: PlannerRunReport; readonly providerLabel: string; readonly attempts: number; readonly playbook: PlannerFallbackPlaybook }> {
   let attempts = 0;
   const attemptRecords: PlannerFallbackAttempt[] = [];
@@ -513,57 +522,61 @@ async function runPlannerWithRetries(options: {
 
     for (let retry = 0; retry < maxSameProviderAttempts; retry += 1) {
       attempts += 1;
-      const plannerRuntime = createHarnessRuntime({
+      const plannerRuntime = options.runtimeFactory({
         operationalStore: options.operationalStore,
         sessionPersistenceStore: options.sessionPersistenceStore,
         ...(options.commandExecutor ? { commandExecutor: options.commandExecutor } : {}),
         ...(options.mandatePolicy ? { mandatePolicy: options.mandatePolicy } : {}),
         plannerModel: plannerCandidate.model
       });
-      const resumed = await plannerRuntime.resumeSession(options.session.id);
-      if (!resumed) {
-        const report = createBlockedPlannerReport(
-          options.session,
-          options.objective,
-          [`Planner runtime could not resume session before planning: ${options.session.id}`],
-          "missing-session"
-        );
-        attemptRecords.push(buildPlannerFallbackAttempt(report, plannerCandidate.label, candidateIndex, retry, attempts));
+      try {
+        const resumed = await plannerRuntime.resumeSession(options.session.id);
+        if (!resumed) {
+          const report = createBlockedPlannerReport(
+            options.session,
+            options.objective,
+            [`Planner runtime could not resume session before planning: ${options.session.id}`],
+            "missing-session"
+          );
+          attemptRecords.push(buildPlannerFallbackAttempt(report, plannerCandidate.label, candidateIndex, retry, attempts));
 
-        return {
-          report,
-          providerLabel: plannerCandidate.label,
-          attempts,
-          playbook: buildPlannerFallbackPlaybook({ attempts: attemptRecords, selectedProviderLabel: null, exhausted: true })
-        };
-      }
-
-      const planner = await plannerRuntime.runPlanner(options.session.id, {
-        objective: options.objective,
-        ...(options.maxSteps !== undefined ? { maxSteps: options.maxSteps } : {})
-      });
-      attemptRecords.push(buildPlannerFallbackAttempt(planner, plannerCandidate.label, candidateIndex, retry, attempts));
-
-      if (planner.status === "completed") {
-        return {
-          report: planner,
-          providerLabel: plannerCandidate.label,
-          attempts,
-          playbook: buildPlannerFallbackPlaybook({ attempts: attemptRecords, selectedProviderLabel: plannerCandidate.label, exhausted: false })
-        };
-      }
-
-      if (!shouldRetrySameProvider(planner) || retry >= maxSameProviderAttempts - 1) {
-        if (!shouldTryFallbackProvider(planner)) {
           return {
-            report: planner,
+            report,
             providerLabel: plannerCandidate.label,
             attempts,
             playbook: buildPlannerFallbackPlaybook({ attempts: attemptRecords, selectedProviderLabel: null, exhausted: true })
           };
         }
 
-        break;
+        const planner = await plannerRuntime.runPlanner(options.session.id, {
+          objective: options.objective,
+          ...(options.maxSteps !== undefined ? { maxSteps: options.maxSteps } : {})
+        });
+        attemptRecords.push(buildPlannerFallbackAttempt(planner, plannerCandidate.label, candidateIndex, retry, attempts));
+
+        if (planner.status === "completed") {
+          return {
+            report: planner,
+            providerLabel: plannerCandidate.label,
+            attempts,
+            playbook: buildPlannerFallbackPlaybook({ attempts: attemptRecords, selectedProviderLabel: plannerCandidate.label, exhausted: false })
+          };
+        }
+
+        if (!shouldRetrySameProvider(planner) || retry >= maxSameProviderAttempts - 1) {
+          if (!shouldTryFallbackProvider(planner)) {
+            return {
+              report: planner,
+              providerLabel: plannerCandidate.label,
+              attempts,
+              playbook: buildPlannerFallbackPlaybook({ attempts: attemptRecords, selectedProviderLabel: null, exhausted: true })
+            };
+          }
+
+          break;
+        }
+      } finally {
+        await plannerRuntime.close();
       }
     }
   }

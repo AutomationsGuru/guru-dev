@@ -180,9 +180,18 @@ export function rankForInjection(
   learnings: readonly Learning[],
   opts: { readonly now: Date; readonly taskTerms?: ReadonlySet<string>; readonly budget: InjectionBudget }
 ): Learning[] {
-  const scored = [...learnings]
-    .map((learning) => ({ learning, score: decayScore(learning, opts.now, opts.taskTerms) }))
-    .sort((a, b) => b.score - a.score);
+  // Score each learning, dropping any with a non-finite score (a malformed date
+  // yields NaN via Date.parse → ageDays NaN → score NaN). Previously such a
+  // learning poisoned the sort comparator AND could throw upstream, blanking
+  // all boot memory via the blunt catch in refreshBootMemoryBlock (review 2026-07-08).
+  const scored: Array<{ learning: Learning; score: number }> = [];
+  for (const learning of learnings) {
+    const score = decayScore(learning, opts.now, opts.taskTerms);
+    if (Number.isFinite(score)) {
+      scored.push({ learning, score });
+    }
+  }
+  scored.sort((a, b) => b.score - a.score);
   const picked: Learning[] = [];
   let chars = 0;
   for (const { learning } of scored) {

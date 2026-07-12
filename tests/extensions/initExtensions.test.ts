@@ -24,7 +24,6 @@ describe("initExtensions", () => {
         "todo_list",
         "web_fetch",
         "web_search",
-        "ask_question",
         "mcp_bridge_status",
         "provider_cli_status",
         "provider_cli_run",
@@ -44,7 +43,9 @@ describe("initExtensions", () => {
     expect(ids).toContain("todo_write");
     expect(ids).toContain("web_fetch");
     expect(ids).toContain("web_search");
-    expect(ids).toContain("ask_question");
+    // ask_question ships in the BASE tool set (not extensions) so the TUI/RPC
+    // onAsk injection seam reaches it — see baseToolFactory.ts.
+    expect(ids).not.toContain("ask_question");
     expect(ids).toContain("mcp_bridge_status");
     expect(ids).toContain("provider_cli_status");
     expect(ids).toContain("pyautogui_status");

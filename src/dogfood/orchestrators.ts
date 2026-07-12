@@ -17,7 +17,20 @@ export interface DogfoodOrchestrator {
 }
 
 export function composeDogfoodOrchestrators(orchestrators: readonly DogfoodOrchestrator[]): readonly DogfoodRepoCandidate[] {
-  return orchestrators.flatMap((orchestrator) => orchestrator.getCandidates());
+  // Per-orchestrator resilience (review 2026-07-08): the old flatMap let one
+  // failing orchestrator's getCandidates() throw and abort the ENTIRE portfolio
+  // composition — no candidates, no summary, leaked temp clones. Skip a failing
+  // orchestrator (warn) so the rest of the portfolio still runs.
+  const candidates: DogfoodRepoCandidate[] = [];
+  for (const orchestrator of orchestrators) {
+    try {
+      candidates.push(...orchestrator.getCandidates());
+    } catch (error) {
+      // eslint-disable-next-line no-console
+      console.warn(`[dogfood] orchestrator '${orchestrator.id}' failed to enumerate candidates and was skipped: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  return candidates;
 }
 
 export function createCoreDogfoodOrchestrator(): DogfoodOrchestrator {

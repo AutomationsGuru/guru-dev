@@ -18,8 +18,8 @@ export interface SheetModel {
   readonly images: boolean;
 }
 
-const K = 1000;
-const M = 1_000_000;
+export const K = 1000;
+export const M = 1_000_000;
 
 export const MODEL_SHEET: readonly SheetModel[] = [
   { provider: "anthropic", model: "claude-fable-5", contextTokens: 1 * M, maxOutputTokens: 128 * K, thinking: true, images: true },
@@ -29,10 +29,11 @@ export const MODEL_SHEET: readonly SheetModel[] = [
   { provider: "azure-foundry", model: "kimi-k2.6", contextTokens: 128 * K, maxOutputTokens: 32 * K, thinking: false, images: false },
   { provider: "azure-foundry", model: "deepseek-v4-flash", contextTokens: 1 * M, maxOutputTokens: 384 * K, thinking: false, images: false },
   { provider: "azure-foundry", model: "deepseek-v4-pro", contextTokens: 1 * M, maxOutputTokens: 384 * K, thinking: true, images: false },
-  { provider: "azure-foundry", model: "grok-4.3", contextTokens: 1 * M, maxOutputTokens: 512 * K, thinking: true, images: false },
+  { provider: "azure-foundry", model: "grok-4.5", contextTokens: 1 * M, maxOutputTokens: 512 * K, thinking: true, images: false },
   { provider: "azure-foundry", model: "gpt-chat-latest", contextTokens: 272 * K, maxOutputTokens: 128 * K, thinking: false, images: false },
-  { provider: "azure-openai-responses", model: "gpt-5.5", contextTokens: 1_100_000, maxOutputTokens: 128 * K, thinking: true, images: true },
-  { provider: "azure-openai-responses", model: "gpt-5.5-pro", contextTokens: 1_100_000, maxOutputTokens: 128 * K, thinking: true, images: true },
+  { provider: "azure-openai-responses", model: "gpt-5.6-sol", contextTokens: 2 * M, maxOutputTokens: 128 * K, thinking: true, images: true },
+  { provider: "azure-openai-responses", model: "gpt-5.6-luna", contextTokens: 1 * M, maxOutputTokens: 128 * K, thinking: true, images: true },
+  { provider: "azure-openai-responses", model: "gpt-5.6-terra", contextTokens: 272 * K, maxOutputTokens: 64 * K, thinking: true, images: true },
   { provider: "azure-openai-responses", model: "gpt-5.3-codex-spark", contextTokens: 128 * K, maxOutputTokens: 32 * K, thinking: true, images: true },
   { provider: "azure-openai-responses", model: "gpt-5.3-codex", contextTokens: 272 * K, maxOutputTokens: 128 * K, thinking: true, images: true },
   { provider: "bigmodel", model: "glm-5.2", contextTokens: 1 * M, maxOutputTokens: 128 * K, thinking: false, images: false },
@@ -44,13 +45,15 @@ export const MODEL_SHEET: readonly SheetModel[] = [
   { provider: "gemini", model: "gemini-3.1-pro-preview", contextTokens: 1 * M, maxOutputTokens: 65_500, thinking: true, images: true },
   { provider: "gemini", model: "gemini-3.1-pro-preview-customtools", contextTokens: 1 * M, maxOutputTokens: 65_500, thinking: true, images: true },
   { provider: "gemini", model: "gemini-3.5-flash", contextTokens: 1 * M, maxOutputTokens: 65_500, thinking: true, images: true },
+  { provider: "grok", model: "grok-4.5", contextTokens: 1 * M, maxOutputTokens: 512 * K, thinking: true, images: true },
   { provider: "grok", model: "grok-composer-2.5-fast", contextTokens: 200 * K, maxOutputTokens: 200 * K, thinking: false, images: false },
   { provider: "grok", model: "grok-build", contextTokens: 512 * K, maxOutputTokens: 512 * K, thinking: false, images: false },
   { provider: "minimax", model: "minimax-m3", contextTokens: 1 * M, maxOutputTokens: 128 * K, thinking: true, images: true },
   { provider: "minimax", model: "minimax-m2.7", contextTokens: 200 * K, maxOutputTokens: 128 * K, thinking: true, images: false },
   { provider: "minimax", model: "minimax-m2.7-highspeed", contextTokens: 200 * K, maxOutputTokens: 128 * K, thinking: true, images: false },
-  { provider: "openai", model: "gpt-5.5", contextTokens: 1_100_000, maxOutputTokens: 128 * K, thinking: true, images: true },
-  { provider: "openai", model: "gpt-5.5-pro", contextTokens: 1_100_000, maxOutputTokens: 128 * K, thinking: true, images: true },
+  { provider: "openai", model: "gpt-5.6-sol", contextTokens: 2 * M, maxOutputTokens: 128 * K, thinking: true, images: true },
+  { provider: "openai", model: "gpt-5.6-luna", contextTokens: 1 * M, maxOutputTokens: 128 * K, thinking: true, images: true },
+  { provider: "openai", model: "gpt-5.6-terra", contextTokens: 272 * K, maxOutputTokens: 64 * K, thinking: true, images: true },
   // openai-codex (ChatGPT-plan) DELEGATE rows removed 2026-07 — the ChatGPT plan now runs
   // NATIVELY through the openai-codex token lane (guru's own /login loopback OAuth).
   // No CLI delegate. See CODEX_DIRECT_ROUTES in catalog.ts.
@@ -63,7 +66,7 @@ export const MODEL_SHEET: readonly SheetModel[] = [
   { provider: "perplexity-sonar", model: "sonar-pro", contextTokens: 200 * K, maxOutputTokens: 32 * K, thinking: false, images: false },
   { provider: "sakana", model: "fugu", contextTokens: 1 * M, maxOutputTokens: 128 * K, thinking: true, images: true },
   { provider: "sakana", model: "fugu-ultra", contextTokens: 1 * M, maxOutputTokens: 128 * K, thinking: true, images: true },
-  { provider: "xai", model: "grok-4.3", contextTokens: 1 * M, maxOutputTokens: 512 * K, thinking: true, images: true },
+  { provider: "xai", model: "grok-4.5", contextTokens: 1 * M, maxOutputTokens: 512 * K, thinking: true, images: true },
   { provider: "zai-api", model: "glm-5.2", contextTokens: 1 * M, maxOutputTokens: 128 * K, thinking: true, images: false },
   { provider: "zai-api", model: "glm-4.7", contextTokens: 200 * K, maxOutputTokens: 128 * K, thinking: true, images: false },
   { provider: "zai-api", model: "glm-5-turbo", contextTokens: 200 * K, maxOutputTokens: 128 * K, thinking: true, images: false },
@@ -126,7 +129,7 @@ export const BEDROCK_SHEET: readonly SheetModel[] = [
   { provider: "aws-bedrock", model: "qwen.qwen3-next-80b-a3b-instruct", contextTokens: 200 * K, maxOutputTokens: 32 * K, thinking: true, images: false },
   { provider: "aws-bedrock", model: "qwen.qwen3-vl-235b-a22b-instruct", contextTokens: 200 * K, maxOutputTokens: 32 * K, thinking: true, images: true },
   { provider: "aws-bedrock", model: "writer.palmyra-vision-7b", contextTokens: 200 * K, maxOutputTokens: 32 * K, thinking: false, images: true },
-  { provider: "aws-bedrock-oai", model: "xai.grok-4.3", contextTokens: 200 * K, maxOutputTokens: 32 * K, thinking: true, images: false },
+  { provider: "aws-bedrock-oai", model: "xai.grok-4.5", contextTokens: 200 * K, maxOutputTokens: 32 * K, thinking: true, images: false },
   { provider: "aws-bedrock", model: "zai.glm-4.6", contextTokens: 200 * K, maxOutputTokens: 32 * K, thinking: false, images: false },
   { provider: "aws-bedrock", model: "zai.glm-4.7", contextTokens: 200 * K, maxOutputTokens: 32 * K, thinking: true, images: false },
   { provider: "aws-bedrock", model: "zai.glm-4.7-flash", contextTokens: 200 * K, maxOutputTokens: 32 * K, thinking: true, images: false },

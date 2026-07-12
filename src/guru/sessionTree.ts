@@ -52,7 +52,14 @@ export function foldLabel(content: string, width: number = DEFAULT_FOLD_WIDTH): 
   if (oneLine.length <= width) {
     return oneLine;
   }
-  return `${oneLine.slice(0, Math.max(1, width - 1))}…`;
+  // Never split a surrogate pair at the fold boundary — a cut mid-emoji left a
+  // lone surrogate that renders as U+FFFD in /tree and /sessions.
+  let cut = Math.max(1, width - 1);
+  const high = oneLine.charCodeAt(cut - 1);
+  if (high >= 0xd800 && high <= 0xdbff) {
+    cut -= 1;
+  }
+  return `${oneLine.slice(0, Math.max(1, cut))}…`;
 }
 
 export function buildSessionTree(
@@ -134,13 +141,15 @@ export function buildSessionTree(
 /** Plain-text render (non-TTY + tests). guru.ts colors the same rows for TTY. */
 export function renderTreePlain(model: SessionTreeModel): string[] {
   const lines = [`Session tree · ${model.title}`];
+  // Fork markers pad to the widest number so [9]→[10] doesn't shift the column.
+  const digits = String(Math.max(1, model.forkTargets.size)).length;
   for (const row of model.rows) {
     const indent = "  ".repeat(row.depth + 1);
     if (row.kind === "branch") {
       lines.push(`${indent}└─ ${row.text}`);
       continue;
     }
-    const marker = row.forkNumber !== undefined ? `[${row.forkNumber}]` : "   ";
+    const marker = row.forkNumber !== undefined ? `[${String(row.forkNumber).padStart(digits)}]` : " ".repeat(digits + 2);
     const who = row.role === "user" ? "you" : row.role === "assistant" ? "guru" : row.role ?? "";
     lines.push(`${indent}${marker} ${who ? `${who}: ` : ""}${row.text}`.trimEnd());
   }

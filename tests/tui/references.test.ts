@@ -35,6 +35,13 @@ describe("expandReferences", () => {
     expect(result.text).toContain("please");
   });
 
+  it.each([",", ".", ":", ")"])("inlines a reference before %s and preserves the punctuation", (punctuation) => {
+    const result = expandReferences(`explain @src/small.ts${punctuation} please`, opts());
+    expect(result.notices).toEqual([]);
+    expect(result.text).toContain("export const x = 1;");
+    expect(result.text).toContain(`\n\`\`\`\`\`\n${punctuation} please`);
+  });
+
   it("multi-file additive", () => {
     writeFileSync(join(root, "src", "two.ts"), "export const y = 2;\n");
     const result = expandReferences("@src/small.ts and @src/two.ts", opts());

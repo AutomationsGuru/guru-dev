@@ -296,8 +296,13 @@ export function createSessionLogStore(options: SessionLogStoreOptions = {}): Ses
           branchSummary = entry.branchSummary;
         }
       } else if (entry.kind === "message") {
-        messages.push({ role: entry.role, content: entry.content });
-        entryIds.push(entry.id);
+        // Skip empty messages at load (defensive normalization): an aborted
+        // turn's empty assistant line would re-poison a resumed session on
+        // strict providers that reject empty content (anthropic-messages 400).
+        if (entry.content.trim().length > 0) {
+          messages.push({ role: entry.role, content: entry.content });
+          entryIds.push(entry.id);
+        }
       } else {
         compaction = entry.compaction;
       }
@@ -330,6 +335,11 @@ export function createSessionLogStore(options: SessionLogStoreOptions = {}): Ses
         return undefined;
       }
       const record = parsed.data;
+      // Same empty-message normalization as the jsonl path — filter BEFORE the
+      // positional entry ids are synthesized so messages/entryIds stay parallel.
+      const kept = record.messages
+        .map((message, index) => ({ role: message.role, content: message.content, id: `${record.id}:m${index}` }))
+        .filter((message) => message.content.trim().length > 0);
       return {
         id: record.id,
         title: record.title,
@@ -337,10 +347,10 @@ export function createSessionLogStore(options: SessionLogStoreOptions = {}): Ses
         modelIdOverride: record.modelIdOverride,
         createdAt: record.createdAt,
         updatedAt: record.updatedAt,
-        messages: record.messages.map((message) => ({ role: message.role, content: message.content })),
+        messages: kept.map(({ role, content }) => ({ role, content })),
         // Legacy records have no per-entry ids; synthesize stable positional ones
         // so /fork can still target a prior message.
-        entryIds: record.messages.map((_, index) => `${record.id}:m${index}`),
+        entryIds: kept.map((message) => message.id),
         ...(record.compaction ? { compaction: record.compaction } : {}),
         legacy: true
       };

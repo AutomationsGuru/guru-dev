@@ -113,12 +113,9 @@ describe("cli", { timeout: 60_000 }, () => {
     }).trim();
     const parsed = JSON.parse(output) as { verdict?: string; checks?: { id: string; status: string }[] };
 
-    // main is now a pristine runtime package (no AGENTS.md / docs by design), so guru
-    // auditing its OWN repo flags exactly the two working-repo doc surfaces; the audit's
-    // GREEN path is covered against fixture repos in tests/maintenance/audit.test.ts.
     expect(parsed.checks).toHaveLength(9);
     const failed = (parsed.checks ?? []).filter((c) => c.status === "failed").map((c) => c.id).sort();
-    expect(failed).toEqual(["documentation", "repo-context"]);
+    expect(failed).toEqual(["documentation"]);
   });
 
   it("should print the HERE/THERE direction check", () => {
@@ -188,6 +185,51 @@ describe("cli", { timeout: 60_000 }, () => {
 
     expect(parsed.session).toMatchObject({ status: "ready" });
     expect(parsed.observation).toMatchObject({ status: "succeeded", output: { repoRoot } });
+  });
+
+  it("should close configured MCP clients before tool-run exits", () => {
+    const directory = mkdtempSync(join(tmpdir(), "guruharness-cli-mcp-"));
+    const configPath = join(directory, "guruharness.config.json");
+    const fakeMcpServer = join(repoRoot, "tests", "mcp", "fixtures", "fake-mcp-server.mjs");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        mcpServers: [
+          {
+            id: "fake",
+            transport: "stdio",
+            command: process.execPath,
+            args: [fakeMcpServer],
+            category: "test",
+            timeoutMs: 10_000
+          }
+        ]
+      }),
+      "utf8"
+    );
+
+    try {
+      const output = execFileSync(
+        process.execPath,
+        [
+          "--import",
+          "tsx",
+          "src/cli.ts",
+          "tool-run",
+          "--config",
+          configPath,
+          "--tool-id",
+          "mcp.fake.echo",
+          "--input-json",
+          JSON.stringify({ arguments: { value: "cli" } })
+        ],
+        { cwd: repoRoot, encoding: "utf8", timeout: 15_000 }
+      ).trim();
+      const parsed = JSON.parse(output) as { observation?: { status?: string; output?: { text?: string } } };
+      expect(parsed.observation).toMatchObject({ status: "succeeded", output: { text: expect.stringContaining("cli") } });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it("should print session list help", () => {

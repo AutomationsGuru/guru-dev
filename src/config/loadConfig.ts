@@ -37,7 +37,10 @@ export function loadHarnessConfig(options: LoadHarnessConfigOptions = {}): Confi
   }
 
   try {
-    const rawConfig = JSON.parse(readFileSync(configPath, "utf8")) as unknown;
+    const rawText = readFileSync(configPath, "utf8");
+    // Strip a UTF-8 BOM (the Windows Notepad default) — JSON.parse throws on it,
+    // which silently replaced the operator's ENTIRE config with safe defaults.
+    const rawConfig = JSON.parse(rawText.charCodeAt(0) === 0xfeff ? rawText.slice(1) : rawText) as unknown;
     const parsedConfig = HarnessConfigSchema.safeParse(rawConfig);
 
     if (!parsedConfig.success) {

@@ -71,13 +71,54 @@ describe("createExtensionHost", () => {
     host.stop();
   });
 
-  it("rejects duplicate command ids", () => {
+  it("keeps the FIRST registration on a duplicate command id (warns, doesn't throw) (review 2026-07-08)", () => {
     const host = createExtensionHost();
+    const calls: string[] = [];
     host.registerExtension((api) => {
-      api.registerCommand("dup", () => {}, { description: "one" });
-      api.registerCommand("dup", () => {}, { description: "two" });
+      api.registerCommand("dup", () => { calls.push("one"); }, { description: "one" });
+      api.registerCommand("dup", () => { calls.push("two"); }, { description: "two" });
     });
 
-    expect(() => host.start()).toThrow("Command already registered: dup");
+    // Old behavior threw "Command already registered" from inside start(), which
+    // aborted the host for every other extension. Now it warns + keeps the first.
+    expect(() => host.start()).not.toThrow();
+    const entry = host.getCommandRegistry().get("dup");
+    expect(entry).toBeDefined();
+    entry?.handler([]);
+    expect(calls).toEqual(["one"]);
+  });
+
+  it("isolates a throwing extension so the rest of the host still activates (review 2026-07-08)", () => {
+    const host = createExtensionHost();
+    const calls: string[] = [];
+    host.registerExtension(() => {
+      throw new Error("boom in ext A");
+    });
+    host.registerExtension((api) => {
+      api.registerCommand("good", () => { calls.push("ok"); }, { description: "good ext" });
+    });
+
+    // Old behavior: ext A's throw aborted start(), so the good command never
+    // registered and active stayed false. Now A is skipped with a warning and B
+    // still activates.
+    expect(() => host.start()).not.toThrow();
+    const entry = host.getCommandRegistry().get("good");
+    expect(entry).toBeDefined();
+    entry?.handler([]);
+    expect(calls).toEqual(["ok"]);
+  });
+
+  it("a second start() rebuilds the registry from scratch (no doubling) (review 2026-07-08)", () => {
+    const host = createExtensionHost();
+    host.registerExtension((api) => {
+      api.registerCommand("once", () => {}, { description: "x" });
+    });
+    host.start();
+    host.stop();
+    host.start(); // re-start — old behavior DOUBLED the registration
+
+    // The command must appear exactly once (not twice).
+    const commands = [...host.getCommandRegistry().keys()].filter((id) => id === "once");
+    expect(commands).toHaveLength(1);
   });
 });
