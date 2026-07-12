@@ -7,6 +7,7 @@ import {
   buildAuthorizeUrl,
   exchangeCode,
   extractAccountFacts,
+  fetchWithTimeout,
   generatePkce,
   isTokenNearExpiry,
   readCodexCacheToken,
@@ -96,6 +97,34 @@ describe("openai codex native OAuth — flow mechanics", () => {
     const token: GuruOAuthToken = { accessToken: "a", refreshToken: "r", idToken: "", authMode: "chatgpt", obtainedAt: 0, expiresAt: 1_000_000 };
     expect(isTokenNearExpiry(token, 1_000_000 - 60_000)).toBe(true);
     expect(isTokenNearExpiry(token, 1_000_000 - 10 * 60_000)).toBe(false);
+  });
+});
+
+describe("OAuth POSTs are timeout-bounded (a blackholed token endpoint must not hang /login or the pre-turn refresh)", () => {
+  const hangingFetch = ((_url: unknown, init: { signal?: AbortSignal }) =>
+    new Promise((_resolve, reject) => {
+      init.signal?.addEventListener("abort", () => reject(new Error("aborted by timeout")));
+    })) as typeof fetch;
+
+  it("fetchWithTimeout aborts a hung request at timeoutMs", async () => {
+    await expect(fetchWithTimeout(hangingFetch, "https://example.test/token", { method: "POST", timeoutMs: 10 })).rejects.toThrow(
+      /aborted/
+    );
+  });
+
+  it("exchangeCode and refreshOAuthToken pass an abort signal into fetch (the timeout is armed)", async () => {
+    const signals: Array<AbortSignal | undefined> = [];
+    const fetchImpl = (async (_url: unknown, init: { signal?: AbortSignal }) => {
+      signals.push(init.signal);
+      return new Response(JSON.stringify({ access_token: "", refresh_token: "r2" }), { status: 200 });
+    }) as typeof fetch;
+    await exchangeCode(resolveOAuthConfig(EMPTY_ENV), "CODE", "VER", "http://localhost:1455/auth/callback", fetchImpl, 1000);
+    const previous: GuruOAuthToken = { accessToken: "", refreshToken: "r1", idToken: "", authMode: "chatgpt", obtainedAt: 0 };
+    await refreshOAuthToken(resolveOAuthConfig(EMPTY_ENV), previous, fetchImpl, 5);
+    expect(signals).toHaveLength(2);
+    for (const signal of signals) {
+      expect(signal).toBeInstanceOf(AbortSignal);
+    }
   });
 });
 

@@ -11,7 +11,8 @@ import {
   OAuthRefreshError,
   safeReadFile,
   type GuruOAuthToken,
-  type Pkce
+  type Pkce,
+  fetchWithTimeout
 } from "./openaiCodexLogin.js";
 
 /**
@@ -62,23 +63,6 @@ export function resolveXaiOAuthConfig(env: NodeJS.ProcessEnv = process.env): Xai
 }
 
 type FetchImpl = typeof globalThis.fetch;
-
-/**
- * Fetch with a hard per-request timeout (review 2026-07-08): a blackholed token
- * endpoint (flaky Wi-Fi, captive portal, transient DNS) used to hang /login
- * forever because the device-code expiry was only checked BETWEEN polls. This
- * bounds every OAuth fetch so a stalled connection aborts instead of freezing.
- */
-async function fetchWithTimeout(fetchImpl: FetchImpl, url: string, init: RequestInit & { readonly timeoutMs?: number }): Promise<Response> {
-  const { timeoutMs = 15_000, ...rest } = init;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetchImpl(url, { ...rest, signal: controller.signal });
-  } finally {
-    clearTimeout(timer);
-  }
-}
 
 // expiryFromAccessToken, safeReadFile, defaultOpenBrowser are shared with the ChatGPT
 // login and imported from openaiCodexLogin.ts (single source of truth).
@@ -140,7 +124,7 @@ export async function exchangeXaiCode(
     code_challenge: pkce.challenge,
     code_challenge_method: "S256"
   });
-  const res = await fetchImpl(`${config.issuer}${config.tokenPath}`, {
+  const res = await fetchWithTimeout(fetchImpl, `${config.issuer}${config.tokenPath}`, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: body.toString()

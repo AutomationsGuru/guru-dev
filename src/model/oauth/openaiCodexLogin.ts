@@ -148,6 +148,27 @@ function tokenFromResponse(json: Record<string, unknown>, previous?: GuruOAuthTo
   };
 }
 
+/**
+ * Fetch with a hard per-request timeout (review 2026-07-08, generalized from the
+ * xAI login 2026-07-12): a blackholed token endpoint (flaky Wi-Fi, captive
+ * portal, transient DNS) hangs /login and the pre-turn refresh forever without
+ * one. Bounds every OAuth POST so a stalled connection aborts instead of freezing.
+ */
+export async function fetchWithTimeout(
+  fetchImpl: FetchImpl,
+  url: string,
+  init: RequestInit & { readonly timeoutMs?: number }
+): Promise<Response> {
+  const { timeoutMs = 15_000, ...rest } = init;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetchImpl(url, { ...rest, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** Exchange the authorization code (form-urlencoded) for the token set. */
 export async function exchangeCode(
   config: OpenaiCodexOAuthConfig,
@@ -164,7 +185,7 @@ export async function exchangeCode(
     client_id: config.clientId,
     code_verifier: verifier
   });
-  const res = await fetchImpl(`${config.issuer}/oauth/token`, {
+  const res = await fetchWithTimeout(fetchImpl, `${config.issuer}/oauth/token`, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: body.toString()
@@ -194,7 +215,7 @@ export async function refreshOAuthToken(
   fetchImpl: FetchImpl = globalThis.fetch,
   now = Date.now()
 ): Promise<GuruOAuthToken> {
-  const res = await fetchImpl(`${config.issuer}/oauth/token`, {
+  const res = await fetchWithTimeout(fetchImpl, `${config.issuer}/oauth/token`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ client_id: config.clientId, grant_type: "refresh_token", refresh_token: previous.refreshToken })
