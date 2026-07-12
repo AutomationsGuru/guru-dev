@@ -1,5 +1,6 @@
+import { execFileSync } from "node:child_process";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 import { createFileMemoryStore, type FileMemoryStore } from "./store.js";
 
@@ -34,6 +35,42 @@ export interface ScopeContext {
   readonly repoRoot?: string;
   /** Enables the role scope when set (the worn suit's slug). */
   readonly roleSlug?: string;
+}
+
+/**
+ * Map a checkout path to the SHARED space-memory root: the main worktree.
+ *
+ * The memory design (guru-memory-design.md §scopes) mandates that every git
+ * worktree of a repo reads and writes ONE space memory — otherwise each agent
+ * lane accretes its own divergent `.guru/memory` and the lanes stop compounding
+ * each other's facts. `git rev-parse --git-common-dir` points at the main
+ * checkout's `.git` from ANY linked worktree; its parent is the shared root.
+ * Fail-safe: any error (not a git repo, git absent, bare repo) returns the
+ * input unchanged, preserving the old per-directory behavior.
+ */
+export function resolveSpaceMemoryRoot(repoRoot: string): string {
+  try {
+    const out = execFileSync("git", ["rev-parse", "--git-common-dir"], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 5_000,
+      windowsHide: true
+    }).trim();
+    if (out.length === 0) {
+      return repoRoot;
+    }
+    // resolve() also normalizes an already-absolute answer to platform
+    // separators (git emits forward slashes on Windows).
+    const commonDir = resolve(repoRoot, out);
+    // A bare repo's common dir has no worktree parent worth writing into.
+    if (!/[\\/]\.git$/u.test(commonDir)) {
+      return repoRoot;
+    }
+    return dirname(commonDir);
+  } catch {
+    return repoRoot;
+  }
 }
 
 /**
@@ -103,6 +140,16 @@ export function createScopedMemory(global: FileMemoryStore, options: ScopedMemor
       }));
 
   let repoRoot: string | null = options.repoRoot ?? null;
+  // One git subprocess per distinct repoRoot, not per space() access.
+  const spaceRootCache = new Map<string, string>();
+  const sharedSpaceRoot = (root: string): string => {
+    let resolved = spaceRootCache.get(root);
+    if (resolved === undefined) {
+      resolved = resolveSpaceMemoryRoot(root);
+      spaceRootCache.set(root, resolved);
+    }
+    return resolved;
+  };
   let roleSlug: string | null = options.roleSlug ?? null;
   let spaceStore: FileMemoryStore | null = null;
   let spaceKey: string | null = null;
@@ -116,7 +163,13 @@ export function createScopedMemory(global: FileMemoryStore, options: ScopedMemor
   });
 
   const space = (): FileMemoryStore | null => {
-    const dir = resolveScopeDirectory("space", ctx());
+    // Space memory is shared across ALL worktrees of the repo (one lane's facts
+    // must reach the others) — resolve through the git common dir first.
+    const context = ctx();
+    const dir = resolveScopeDirectory("space", {
+      ...context,
+      ...(context.repoRoot ? { repoRoot: sharedSpaceRoot(context.repoRoot) } : {})
+    });
     if (!dir) {
       spaceStore = null;
       spaceKey = null;
