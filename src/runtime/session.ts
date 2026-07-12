@@ -407,8 +407,9 @@ async function buildHarnessSession(
   const configCwd = configResult.status === "loaded" ? dirname(configResult.path) : cwd;
   const baseState = createSelfBuildState();
   const state = applySelfBuildProgress(baseState, configResult.config.selfBuild.completedTaskIds);
+  const chatSession = parsedOptions.purpose === "chat";
   const selectedTask = selectSessionTask(state.tasks, parsedOptions.taskId);
-  const task = parsedOptions.taskId ? selectedTask ?? null : planNextSelfBuildTask(state) ?? null;
+  const task = chatSession ? null : parsedOptions.taskId ? selectedTask ?? null : planNextSelfBuildTask(state) ?? null;
   const direction = createDirectionAlignmentReport({
     here: state.here,
     there: state.there,
@@ -432,14 +433,19 @@ async function buildHarnessSession(
     blockers.push(...configResult.diagnostics);
   }
 
-  if (parsedOptions.taskId && !selectedTask) {
-    blockers.push(`Self-build task not found: ${parsedOptions.taskId}`);
-  } else if (!task) {
-    blockers.push("No self-build task is selected for this session.");
-  }
+  // Chat sessions are conversational: self-build task selection and direction
+  // alignment are planner scaffolding and must not block them. Config-RED,
+  // skill-load, and repo-context blockers above still apply.
+  if (!chatSession) {
+    if (parsedOptions.taskId && !selectedTask) {
+      blockers.push(`Self-build task not found: ${parsedOptions.taskId}`);
+    } else if (!task) {
+      blockers.push("No self-build task is selected for this session.");
+    }
 
-  if (direction.verdict === "RED") {
-    blockers.push(direction.summary);
+    if (direction.verdict === "RED") {
+      blockers.push(direction.summary);
+    }
   }
 
   const session = HarnessSessionSchema.parse({

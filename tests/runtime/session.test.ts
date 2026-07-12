@@ -175,6 +175,18 @@ describe("startHarnessSession", () => {
     expect(session.task?.id).toBe("planner-runtime");
     expect(session.direction.task?.thereContribution).toContain("model-backed planning");
   });
+
+  it("chat purpose: no self-build task is planned and no planner blockers apply", async () => {
+    const session = await startHarnessSession({ cwd: repoRoot, purpose: "chat" });
+
+    expect(session.status).toBe("ready");
+    expect(session.task).toBeNull();
+    expect(session.blockers).toEqual([]);
+  });
+
+  it("chat purpose rejects a taskId — chat sessions carry no self-build task", async () => {
+    await expect(startHarnessSession({ cwd: repoRoot, purpose: "chat", taskId: "planner-runtime" })).rejects.toThrow(/chat/u);
+  });
 });
 
 describe("createHarnessRuntime", () => {

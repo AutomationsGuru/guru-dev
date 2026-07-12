@@ -129,7 +129,7 @@ export interface RunRpcOptions {
 async function bootstrapSession(createRuntime: () => HarnessRuntime): Promise<{ session: AgentSession; routes: readonly ProviderRouteDescriptor[]; runtime: HarnessRuntime }> {
   const runtime = createRuntime();
   try {
-    const harness = await runtime.startSession({});
+    const harness = await runtime.startSession({ purpose: "chat" });
     const routes = createDirectProviderCatalog();
     const route = routes.find((r) => isChatCapableFamily(r.apiFamily) && r.routeType === "direct-api" && resolveRouteCredential(r).usable) ?? routes[0];
     const session = new AgentSession({

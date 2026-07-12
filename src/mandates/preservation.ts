@@ -1,3 +1,8 @@
+import { readFileSync } from "node:fs";
+import { resolve as resolvePath } from "node:path";
+
+import type { MandateDecision } from "./evaluate.js";
+
 /**
  * Content-preservation guard — the mechanical arm of PRESERVE, DON'T REPLACE
  * (THERE §12; the behavioral rule lives in Guru's system prompt).
@@ -107,4 +112,50 @@ export function assessContentRemoval(toolId: string, input: unknown, probe: Pres
   }
 
   return null;
+}
+
+
+/**
+ * PRESERVE, DON'T REPLACE mechanical backstop shared by EVERY approval path —
+ * TUI main turn, swarm workers, and the AgentSession engine default (SDK/RPC).
+ * Escalates a gutting write/edit/fs.edit.apply to destructive-class so the
+ * hard-edge rules double-check it in every mode, YOLO included.
+ */
+export function applyPreservationGuard(
+  decision: MandateDecision,
+  toolId: string,
+  input: unknown,
+  defaultRepoRoot: string
+): MandateDecision {
+  if (decision.outcome === "deny") {
+    return decision;
+  }
+  const removal = assessContentRemoval(toolId, input, {
+    resolvePath: (p) => {
+      const record = typeof input === "object" && input !== null ? (input as Record<string, unknown>) : {};
+      const root =
+        typeof record.repoRoot === "string" && record.repoRoot.length > 0 ? record.repoRoot : defaultRepoRoot;
+      return resolvePath(root, p);
+    },
+    readExisting: (abs) => {
+      try {
+        return readFileSync(abs, "utf8");
+      } catch (error) {
+        // Only a genuinely missing file is "brand new"; other errors must not
+        // silently skip the guard (EACCES / EISDIR / I/O).
+        if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+          return null;
+        }
+        throw error;
+      }
+    }
+  });
+  if (!removal) {
+    return decision;
+  }
+  return {
+    outcome: "escalate",
+    reason: `content preservation — ${removal.reason}`,
+    verbs: decision.verbs.includes("destructive") ? decision.verbs : [...decision.verbs, "destructive"]
+  };
 }

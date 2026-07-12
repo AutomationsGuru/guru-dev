@@ -80,7 +80,7 @@ import { createMandateStore, type MandateStore } from "./mandates/store.js";
 import { evaluateToolMandate, MANDATE_READ_ONLY_TOOLS, type MandateDecision } from "./mandates/evaluate.js";
 import { HARD_EDGE_VERBS, type MandateState, type MandateVerb } from "./mandates/schema.js";
 import { resolveApproval, type ApprovalChoice, type ApprovalRequest } from "./mandates/approval.js";
-import { assessContentRemoval } from "./mandates/preservation.js";
+import { applyPreservationGuard } from "./mandates/preservation.js";
 import {
   estimateTranscriptTokens,
   runCompaction,
@@ -216,10 +216,12 @@ interface GuruState {
   sessionNumber: number;
   /** The unified turn engine (Engine Extraction v0.18b): the TUI drives THIS. */
   agentSession: AgentSession | null;
-  /** Per-turn abort controller (§17 S13 / daily-driver Ctrl+C). Set at the top of
-   * chatTurn and tripped by the composer interrupt handler. Lives alongside
-   * agentSession.currentAbort because the delegated turn (Codex/Grok CLI) does not
-   * go through AgentSession — it needs its own signal to kill the child process. */
+  /** Per-turn abort controller (§17 S13 / daily-driver Ctrl+C). Armed at the top of
+   * chatTurn BEFORE maybeAutoCompact and tripped by the composer interrupt handler.
+   * Lives alongside agentSession.currentAbort because it covers the pre-driveTurn
+   * window (compaction / working…) where agentSession.abort() is a no-op — it is
+   * threaded as the request signal into buildRouteSummarizer's directAgentTurn call
+   * so Esc cancels an in-flight compaction summary. */
   turnAbortController: AbortController | null;
   /**
    * Active chatTurn spinner clearer — ask_question / other mid-turn prompts call
@@ -383,49 +385,6 @@ function runFlywheelAtPark(roleSlug: string, earnedTools: readonly string[], use
   }
   const levels = promoted > 0 || demoted > 0 ? ` · ${promoted} promoted · ${demoted} demoted` : "";
   return `${extracted} learned · ${cited} cited · ${pruned} pruned${levels}${flagged > 0 ? ` · ${flagged} to review` : ""}`;
-}
-
-/**
- * PRESERVE, DON'T REPLACE mechanical backstop shared by main-turn and swarm
- * approveTool paths. Escalates gutting write/edit/fs.edit.apply to destructive.
- */
-function applyPreservationGuard(
-  decision: MandateDecision,
-  toolId: string,
-  input: unknown,
-  defaultRepoRoot: string
-): MandateDecision {
-  if (decision.outcome === "deny") {
-    return decision;
-  }
-  const removal = assessContentRemoval(toolId, input, {
-    resolvePath: (p) => {
-      const record = typeof input === "object" && input !== null ? (input as Record<string, unknown>) : {};
-      const root =
-        typeof record.repoRoot === "string" && record.repoRoot.length > 0 ? record.repoRoot : defaultRepoRoot;
-      return resolvePath(root, p);
-    },
-    readExisting: (abs) => {
-      try {
-        return readFileSync(abs, "utf8");
-      } catch (error) {
-        // Only a genuinely missing file is "brand new"; other errors must not
-        // silently skip the guard (EACCES / EISDIR / I/O).
-        if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
-          return null;
-        }
-        throw error;
-      }
-    }
-  });
-  if (!removal) {
-    return decision;
-  }
-  return {
-    outcome: "escalate",
-    reason: `content preservation — ${removal.reason}`,
-    verbs: decision.verbs.includes("destructive") ? decision.verbs : [...decision.verbs, "destructive"]
-  };
 }
 
 /** Base tools that need repoRoot injected from the live session's repo context. */
@@ -5145,7 +5104,7 @@ export async function runGuru(): Promise<void> {
     // operator staring at a blank screen with no feedback.
     print(dim(theme, "starting session… (resolving repo / git)"));
     const sessionStartedAt = Date.now();
-    state.session = await runtime.startSession({});
+    state.session = await runtime.startSession({ purpose: "chat" });
     state.sessionTools = runtime.getSessionTools(state.session.id);
     // Bind the space scope (§7): the session repo's .guru/memory travels with it.
     scopedMemory.setRepoRoot(state.session.repo?.repoRoot ?? null);
@@ -5453,10 +5412,9 @@ export async function runGuru(): Promise<void> {
       // Mid-turn: first Esc/Ctrl+C aborts the RUNNING agent — the #1 interactive
       // promise ("esc interrupt"). Double-tap quit only applies when IDLE.
       if (state.busy) {
-        // Trip the per-turn signal so the delegated CLI's child process is SIGKILL'd
-        // (the delegated path doesn't run through AgentSession, so we can't rely on
-        // its internal controller alone). Also covers the pre-driveTurn window
-        // (compaction / working…) where agentSession.abort() is a no-op.
+        // Trip the per-turn signal: it covers the pre-driveTurn window
+        // (compaction / working…) where agentSession.abort() is a no-op —
+        // the compaction summarizer runs on this signal, not the engine's.
         state.turnAbortController?.abort();
         const sessionAborted = state.agentSession?.abort() ?? false;
         if ((sessionAborted || state.turnAbortController?.signal.aborted) && !state.abortAnnounced) {

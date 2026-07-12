@@ -99,6 +99,62 @@ describe("AgentSession — the turn engine", () => {
     }).prompt("hard");
     expect(decisions.write).toBe(false);
   });
+
+  it("PRESERVE-DON'T-REPLACE holds on the ENGINE path: a gutting edit is denied even with writesAllowed:true", async () => {
+    const decisions: Record<string, boolean> = {};
+    const capture = (toolId: string, allowed: boolean) => {
+      decisions[toolId] = allowed;
+    };
+    const original = Array.from({ length: 30 }, (_, i) => `line ${i}`).join("\n");
+    // Gutting: 30 lines -> 2 (net -28 >= threshold, survivor < half) escalates to
+    // destructive-class, and the engine default has no interactive double-check,
+    // so it must deny — writesAllowed and standing grants notwithstanding.
+    await makeSession({
+      writesAllowed: true,
+      runTurn: stubRunner({
+        toolEvent: { toolId: "edit", status: "failed" },
+        approveInput: { oldText: original, newText: "line 0\nline 1" },
+        captureApprove: capture
+      })
+    }).prompt("gut");
+    expect(decisions.edit).toBe(false);
+
+    // A modest trim (30 -> 25 lines) is NOT a gutting; writesAllowed still works.
+    await makeSession({
+      writesAllowed: true,
+      runTurn: stubRunner({
+        toolEvent: { toolId: "edit", status: "succeeded" },
+        approveInput: { oldText: original, newText: Array.from({ length: 25 }, (_, i) => `line ${i}`).join("\n") },
+        captureApprove: capture
+      })
+    }).prompt("trim");
+    expect(decisions.edit).toBe(true);
+  });
+
+  it("rejects overlapping turns: a second prompt() throws, history stays clean, abort still reaches the running turn", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolveGate) => {
+      release = resolveGate;
+    });
+    const blockedRunner: TurnRunner = (async () => {
+      await gate;
+      const result: AgentTurnResult = { text: "first done", modelId: "m", routeId: "stub/model", apiFamily: "openai-chat-completions", toolCallCount: 0, toolEvents: [] };
+      return result;
+    }) as TurnRunner;
+    const s = makeSession({ runTurn: blockedRunner });
+
+    const first = s.prompt("one");
+    await expect(s.prompt("two")).rejects.toThrow(/already running/);
+    // The rejected prompt must not leave a dangling user message.
+    expect(s.history.filter((message) => message.role === "user")).toHaveLength(1);
+    // The RUNNING turn stays abortable (the old overlap clobbered its controller).
+    expect(s.abort()).toBe(true);
+    release();
+    await first;
+    // The finished turn released the busy sentinel — the session is reusable.
+    const again = await s.prompt("three");
+    expect(again.text).toBe("first done");
+  });
 });
 
 describe("AgentSession — driveTurn (the TUI seam, v0.18b)", () => {
