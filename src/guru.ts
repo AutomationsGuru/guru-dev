@@ -4266,6 +4266,9 @@ async function promptApproval(
   }
 }
 
+/** One near-expiry notice per provider per session — guidance, not nagging. */
+const cacheTokenExpiryWarned = new Set<string>();
+
 /** Refresh a guru-native OAuth token that's near expiry, persisting the rotated token. */
 async function refreshCodexTokenIfNeeded(state: GuruState, route: ProviderRouteDescriptor, force = false): Promise<boolean> {
   if (route.credentialSource.type !== "guru-oauth") {
@@ -4273,6 +4276,24 @@ async function refreshCodexTokenIfNeeded(state: GuruState, route: ProviderRouteD
   }
   const token = readVaultOAuthToken(state.vault, route.providerId);
   if (!token) {
+    // CLI-cache SHORTCUT tokens (~/.codex, ~/.grok) are used on the wire but must
+    // NOT be refreshed by guru: their refresh token ROTATES on use, so consuming it
+    // could invalidate the owning CLI's session — and writing the rotated pair back
+    // into another tool's auth file is an ecosystem-auth hard edge. Instead, when a
+    // cache token nears expiry, say so ONCE with the fix, rather than letting the
+    // operator hit a mystery 401 every hour.
+    const cached =
+      route.providerId === "grok" ? readGrokCacheToken() : route.providerId === "openai-codex" ? readCodexCacheToken() : null;
+    if (cached && (force || isTokenNearExpiry(cached)) && !cacheTokenExpiryWarned.has(route.providerId)) {
+      cacheTokenExpiryWarned.add(route.providerId);
+      print(
+        colorize(
+          theme,
+          "yellow",
+          `  using the ${route.providerId} CLI's cached sign-in, which is ${force ? "being rejected" : "near expiry"} — run /login ${route.providerId} for guru's own session (or refresh the provider CLI).`
+        )
+      );
+    }
     return false;
   }
   // `force` (the on-401 path, review 2026-07-08) refreshes even when the token
