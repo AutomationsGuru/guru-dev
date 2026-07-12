@@ -88,8 +88,8 @@ describe("resolveSpaceMemoryRoot — one space memory per repo, shared across wo
     mkdirSync(homeB, { recursive: true });
     const { mem: laneMain } = scoped(homeA, main);
     const { mem: laneWt } = scoped(homeB, wt);
-    laneMain.space()!.remember({ type: "project", title: "shared fact", description: "from the main lane", body: "written by lane A, must be visible to lane B" });
-    expect(laneWt.space()!.search({ terms: "shared fact" }).hits.length).toBeGreaterThan(0);
+    laneMain.space()!.remember({ type: "project", title: "shared fact", description: "from the main lane", body: "written by lane A, must be visible to lane B", edit: "replace", confidence: 1 });
+    expect(laneWt.space()!.search({ terms: "shared fact", limit: 5 }).hits.length).toBeGreaterThan(0);
   });
 });
 
