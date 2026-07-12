@@ -3,8 +3,9 @@
 [![CI](https://github.com/AutomationsGuru/guru-dev/actions/workflows/ci.yml/badge.svg)](https://github.com/AutomationsGuru/guru-dev/actions/workflows/ci.yml)
 ![guru harness](https://img.shields.io/badge/guru%20harness-AI%20agent%20harness-8C11E1?labelColor=1A1130&style=flat-square)
 ![node](https://img.shields.io/badge/node-%E2%89%A522-B56EF1?labelColor=1A1130&style=flat-square)
-![tests](https://img.shields.io/badge/tests-1190%2B%20passing-31C48D?labelColor=1A1130&style=flat-square)
-![version](https://img.shields.io/badge/release-v1.4.2-E958BE?labelColor=1A1130&style=flat-square)
+![tests](https://img.shields.io/badge/tests-1400%20passing-31C48D?labelColor=1A1130&style=flat-square)
+![version](https://img.shields.io/badge/release-v1.5.0-E958BE?labelColor=1A1130&style=flat-square)
+![license](https://img.shields.io/badge/license-MIT-31C48D?labelColor=1A1130&style=flat-square)
 
 **`guru` is a repo-aware terminal agent harness.** `cd` into any project, launch it, connect the model you want — your own provider API keys or a provider subscription/plan — and it does real coding work: reads your code, edits files, runs your tests, and iterates to green, with every action shown and every mutation behind an approval gate.
 
