@@ -77,9 +77,12 @@ describe("resolveSpaceMemoryRoot — one space memory per repo, shared across wo
     const wt = join(root, "lane-b");
     git(main, "worktree", "add", wt);
 
-    const mainReal = realpathSync(resolve(main));
-    expect(realpathSync(resolveSpaceMemoryRoot(main))).toBe(mainReal);
-    expect(realpathSync(resolveSpaceMemoryRoot(wt))).toBe(mainReal);
+    // realpathSync.native canonicalizes Windows 8.3 short names (RUNNER~1)
+    // to their long form, so both sides compare in the same spelling.
+    const canonical = (p: string): string => realpathSync.native(resolve(p));
+    const mainReal = canonical(main);
+    expect(canonical(resolveSpaceMemoryRoot(main))).toBe(mainReal);
+    expect(canonical(resolveSpaceMemoryRoot(wt))).toBe(mainReal);
 
     // The scoped organ therefore materializes ONE space store for both lanes.
     const homeA = join(root, "home-a");
