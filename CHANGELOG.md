@@ -2,7 +2,21 @@
 
 All notable changes to GuruHarness are documented here.
 
-## [Unreleased]
+## [1.5.0] - 2026-07-12
+
+Lane reconciliation release: merges the 2026-07-10/11 Windows daily-driver wave and the
+Codex Linux reliability wave onto the v1.4.2-v1.4.8 line (PR #28), with one
+implementation per capability (todo board, web_fetch, web_search, ask_question kept
+from the released line; schedule, manage_task, read_diagnostics, shell hooks,
+grapheme-aware TUI, and the YOLO hard-edge fixes kept from the wave).
+
+### Integration & delivery
+
+- **License: MIT** (was UNLICENSED on a public npm package) — LICENSE file added.
+- **Tag-triggered release workflow** (`release.yml`): verify gates then `npm publish --provenance` on `v*` tags (requires the `NPM_TOKEN` secret).
+- **Removed `dependabot-auto-merge.yml`** — it unconditionally approved and auto-merged every Dependabot PR (majors and production deps included), bypassing the guarded `dependabot-automation.yml` next to it.
+- **Windows + Node 22 CI job** — the engines floor and the primary dev platform now have CI coverage alongside the ubuntu/node-24 required check.
+- **CodeQL clean**: fixed the three alerts the wave introduced (polynomial ReDoS in the composer @-reference parser; shell-string hook execution -> execFile argv arrays, `.bat` hooks dropped in favor of `.ps1`; tainted cmd.exe token in gate spawn -> allowlist-constant shim names).
 
 ### Added
 
