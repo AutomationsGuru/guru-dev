@@ -362,6 +362,17 @@ function isInvalidToolArguments(value: unknown): value is InvalidToolArguments {
 async function performToolCall(context: FamilyContext, apiName: string, rawArguments: unknown): Promise<string> {
   const declaration = context.byApiName.get(apiName);
   if (!declaration) {
+    // Record the hallucinated call as a blocked event: it must be visible in
+    // toolEvents (operator trace) AND keep the family loops' last-event budget
+    // check honest — a silent return left them inspecting a STALE prior event,
+    // miscounting the budget for a call that never executed.
+    const event: AgentToolEvent = {
+      toolId: apiName,
+      status: "blocked",
+      detail: "Blocked because the model requested a tool that is not registered."
+    };
+    context.events.push(event);
+    context.onToolEvent?.(event);
     return JSON.stringify({ error: `Unknown tool: ${apiName}` });
   }
 
@@ -738,11 +749,13 @@ async function runAnthropicLoop(context: FamilyContext, messages: readonly ChatT
     }
     // Mid-run steer: append to the last user (tool_result) message so anthropic's
     // strict user/assistant alternation is preserved (never a second user in a row).
+    // Check injectability BEFORE draining: pullSteering emits steer.injected, so a
+    // drain that then fails the shape guard silently DROPS notes the operator was
+    // just told landed. An uninjectable tail leaves them queued for the boundary drain.
     if (iteration > 0 && context.pullSteering) {
-      const notes = context.pullSteering();
       const last = conversation[conversation.length - 1] as { role?: string; content?: unknown } | undefined;
-      if (notes.length > 0 && last?.role === "user" && Array.isArray(last.content)) {
-        for (const note of notes) {
+      if (last?.role === "user" && Array.isArray(last.content)) {
+        for (const note of context.pullSteering()) {
           (last.content as unknown[]).push({ type: "text", text: `[steering] ${note}` });
         }
       }
@@ -804,9 +817,12 @@ async function runAnthropicLoop(context: FamilyContext, messages: readonly ChatT
     }
     if (toolUses.length === 0 || response.stop_reason !== "tool_use") {
       // No-tool / end turn: honor mid-run steers (same daily-driver gap as the
-      // other families). Preserve anthropic user/assistant alternation.
-      const pendingSteers = context.pullSteering?.() ?? [];
-      if (pendingSteers.length > 0 && toolUses.length === 0) {
+      // other families). Preserve anthropic user/assistant alternation. A turn
+      // ending with DANGLING tool_use blocks (stop_reason max_tokens etc.) must
+      // not drain: injection is impossible here, and pullSteering already emits
+      // steer.injected — leave the notes queued for the next boundary drain.
+      const pendingSteers = toolUses.length === 0 ? (context.pullSteering?.() ?? []) : [];
+      if (pendingSteers.length > 0) {
         if (blockText.length > 0 || blocks.length > 0) {
           lastText = blockText.length > 0 ? blockText : lastText;
           conversation.push({ role: "assistant", content: blocks.length > 0 ? blocks : [{ type: "text", text: lastText }] });

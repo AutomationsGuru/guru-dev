@@ -124,7 +124,17 @@ export const StartHarnessSessionOptionsSchema = z
     targetPath: z.string().trim().min(1).optional(),
     taskId: z.string().trim().min(1).optional(),
     skillIds: z.array(z.string().trim().min(1)).default([]),
-    projectSlug: z.string().trim().min(1).default("guruharness")
+    projectSlug: z.string().trim().min(1).default("guruharness"),
+    /**
+     * What the session is FOR. "self-build" (default, the historical behavior)
+     * plans a self-build task and blocks when none fits; "chat" is a plain
+     * conversational session — no task planning, no self-build/direction
+     * blockers (config-RED, skill, and repo blockers still apply).
+     */
+    purpose: z.enum(["self-build", "chat"]).default("self-build")
   })
-  .strict();
+  .strict()
+  .refine((options) => !(options.purpose === "chat" && options.taskId), {
+    message: "taskId cannot be combined with purpose \"chat\" — chat sessions carry no self-build task."
+  });
 export type StartHarnessSessionOptions = z.input<typeof StartHarnessSessionOptionsSchema>;

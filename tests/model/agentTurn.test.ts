@@ -363,6 +363,61 @@ describe("directAgentTurn — abort + mid-run steering (§17 scenario 13)", () =
   });
 });
 
+describe("unknown-tool calls (hallucinated names)", () => {
+  it("records a blocked event and does not consume the budget for a call that never executed", async () => {
+    let call = 0;
+    const executed: string[] = [];
+    const bodies: string[] = [];
+    const result = await directAgentTurn(route, [{ role: "user", content: "go" }], {
+      env,
+      tools: [repoTool],
+      maxToolCalls: 1,
+      executeTool: async (toolId) => {
+        executed.push(toolId);
+        return observation(toolId, { gitStatus: "## main" });
+      },
+      approveTool: () => true,
+      fetchImpl: (async (_url: unknown, init: { body?: string }) => {
+        call += 1;
+        bodies.push(init.body ?? "");
+        if (call === 1) {
+          // Hallucinated name FIRST, real tool second, budget of ONE: if the
+          // unknown call consumed budget (the old stale-last-event bug), the
+          // real call could not execute.
+          return new Response(
+            JSON.stringify({
+              choices: [
+                {
+                  message: {
+                    content: null,
+                    tool_calls: [
+                      { id: "c1", function: { name: "no__such__tool", arguments: "{}" } },
+                      { id: "c2", function: { name: "repo__context__resolve", arguments: "{}" } }
+                    ]
+                  }
+                }
+              ]
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response(JSON.stringify({ choices: [{ message: { content: "done" } }] }), { status: 200 });
+      }) as typeof fetch
+    });
+
+    // The real tool executed despite the hallucinated call ahead of it.
+    expect(executed).toEqual(["repo.context.resolve"]);
+    // The model was told, and the second request carries the error verbatim.
+    expect(bodies[1]).toContain("Unknown tool: no__such__tool");
+    // The hallucinated call is VISIBLE in the trace as blocked, under its raw api name.
+    expect(result.toolEvents).toEqual(
+      expect.arrayContaining([expect.objectContaining({ toolId: "no__such__tool", status: "blocked" })])
+    );
+    expect(result.text).toBe("done");
+    expect(result.toolCallCount).toBe(1); // only the real execution counted
+  });
+});
+
 describe("directAgentTurn (anthropic-messages)", () => {
   const anthropicRoute = defineProviderRoute({
     providerId: "anthropic",
@@ -435,6 +490,38 @@ describe("directAgentTurn (anthropic-messages)", () => {
 
     expect(result.toolCallCount).toBe(1);
     expect(result.text).toBe("Let me check the branch for you."); // NOT ""
+  });
+
+  it("does NOT drain steers on a terminal turn with dangling tool_use blocks (no silent drop)", async () => {
+    // stop_reason "max_tokens" with a tool_use block: injection is impossible
+    // (anthropic alternation) — pullSteering must not be called, because the
+    // drain emits steer.injected and the notes would be silently dropped.
+    // They stay queued for the engine's next boundary drain instead.
+    let drains = 0;
+    const result = await directAgentTurn(anthropicRoute, [{ role: "user", content: "go" }], {
+      env,
+      tools: [repoTool],
+      executeTool: async (toolId) => observation(toolId, { gitStatus: "## main" }),
+      approveTool: () => true,
+      pullSteering: () => {
+        drains += 1;
+        return ["late note"];
+      },
+      fetchImpl: (async () =>
+        new Response(
+          JSON.stringify({
+            stop_reason: "max_tokens",
+            content: [
+              { type: "text", text: "partial answer" },
+              { type: "tool_use", id: "t1", name: "repo__context__resolve", input: {} }
+            ]
+          }),
+          { status: 200 }
+        )) as typeof fetch
+    });
+
+    expect(drains).toBe(0);
+    expect(result.text).toBe("partial answer");
   });
 });
 

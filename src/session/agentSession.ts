@@ -6,6 +6,7 @@ import type { HarnessSession } from "../runtime/schemas.js";
 import type { ToolDefinition, ToolObservation } from "../tools/registry.js";
 import type { RetryConfig, RetryHooks } from "../model/retryPolicy.js";
 import { evaluateToolMandate } from "../mandates/evaluate.js";
+import { applyPreservationGuard } from "../mandates/preservation.js";
 import { HARD_EDGE_VERBS, type MandateState } from "../mandates/schema.js";
 import { expandReferences } from "../tui/references.js";
 import type { FileMemoryStore } from "../memory/store.js";
@@ -250,11 +251,21 @@ export class AgentSession {
 
   private defaultApprove(session: HarnessSession | undefined): (toolId: string, input: unknown) => boolean {
     return (toolId, input) => {
-      const decision = evaluateToolMandate(toolId, input, {
-        cwd: session?.repo?.repoRoot ?? process.cwd(),
-        state: this.deps.mandate,
-        yolo: this.deps.yolo ?? false
-      });
+      const repoRoot = session?.repo?.repoRoot ?? process.cwd();
+      // PRESERVE, DON'T REPLACE holds on the ENGINE path too: a gutting write
+      // escalates to destructive-class even past writesAllowed / a standing
+      // "write" grant / YOLO, and the hard-edge branch below denies it
+      // fail-closed (SDK/RPC callers have no interactive double-check).
+      const decision = applyPreservationGuard(
+        evaluateToolMandate(toolId, input, {
+          cwd: repoRoot,
+          state: this.deps.mandate,
+          yolo: this.deps.yolo ?? false
+        }),
+        toolId,
+        input,
+        repoRoot
+      );
       if (decision.outcome === "allow") {
         return true;
       }
@@ -281,6 +292,12 @@ export class AgentSession {
    * The default driver (no fields) reproduces the v0.18.0 `prompt()` behavior.
    */
   async driveTurn(driver: TurnDriver = {}): Promise<AgentTurnResult> {
+    // Single-driver contract, enforced: overlapping turns would clobber
+    // currentAbort (making the older turn un-abortable) and interleave
+    // history pushes. Await the running turn or call abort() first.
+    if (this.currentAbort) {
+      throw new Error("AgentSession: a turn is already running — await it or call abort() first.");
+    }
     const route = driver.route ?? this.deps.route;
     const harnessSession = driver.session ?? this.deps.session;
     const readHistory = (): ChatTurnMessage[] => (driver.getHistory ? driver.getHistory() : this.history);
@@ -352,12 +369,19 @@ export class AgentSession {
       this.emit("done.packet", { turns: this.usage.turns });
       return result;
     } finally {
-      this.currentAbort = null;
+      if (this.currentAbort === controller) {
+        this.currentAbort = null;
+      }
     }
   }
 
   /** SDK turn: the full lifecycle (steer drain → @-expand → push user → execute). */
   async prompt(text: string): Promise<AgentTurnResult> {
+    // Reject BEFORE the steer drain and user push so a concurrent prompt can
+    // never leave a dangling user message in history (driveTurn re-checks too).
+    if (this.currentAbort) {
+      throw new Error("AgentSession: a turn is already running — await it or call abort() first.");
+    }
     // Drain ONLY pre-queued steers into this turn. Follow-ups stay queued for
     // takeFollowUps() so the driver runs them as fresh turns when the agent stops.
     for (let i = 0; i < this.steerQueue.length; ) {
