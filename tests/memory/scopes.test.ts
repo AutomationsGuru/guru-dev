@@ -1,11 +1,12 @@
-import { mkdirSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createFileMemoryStore } from "../../src/memory/store.js";
-import { createScopedMemory, resolveScopeDirectory, type MemoryScope } from "../../src/memory/scopes.js";
+import { createScopedMemory, resolveScopeDirectory, resolveSpaceMemoryRoot, type MemoryScope } from "../../src/memory/scopes.js";
 import { mergeScopedBootInjection } from "../../src/memory/inject.js";
 import { LearningSchema, learningId, type Learning } from "../../src/garage/flywheel.js";
 import { migrateRoleLearnings, storeLearning, loadLearnings } from "../../src/garage/flywheelStore.js";
@@ -53,6 +54,42 @@ describe("resolveScopeDirectory — the three namespaces (§7)", () => {
     expect(resolveScopeDirectory("space", { home: "/h" })).toBeNull();
     expect(resolveScopeDirectory("role", { home: "/h", repoRoot: "/repo" })).toBeNull();
     expect(resolveScopeDirectory("global", {})).toContain(join(".guruharness", "memory"));
+  });
+});
+
+describe("resolveSpaceMemoryRoot — one space memory per repo, shared across worktrees", () => {
+  const git = (cwd: string, ...args: string[]): string =>
+    execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+
+  it("returns the input unchanged for a non-git directory (fail-safe)", () => {
+    const plain = freshRoot();
+    expect(resolveSpaceMemoryRoot(plain)).toBe(plain);
+  });
+
+  it("maps a linked worktree to the MAIN checkout root, and the main checkout to itself", () => {
+    const root = freshRoot();
+    const main = join(root, "main");
+    mkdirSync(main, { recursive: true });
+    git(main, "init");
+    git(main, "config", "user.email", "t@t");
+    git(main, "config", "user.name", "t");
+    git(main, "commit", "--allow-empty", "-m", "seed");
+    const wt = join(root, "lane-b");
+    git(main, "worktree", "add", wt);
+
+    const mainReal = realpathSync(resolve(main));
+    expect(realpathSync(resolveSpaceMemoryRoot(main))).toBe(mainReal);
+    expect(realpathSync(resolveSpaceMemoryRoot(wt))).toBe(mainReal);
+
+    // The scoped organ therefore materializes ONE space store for both lanes.
+    const homeA = join(root, "home-a");
+    const homeB = join(root, "home-b");
+    mkdirSync(homeA, { recursive: true });
+    mkdirSync(homeB, { recursive: true });
+    const { mem: laneMain } = scoped(homeA, main);
+    const { mem: laneWt } = scoped(homeB, wt);
+    laneMain.space()!.remember({ type: "project", title: "shared fact", description: "from the main lane", body: "written by lane A, must be visible to lane B" });
+    expect(laneWt.space()!.search({ terms: "shared fact" }).hits.length).toBeGreaterThan(0);
   });
 });
 
