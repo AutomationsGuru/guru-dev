@@ -35,12 +35,12 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           test -n "$OPENAI_API_KEY"
-          codex exec review \
-            --base "origin/${{ github.event.pull_request.base.ref }}" \
+          codex exec \
+            --sandbox read-only \
             --ephemeral \
             --ignore-user-config \
             --output-last-message review.md \
-            "Review only this pull request's changes. Report only clear, actionable defects: correctness, security, reliability, or missing validation that can cause a real regression. Do not modify files, run tests, or inspect anything outside this repository. Do not provide praise, summaries, style suggestions, or speculative concerns. If there are no actionable findings, output exactly: No actionable findings."
+            "Review only the pull request diff between origin/${{ github.event.pull_request.base.ref }} and HEAD. Report only clear, actionable defects: correctness, security, reliability, or missing validation that can cause a real regression. Do not modify files, run tests, or inspect anything outside this repository. Do not provide praise, summaries, style suggestions, or speculative concerns. If there are no actionable findings, output exactly: No actionable findings."
 
       - name: Submit pull request review
         env:
