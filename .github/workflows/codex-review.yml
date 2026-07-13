@@ -31,10 +31,7 @@ jobs:
           persist-credentials: false
 
       - name: Review change set
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          test -n "$OPENAI_API_KEY"
           codex exec \
             --sandbox read-only \
             --ephemeral \
