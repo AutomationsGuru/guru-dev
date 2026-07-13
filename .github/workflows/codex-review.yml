@@ -1,0 +1,56 @@
+name: Codex Review
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    name: codex-review
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, agentos, review]
+    timeout-minutes: 20
+    concurrency:
+      group: codex-review-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      - name: Check out pull request
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Review change set
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          test -n "$OPENAI_API_KEY"
+          codex exec review \
+            --base "origin/${{ github.event.pull_request.base.ref }}" \
+            --ephemeral \
+            --ignore-user-config \
+            --output-last-message review.md \
+            "Review only this pull request's changes. Report only clear, actionable defects: correctness, security, reliability, or missing validation that can cause a real regression. Do not modify files, run tests, or inspect anything outside this repository. Do not provide praise, summaries, style suggestions, or speculative concerns. If there are no actionable findings, output exactly: No actionable findings."
+
+      - name: Submit pull request review
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          jq -n \
+            --rawfile body review.md \
+            '{event: "COMMENT", body: $body}' \
+            > review-payload.json
+          gh api \
+            --method POST \
+            "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews" \
+            --input review-payload.json
