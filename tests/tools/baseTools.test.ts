@@ -147,6 +147,28 @@ describe("bash full-command-line handling (shakedown fixes)", () => {
     expect(output.blockers.some((blocker) => blocker.includes("allowlisted"))).toBe(true);
   });
 
+  it("allows any executable when the runtime policy uses the YOLO wildcard", async () => {
+    let seen: readonly string[] = [];
+    const tool = createPiBashTool({
+      shellAllowlist: ["*"],
+      executor: async (command) => {
+        seen = command;
+        return { exitCode: 0, stdout: "ok", stderr: "", durationMs: 1 };
+      }
+    });
+    const output = await tool.execute({
+      repoRoot: process.cwd(),
+      command: "rg --version",
+      args: [],
+      timeoutMs: 5000,
+      maxOutputBytes: 64000,
+      dryRun: false
+    }, {});
+
+    expect(output.executed).toBe(true);
+    expect(seen).toEqual(["rg", "--version"]);
+  });
+
   it("rejects shell operators instead of passing them as literal argv", async () => {
     let calls = 0;
     const tool = createPiBashTool({

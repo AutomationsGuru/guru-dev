@@ -98,10 +98,70 @@ const DEFAULT_RISKY_PATH_PATTERNS = [
   "service-account"
 ];
 
-// Build/runtime tools plus read-only exploration basics — agentic models reach for
-// ls/cat/grep constantly; blocking them burns tool-call budget on no-ops (2026-07-02
-// scale shakedown). Exploration commands stay cwd-contained and content-guarded.
-const DEFAULT_SHELL_ALLOWLIST = ["npm", "node", "git", "pwsh", "ls", "dir", "cat", "type", "head", "tail", "grep", "findstr", "pwd", "echo", "wc"];
+// YOLO is the daily-driver default: permit project-contained argv commands rather
+// than forcing the model through a fragile executable allowlist. The runner still
+// has no shell parsing, keeps cwd in the repository, bounds time/output, and
+// redacts sensitive values. A concrete list remains available for constrained
+// deployments; "*" means any executable.
+const DEFAULT_SHELL_ALLOWLIST = ["*"];
+
+/** Environment-variable names are references only; connection strings and API keys never live in config. */
+const ENVIRONMENT_VARIABLE_NAME = /^[A-Z][A-Z0-9_]*$/;
+/** Kept deliberately narrow because these values become PostgreSQL identifiers. */
+const SQL_IDENTIFIER = /^[a-z_][a-z0-9_]*$/;
+
+export const MemoryPostgresConfigSchema = z
+  .object({
+    /** Name of the environment variable containing a PostgreSQL connection URL. */
+    connectionStringEnvVar: z.string().trim().regex(ENVIRONMENT_VARIABLE_NAME).default("GURU_MEMORY_DATABASE_URL"),
+    /** Namespace Guru may create/use for its own memory facts. */
+    schema: z.string().trim().regex(SQL_IDENTIFIER).default("guru_memory"),
+    /** Fact table within the configured schema. */
+    table: z.string().trim().regex(SQL_IDENTIFIER).default("facts"),
+    /** TLS behavior for managed PostgreSQL services. */
+    ssl: z.enum(["disable", "prefer", "require"]).default("prefer")
+  })
+  .strict();
+export type MemoryPostgresConfig = z.infer<typeof MemoryPostgresConfigSchema>;
+
+export const MemoryStorageConfigSchema = z
+  .object({
+    /** Markdown is the durable, zero-setup daily-driver default. */
+    provider: z.enum(["markdown", "postgres"]).default("markdown"),
+    postgres: MemoryPostgresConfigSchema.default(() => MemoryPostgresConfigSchema.parse({}))
+  })
+  .strict();
+export type MemoryStorageConfig = z.infer<typeof MemoryStorageConfigSchema>;
+
+/**
+ * Honcho is a reasoning/context integration, not a second pretend fact database.
+ * It is off until the operator explicitly supplies an API-key ENV NAME and enables it.
+ */
+export const HonchoMemoryConfigSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    apiKeyEnvVar: z.string().trim().regex(ENVIRONMENT_VARIABLE_NAME).default("HONCHO_API_KEY"),
+    workspaceId: z.string().trim().min(1).max(120).default("guruharness"),
+    sessionId: z.string().trim().min(1).max(160).default("guru-memory"),
+    userPeerId: z.string().trim().min(1).max(160).default("operator"),
+    agentPeerId: z.string().trim().min(1).max(160).default("guru"),
+    /** Optional self-hosted Honcho API endpoint. */
+    baseUrl: z.string().trim().url().optional(),
+    timeoutMs: z.number().int().positive().max(120_000).default(30_000),
+    /** Inject cached Honcho context and record completed chat turns when enabled. */
+    syncOnTurn: z.boolean().default(true),
+    contextTokenBudget: z.number().int().positive().max(8_000).default(1_200)
+  })
+  .strict();
+export type HonchoMemoryConfig = z.infer<typeof HonchoMemoryConfigSchema>;
+
+export const MemoryConfigSchema = z
+  .object({
+    storage: MemoryStorageConfigSchema.default(() => MemoryStorageConfigSchema.parse({})),
+    honcho: HonchoMemoryConfigSchema.default(() => HonchoMemoryConfigSchema.parse({}))
+  })
+  .strict();
+export type MemoryConfig = z.infer<typeof MemoryConfigSchema>;
 
 export const RuntimeHardeningSchema = z
   .object({
@@ -158,7 +218,9 @@ export const HarnessConfigSchema = z
     /** Boot ritual Phase 5 (TTFV): a fast baseline command run at boot; empty = skip. */
     baselineHealth: BaselineHealthConfigSchema.default(() => BaselineHealthConfigSchema.parse({})),
     /** MCP servers to ATTACH (never-stuck resolver): stdio JSON-RPC; empty = none. */
-    mcpServers: z.array(McpServerConfigSchema).default([])
+    mcpServers: z.array(McpServerConfigSchema).default([]),
+    /** Durable fact storage plus optional Honcho context enrichment. */
+    memory: MemoryConfigSchema.default(() => MemoryConfigSchema.parse({}))
   })
   .strict();
 export type HarnessConfig = z.infer<typeof HarnessConfigSchema>;

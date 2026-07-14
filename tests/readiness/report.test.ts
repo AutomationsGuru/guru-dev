@@ -13,7 +13,7 @@ const readyExecutor: ProviderCliStatusExecutor = {
 describe("buildReadinessReport", () => {
   it("includes runtime, honcho, and provider-CLI rows and derives a verdict", async () => {
     const honchoClient = createInMemoryHonchoClient({
-      config: HonchoConfigSchema.parse({ workspaceId: "guruharness", requiredEnvNames: ["HONCHO_API_KEY"] }),
+      config: HonchoConfigSchema.parse({ workspaceId: "guruharness", enabled: true, writeEnabled: true, requiredEnvNames: ["HONCHO_API_KEY"] }),
       env: { HONCHO_API_KEY: "present" }
     });
 

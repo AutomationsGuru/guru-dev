@@ -1,4 +1,4 @@
-import { createInMemoryHonchoClient } from "../../src/honcho/client.js";
+import { createHonchoClient, createInMemoryHonchoClient } from "../../src/honcho/client.js";
 import { HonchoConfigSchema } from "../../src/honcho/schemas.js";
 
 function makeClient(configOverrides: Record<string, unknown> = {}, env: Record<string, string> = {}) {
@@ -14,31 +14,48 @@ function makeClient(configOverrides: Record<string, unknown> = {}, env: Record<s
 const baseRemember = { peer: "user" as const, writeEnabled: false, userApproved: false };
 const baseRecall = { reasoningLevel: "minimal" as const, limit: 10, includeRaw: false };
 
+describe("createHonchoClient production adapter", () => {
+  it("is honestly disabled by default instead of impersonating a live memory service", async () => {
+    const status = await createHonchoClient({ config: HonchoConfigSchema.parse({ workspaceId: "guruharness" }) }).status();
+
+    expect(status).toMatchObject({ status: "disabled", writeEnabled: false, missingEnvNames: [] });
+  });
+
+  it("reports the configured key NAME when enabled but not configured", async () => {
+    const status = await createHonchoClient({
+      config: HonchoConfigSchema.parse({ enabled: true, workspaceId: "guruharness", apiKeyEnvVar: "TEAM_HONCHO_API_KEY" }),
+      env: {}
+    }).status();
+
+    expect(status).toMatchObject({ status: "missing-env", missingEnvNames: ["TEAM_HONCHO_API_KEY"] });
+  });
+});
+
 describe("createInMemoryHonchoClient.status", () => {
-  it("reports missing-env when a required env NAME is absent", () => {
-    const status = makeClient({}, {}).status();
+  it("reports missing-env when a required env NAME is absent", async () => {
+    const status = await makeClient({}, {}).status();
 
     expect(status.status).toBe("missing-env");
     expect(status.missingEnvNames).toContain("HONCHO_API_KEY");
     expect(status.writeEnabled).toBe(false);
   });
 
-  it("reports read-only when the required env is present but writeEnabled is false", () => {
-    const status = makeClient({ writeEnabled: false }, { HONCHO_API_KEY: "present" }).status();
+  it("reports read-only when the required env is present but writeEnabled is false", async () => {
+    const status = await makeClient({ enabled: true, writeEnabled: false }, { HONCHO_API_KEY: "present" }).status();
 
     expect(status.status).toBe("read-only");
     expect(status.missingEnvNames).toEqual([]);
   });
 
-  it("reports ready when the required env is present and writeEnabled is true", () => {
-    const status = makeClient({ writeEnabled: true }, { HONCHO_API_KEY: "present" }).status();
+  it("reports ready when the required env is present and writeEnabled is true", async () => {
+    const status = await makeClient({ enabled: true, writeEnabled: true }, { HONCHO_API_KEY: "present" }).status();
 
     expect(status.status).toBe("ready");
     expect(status.writeEnabled).toBe(true);
   });
 
-  it("never echoes a secret VALUE — env names only", () => {
-    const status = makeClient({}, { HONCHO_API_KEY: "super-secret-value" }).status();
+  it("never echoes a secret VALUE — env names only", async () => {
+    const status = await makeClient({}, { HONCHO_API_KEY: "super-secret-value" }).status();
 
     expect(JSON.stringify(status)).not.toContain("super-secret-value");
   });

@@ -8,15 +8,43 @@ import {
   filterSlashCommands,
   formatMcpStatusLines,
   formatApprovalOutcome,
+  getToolAccessMode,
+  isDirectGuruInvocation,
   injectRepoRoot,
   parseSlashCommand,
   readApprovalAnswer,
+  resolveWorkerYolo,
   resolveRouteSelector,
   sortedRoutes,
   SLASH_COMMANDS,
   withRuntimeCleanup
 } from "../../src/guru.js";
 import { createDirectProviderCatalog } from "../../src/providers/catalog.js";
+
+describe("guru entrypoint detection", () => {
+  const moduleEntry = "/repo/dist/guru.js";
+
+  it.each([
+    "/repo/dist/guru.js",
+    "/repo/dist/guru.ts",
+    "/repo/node_modules/.bin/guru",
+    "C:\\Users\\agentos\\AppData\\Roaming\\npm\\guru.cmd",
+    "C:\\Users\\agentos\\AppData\\Roaming\\npm\\guru.ps1"
+  ])("starts for a direct or npm launcher entrypoint: %s", (argvEntry) => {
+    expect(isDirectGuruInvocation(argvEntry, moduleEntry)).toBe(true);
+  });
+
+  it.each(["/repo/node_modules/.bin/vitest", "/repo/dist/cli.js", undefined])(
+    "does not start for an importing process: %s",
+    (argvEntry) => {
+      expect(isDirectGuruInvocation(argvEntry, moduleEntry)).toBe(false);
+    }
+  );
+
+  it("requires the guru module itself, not only a matching argv basename", () => {
+    expect(isDirectGuruInvocation("/repo/node_modules/.bin/guru", "/repo/dist/cli.js")).toBe(false);
+  });
+});
 
 describe("parseSlashCommand", () => {
   it("parses slash commands with args and lowercases the command", () => {
@@ -29,6 +57,20 @@ describe("parseSlashCommand", () => {
   it("returns null for chat text", () => {
     expect(parseSlashCommand("hello there")).toBeNull();
     expect(parseSlashCommand("  what is 2+2?")).toBeNull();
+  });
+});
+
+describe("YOLO access presentation", () => {
+  it("shows routine mutations as YOLO rather than per-call gated", () => {
+    expect(getToolAccessMode("read", true)).toBe("free");
+    expect(getToolAccessMode("write", true)).toBe("yolo");
+    expect(getToolAccessMode("write", false)).toBe("approval");
+  });
+
+  it("uses the spawn-time YOLO snapshot when present", () => {
+    expect(resolveWorkerYolo({ yolo: true }, false)).toBe(true);
+    expect(resolveWorkerYolo({ yolo: false }, true)).toBe(false);
+    expect(resolveWorkerYolo(undefined, true)).toBe(true);
   });
 });
 

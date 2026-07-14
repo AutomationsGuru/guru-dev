@@ -8,10 +8,19 @@ export type HonchoReasoningLevel = z.infer<typeof HonchoReasoningLevelSchema>;
 
 export const HonchoConfigSchema = z
   .object({
+    /** Disabled is the honest default until the operator explicitly opts in. */
+    enabled: z.boolean().default(false),
+    /** Env-var NAME only; values never land in config, logs, or status output. */
+    apiKeyEnvVar: z.string().trim().regex(/^[A-Z][A-Z0-9_]*$/).default("HONCHO_API_KEY"),
     workspaceId: z.string().trim().min(1),
-    sessionId: z.string().trim().min(1).optional(),
+    sessionId: z.string().trim().min(1).default("guru-memory"),
+    userPeerId: z.string().trim().min(1).default("operator"),
+    agentPeerId: z.string().trim().min(1).default("guru"),
+    baseUrl: z.string().trim().url().optional(),
     defaultPeer: HonchoPeerSchema.default("user"),
+    /** Kept for compatibility with the old in-memory test double; real runtime follows enabled. */
     writeEnabled: z.boolean().default(false),
+    /** Kept for compatibility with the old in-memory test double. */
     requiredEnvNames: z.array(z.string().trim().regex(/^[A-Z][A-Z0-9_]*$/)).default([]),
     timeoutMs: z.number().int().positive().default(30000)
   })
@@ -38,7 +47,9 @@ export const HonchoRememberRequestSchema = z
     peer: HonchoPeerSchema.default("user"),
     fact: z.string().trim().min(1),
     context: z.string().trim().min(1).optional(),
+    /** Legacy test-double compatibility; real configured Honcho follows integration config + runtime mode. */
     writeEnabled: z.boolean().default(false),
+    /** Legacy test-double compatibility; real configured Honcho follows integration config + runtime mode. */
     userApproved: z.boolean().default(false)
   })
   .strict();
@@ -100,7 +111,9 @@ export const HonchoLogTurnRequestSchema = z
     userSummary: z.string().trim().min(1),
     assistantSummary: z.string().trim().min(1).optional(),
     peer: HonchoPeerSchema.default("ai"),
+    /** Legacy test-double compatibility; real configured Honcho follows integration config + runtime mode. */
     writeEnabled: z.boolean().default(false),
+    /** Legacy test-double compatibility; real configured Honcho follows integration config + runtime mode. */
     userApproved: z.boolean().default(false)
   })
   .strict();

@@ -1,4 +1,5 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,6 +15,7 @@ import {
   type HarnessRuntime,
   type ToolDefinition
 } from "../../src/index.js";
+import { ensureGuruHome } from "../../src/home/paths.js";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const fakeMcpServer = resolve(repoRoot, "tests", "mcp", "fixtures", "fake-mcp-server.mjs");
@@ -108,6 +110,7 @@ describe("startHarnessSession", () => {
       "memory_get",
       "memory_remember",
       "memory_search",
+      "memory_status",
       "operational.backlog.create",
       "operational.backlog.list",
       "operational.blocker.record",
@@ -186,6 +189,42 @@ describe("startHarnessSession", () => {
 
   it("chat purpose rejects a taskId — chat sessions carry no self-build task", async () => {
     await expect(startHarnessSession({ cwd: repoRoot, purpose: "chat", taskId: "planner-runtime" })).rejects.toThrow(/chat/u);
+  });
+
+  it("creates a usable project-specific harness in a fresh non-Git folder", async () => {
+    const root = await mkdtemp(resolve(tmpdir(), "guruharness-fresh-project-"));
+    const homeDirectory = resolve(root, "home");
+    const projectDirectory = resolve(root, "project");
+    const home = ensureGuruHome({ homeDirectory }).paths;
+    await mkdir(resolve(home.skillsDirectory, "shared"), { recursive: true });
+    await writeFile(
+      resolve(home.skillsDirectory, "shared", "SKILL.md"),
+      "---\nname: shared-home-skill\ndescription: Available through the home profile.\n---\n# Shared home skill\n",
+      "utf8"
+    );
+
+    try {
+      const session = await startHarnessSession({
+        cwd: projectDirectory,
+        purpose: "chat",
+        guruHomeDirectory: homeDirectory
+      });
+
+      expect(session.status).toBe("ready");
+      expect(session.repo).toBeNull();
+      expect(session.config).toMatchObject({ source: "project", status: "loaded" });
+      expect(session.projectHarness).toMatchObject({
+        status: "ready",
+        projectRoot: projectDirectory,
+        configPath: resolve(projectDirectory, ".guru", "guruharness.config.json")
+      });
+      expect(session.skills.catalog.skills.map((skill) => skill.id)).toContain("shared-home-skill");
+      expect(session.projectHarness?.manifest?.toolIds).toContain("read");
+      expect(existsSync(resolve(projectDirectory, ".guru", "harness.json"))).toBe(true);
+      expect(existsSync(resolve(projectDirectory, ".guru", "memory", "MEMORY.md"))).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
 

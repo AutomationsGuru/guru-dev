@@ -50,7 +50,7 @@ export function createShellExecTool(
   return {
     id: "shell.command.run",
     title: "Run bounded shell command",
-    description: "Run an allowlisted command with shell:false, repository cwd containment, secret checks, and dry-run by default.",
+    description: "Run a policy-permitted command with shell:false, repository cwd containment, secret checks, and dry-run by default.",
     inputSchema: ShellExecToolInputSchema,
     outputSchema: ShellExecToolOutputSchema,
     async execute(input, context) {
@@ -157,7 +157,7 @@ function buildShellBlockers(
   const [executable, ...args] = input.command;
   const allowedExecutables = new Set(options.shellAllowlist.map((entry) => entry.toLowerCase()));
 
-  if (!executable || !allowedExecutables.has(executable.toLowerCase())) {
+  if (!executable || (!allowedExecutables.has("*") && !allowedExecutables.has(executable.toLowerCase()))) {
     blockers.push("Executable is not allowlisted by runtime hardening policy.");
   }
 

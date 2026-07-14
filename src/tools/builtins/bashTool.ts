@@ -50,7 +50,7 @@ export function createPiBashTool(options: PiBashToolOptions = { shellAllowlist: 
     id: "bash",
     title: "Run command (argv)",
     description:
-      "Bounded single-process argv runner (cwd containment, allowlist, timeout, truncation). Pass a simple command line (e.g. \"npm test\") or executable + args separately. " +
+      "Bounded single-process argv runner (cwd containment, executable policy, timeout, truncation). Pass a simple command line (e.g. \"npm test\") or executable + args separately. " +
       "Shell operators, redirects, pipes, expansion, and command chaining are intentionally unsupported; issue separate tool calls instead. " +
       "Before any destructive/delete command (rm, a truncating `>` redirect, git reset --hard, force-push), ask: does this really need to go? (yes/no) " +
       "Preserve, rename-aside, or enhance before you delete — destructive commands are double-checked even in YOLO.",
@@ -143,7 +143,7 @@ function buildBlockers(command: readonly string[], cwd: string, repoRoot: string
   const blockers: string[] = [];
   const [exe, ...args] = command;
   const allowed = new Set(options.shellAllowlist.map((item) => item.toLowerCase()));
-  if (!exe || !allowed.has(exe.toLowerCase())) blockers.push("Executable is not allowlisted by runtime hardening policy.");
+  if (!exe || (!allowed.has("*") && !allowed.has(exe.toLowerCase()))) blockers.push("Executable is not allowlisted by runtime hardening policy.");
   const rel = relative(repoRoot, cwd);
   if (rel.startsWith("..") || isAbsolute(rel)) blockers.push("Command cwd escapes the repository root (path redacted).");
   const content = guardContent(command.map((value, index) => ({ name: `command[${index}]`, value })), { repoRoot, riskyPathPatterns: [], secretAllowList: options.secretAllowList ?? [], allowRiskyPaths: false });

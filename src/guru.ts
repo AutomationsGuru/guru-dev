@@ -17,6 +17,8 @@ import { createInterface } from "node:readline";
 import { StringDecoder } from "node:string_decoder";
 
 import { getRuntimeInfo, loadHarnessConfig } from "./index.js";
+import { getGuruHomePaths } from "./home/paths.js";
+import { bootstrapProjectHarness } from "./project-harness/bootstrap.js";
 import { createHarnessRuntime, type HarnessRuntime } from "./runtime/session.js";
 import type { HarnessSession } from "./runtime/schemas.js";
 import type { McpServerStatus } from "./mcp/schemas.js";
@@ -47,10 +49,13 @@ import {
 } from "./guru/turnMessages.js";
 
 export { preserveHistoryOnModelSwitch } from "./guru/turnMessages.js";
-import { createFileMemoryStore } from "./memory/store.js";
-import { mergeScopedBootInjection } from "./memory/inject.js";
+import { createFileMemoryStore, type MemoryFactEntry } from "./memory/store.js";
+import { buildFactMemoryInjection, mergeScopedBootInjection } from "./memory/inject.js";
+import { createMarkdownMemoryStore, type MemoryFactStore } from "./memory/provider.js";
+import type { MemoryWriteResult } from "./memory/schemas.js";
 import { buildRecallIndex, queryRecall } from "./memory/recall.js";
 import { createScopedMemory, MEMORY_SCOPES, type MemoryScope } from "./memory/scopes.js";
+import { initExtensions } from "./extensions/initExtensions.js";
 import { citeLearning, decaySweep, extractLearnings, gateLearning, promoteSweep, type Learning } from "./garage/flywheel.js";
 import { loadLearnings, migrateRoleLearnings, pruneLearning, storeLearning } from "./garage/flywheelStore.js";
 import { describeLoginFlow, formatExpiry } from "./model/loginFlow.js";
@@ -285,6 +290,11 @@ const guruMemoryStore = createFileMemoryStore();
  * injection merges across the active scopes; /remember + the flywheel address one.
  */
 const scopedMemory = createScopedMemory(guruMemoryStore);
+/** Selected fact backend. Garage/flywheel operational state intentionally stays local. */
+let activeFactMemoryStore: MemoryFactStore = createMarkdownMemoryStore(guruMemoryStore);
+let activeFactMemoryProvider: "markdown" | "postgres" = "markdown";
+let activeHonchoSyncOnTurn = false;
+let activeHonchoContextTokenBudget = 1_200;
 let bootMemoryBlock = "";
 /** Learning ids injected into THIS session's boot block — the CITE candidates. */
 let injectedLearningIds: readonly string[] = [];
@@ -299,8 +309,14 @@ function systemPrompt(): string {
  * facts are BM25-ranked by relevance to it (the current turn) and its terms seed
  * the learnings task-boost; without one, the cold recency/decay ordering.
  */
-function refreshBootMemoryBlock(query?: string): void {
+async function refreshBootMemoryBlock(query?: string): Promise<void> {
   try {
+    if (activeFactMemoryProvider === "postgres") {
+      const injection = buildFactMemoryInjection(await activeFactMemoryStore.list(), query ? { query } : {});
+      bootMemoryBlock = injection.block;
+      injectedLearningIds = injection.injectedLearningIds;
+      return;
+    }
     const injection = mergeScopedBootInjection(scopedMemory.activeStores(), query ? { query } : {});
     bootMemoryBlock = injection.block;
     injectedLearningIds = injection.injectedLearningIds;
@@ -309,8 +325,54 @@ function refreshBootMemoryBlock(query?: string): void {
     // old catch wiped EVERY fact for the whole session on any throw, so a single
     // transient parse failure made the model "forget" everything until restart.
     // Per-learning skipping in mergeScopedBootInjection handles the common case;
-    // this is the last line of defense — preserve, don't erase.
+    // this is the last line of defense — preserve, don't erase. PostgreSQL is
+    // intentionally different: never silently fall back to prior Markdown
+    // content when the selected canonical store is unavailable.
+    if (activeFactMemoryProvider === "postgres") {
+      bootMemoryBlock = "";
+      injectedLearningIds = [];
+    }
   }
+}
+
+/**
+ * Honcho is an opt-in reasoning/context layer. Its context is added after the
+ * canonical Markdown/PostgreSQL fact block, so it never silently replaces the
+ * deterministic store. A short timeout keeps an unavailable integration from
+ * freezing ordinary chat turns.
+ */
+async function refreshHonchoMemoryContext(state: GuruState): Promise<void> {
+  if (!activeHonchoSyncOnTurn || !state.session) {
+    return;
+  }
+  try {
+    const result = await Promise.race([
+      state.runtime.executeTool(state.session.id, "honcho_context", { maxTokens: activeHonchoContextTokenBudget }),
+      new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 2_000))
+    ]);
+    if (!result || result.status !== "succeeded") {
+      return;
+    }
+    const output = result.output as { status?: string; snapshot?: string } | undefined;
+    if (output?.status !== "succeeded" || !output.snapshot) {
+      return;
+    }
+    bootMemoryBlock = `${bootMemoryBlock}\n\n## Honcho memory context (derived — verify against current state)\n${output.snapshot}`;
+  } catch {
+    // Honcho is additive. Preserve the canonical memory block when unavailable.
+  }
+}
+
+function recordHonchoTurn(state: GuruState, userSummary: string, assistantSummary: string): void {
+  if (!activeHonchoSyncOnTurn || !state.session || assistantSummary.trim().length === 0) {
+    return;
+  }
+  void state.runtime.executeTool(state.session.id, "honcho_log_turn", {
+    userSummary,
+    assistantSummary,
+    writeEnabled: true,
+    userApproved: true
+  });
 }
 
 /** Flywheel decay clocks: sessions primary (§8), days as the fallback for pre-counter learnings. */
@@ -414,6 +476,7 @@ export const GURU_CHAT_TOOL_IDS: ReadonlySet<string> = new Set([
   "memory_remember",
   "memory_search",
   "memory_get",
+  "memory_status",
   "spawn_agent",
   "get_task_output",
   "kill_task",
@@ -448,6 +511,7 @@ export const READ_ONLY_TOOL_IDS: ReadonlySet<string> = new Set([
   "honcho_context",
   "memory_search",
   "memory_get",
+  "memory_status",
   "get_task_output",
   "resolve_capability_gap",
   "todo_list",
@@ -463,6 +527,25 @@ export const READ_ONLY_TOOL_IDS: ReadonlySet<string> = new Set([
   "github.pr.status",
   "read_diagnostics"
 ]);
+
+/** Access text for `/tools`: reflect the mode actually active in this session. */
+export type ToolAccessMode = "free" | "yolo" | "approval";
+
+export function getToolAccessMode(toolId: string, yolo: boolean): ToolAccessMode {
+  if (READ_ONLY_TOOL_IDS.has(toolId)) {
+    return "free";
+  }
+  return yolo ? "yolo" : "approval";
+}
+
+/** Read a spawn-time YOLO snapshot, falling back for older or foreign snapshots. */
+export function resolveWorkerYolo(snapshot: unknown, fallback: boolean): boolean {
+  if (typeof snapshot !== "object" || snapshot === null) {
+    return fallback;
+  }
+  const value = (snapshot as Record<string, unknown>).yolo;
+  return typeof value === "boolean" ? value : fallback;
+}
 
 export interface SlashCommand {
   readonly name: string;
@@ -484,7 +567,7 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = [
   { name: "/clone", usage: "/clone", description: "Duplicate the active branch for destructive experiments" },
   { name: "/skills", usage: "/skills [promote <id>]", description: "List discovered skills ([bridge] = ATTACH); promote a bridge skill to native" },
   { name: "/remember", usage: "/remember [global|space|role] <fact>", description: "Save a durable memory fact to a scope (default global; injected at boot)" },
-  { name: "/memory", usage: "/memory [status|doctor]", description: "Memory organ status / heal the index" },
+  { name: "/memory", usage: "/memory [status|doctor|migrate]", description: "Memory backend status, repair, or explicit Markdown → PostgreSQL migration" },
   { name: "/recall", usage: "/recall <query>", description: "Smart Connections — surface memory semantically related to a query (BM25)" },
   { name: "/role", usage: "/role [list | suit <thing> | park | off]", description: "Suit up for the day's work (roles emerge; garage lists parked suits)" },
   { name: "/lookahead", usage: "/lookahead [on|off]", description: "The scout/commit look-ahead engine (config-gated; scouts run ahead in dead time)" },
@@ -1488,7 +1571,7 @@ function switchToSession(state: GuruState, session: ReconstructedSession, lineag
   // so facts remembered after that point are invisible to the model until the
   // first submitted message triggers the per-turn rebuild. Refresh + replace the
   // head now so a resumed session starts with current memory, not a stale snapshot.
-  refreshBootMemoryBlock();
+  void refreshBootMemoryBlock();
   if (state.history[0]?.role === "system") {
     state.history[0] = { role: "system", content: systemPrompt() };
   }
@@ -1775,7 +1858,7 @@ function cmdSkillPromote(state: GuruState, skillId: string): void {
   print(colorize(theme, "green", `Promoted ${skill.id} to native — bridge dropped, parity gap closed.`));
 }
 
-function cmdRemember(state: GuruState, args: readonly string[]): void {
+async function cmdRemember(state: GuruState, args: readonly string[]): Promise<void> {
   // An optional leading scope keyword targets a namespace (§7); default global.
   let scope: MemoryScope = "global";
   let words = [...args];
@@ -1789,16 +1872,25 @@ function cmdRemember(state: GuruState, args: readonly string[]): void {
     print(dim(theme, "Usage: /remember [global|space|role] <fact to persist>"));
     return;
   }
-  let store = scopedMemory.storeFor(scope);
-  if (!store) {
-    print(dim(theme, `  no ${scope} scope active (${scope === "space" ? "no repo bound" : "no suit worn"}) — saving to global`));
-    scope = "global";
-    store = guruMemoryStore;
-  }
   const firstSentence = textInput.split(/(?<=[.!?])\s+/u)[0] ?? textInput;
   const title = (firstSentence.length > 80 ? `${firstSentence.slice(0, 77)}...` : firstSentence).trim();
   const description = (textInput.length > 200 ? `${textInput.slice(0, 197)}...` : textInput).replace(/\s+/gu, " ").trim();
-  const result = store.remember({ title, description, body: textInput, type: "project", edit: "replace", confidence: 1 });
+  let result: MemoryWriteResult;
+  if (activeFactMemoryProvider === "postgres") {
+    if (scope !== "global") {
+      print(dim(theme, `  PostgreSQL fact memory currently uses its configured global namespace; saving this ${scope} fact there.`));
+      scope = "global";
+    }
+    result = await activeFactMemoryStore.remember({ title, description, body: textInput, type: "project", edit: "replace", confidence: 1 });
+  } else {
+    let store = scopedMemory.storeFor(scope);
+    if (!store) {
+      print(dim(theme, `  no ${scope} scope active (${scope === "space" ? "no repo bound" : "no suit worn"}) — saving to global`));
+      scope = "global";
+      store = guruMemoryStore;
+    }
+    result = store.remember({ title, description, body: textInput, type: "project", edit: "replace", confidence: 1 });
+  }
   if (result.status === "blocked") {
     print(colorize(theme, "yellow", result.summary));
     for (const blocker of result.blockers) {
@@ -1806,7 +1898,7 @@ function cmdRemember(state: GuruState, args: readonly string[]): void {
     }
     return;
   }
-  refreshBootMemoryBlock();
+  await refreshBootMemoryBlock();
   if (state.history[0]?.role === "system") {
     state.history[0] = { role: "system", content: systemPrompt() };
   }
@@ -1814,10 +1906,49 @@ function cmdRemember(state: GuruState, args: readonly string[]): void {
   print(colorize(theme, "green", `${result.summary}${scopeNote} It will be in every future boot briefing.`));
 }
 
-function cmdMemory(args: readonly string[]): void {
+async function cmdMemory(state: GuruState, args: readonly string[]): Promise<void> {
   const sub = (args[0] ?? "status").toLowerCase();
+  if (sub === "migrate") {
+    if (activeFactMemoryProvider !== "postgres") {
+      print(dim(theme, "Memory migration is available after setting memory.storage.provider to postgres and restarting Guru."));
+      return;
+    }
+    const storage = await activeFactMemoryStore.status();
+    if (storage.status !== "ready") {
+      print(colorize(theme, "yellow", `PostgreSQL memory is ${storage.status}; migration did not run. ${storage.summary}`));
+      return;
+    }
+    // Explicit, idempotent copy only — never auto-delete the Markdown source or
+    // quietly move garage/flywheel operational records into the user fact store.
+    const candidates = guruMemoryStore
+      .list()
+      .filter(({ fact }) => !["learning", "loadout", "path-outcome"].includes(fact.type));
+    let created = 0;
+    let updated = 0;
+    let blocked = 0;
+    for (const { fact, body } of candidates) {
+      const result = await activeFactMemoryStore.remember({
+        name: fact.name,
+        title: fact.title,
+        description: fact.description,
+        body,
+        type: fact.type,
+        edit: "replace",
+        confidence: fact.confidence
+      });
+      if (result.status === "created") created += 1;
+      else if (result.status === "updated") updated += 1;
+      else blocked += 1;
+    }
+    await refreshBootMemoryBlock();
+    if (state.history[0]?.role === "system") {
+      state.history[0] = { role: "system", content: systemPrompt() };
+    }
+    print(colorize(theme, blocked === 0 ? "green" : "yellow", `Migrated ${created} Markdown fact(s), updated ${updated}; ${blocked} blocked. Source Markdown files were left untouched.`));
+    return;
+  }
   if (sub === "doctor") {
-    const report = guruMemoryStore.doctor();
+    const report = activeFactMemoryProvider === "postgres" ? await activeFactMemoryStore.doctor() : guruMemoryStore.doctor();
     print(colorize(theme, "green", report.summary));
     for (const corrupt of report.corruptSkipped) {
       print(dim(theme, `  corrupt (skipped): ${corrupt}`));
@@ -1825,7 +1956,40 @@ function cmdMemory(args: readonly string[]): void {
     for (const link of report.danglingLinks) {
       print(dim(theme, `  dangling link: ${link}`));
     }
-    refreshBootMemoryBlock();
+    await refreshBootMemoryBlock();
+    return;
+  }
+  const storage = await activeFactMemoryStore.status();
+  let honcho = "unavailable";
+  if (state.session) {
+    try {
+      const status = await state.runtime.executeTool(state.session.id, "honcho_memory_status", {});
+      honcho = (status.output as { status?: string } | undefined)?.status ?? "unavailable";
+    } catch {
+      honcho = "unavailable";
+    }
+  }
+  if (activeFactMemoryProvider === "postgres") {
+    print(dim(theme, `  storage  ${storage.status} · ${storage.location}`));
+    print(dim(theme, `  honcho   ${honcho} (optional context layer)`));
+    if (storage.status !== "ready") {
+      print(colorize(theme, "yellow", "  PostgreSQL memory is not usable; no Markdown fallback is active. Fix the status above, then retry."));
+      return;
+    }
+    let facts: readonly MemoryFactEntry[];
+    try {
+      facts = await activeFactMemoryStore.list();
+    } catch {
+      print(colorize(theme, "yellow", "  PostgreSQL memory became unavailable while listing facts; no fallback was used."));
+      return;
+    }
+    print(bold(theme, `memory — ${facts.length} PostgreSQL fact(s)`));
+    for (const { fact } of facts.slice(0, 15)) {
+      print(`  ${colorize(theme, "cyan", fact.name.padEnd(34))} ${dim(theme, `${fact.type} · updated ${fact.updatedAt.slice(0, 10)}`)}`);
+    }
+    if (facts.length === 0) {
+      print(dim(theme, "  Nothing remembered yet — /remember <fact> or the memory_remember tool."));
+    }
     return;
   }
   // Headline counts the OPERATOR'S view across every ACTIVE scope, not just
@@ -1852,6 +2016,7 @@ function cmdMemory(args: readonly string[]): void {
     print(dim(theme, "  Nothing remembered yet — /remember [global|space|role] <fact> or the memory_remember tool."));
   }
   print(dim(theme, "  Obsidian-compatible vault: open a scope directory above as a vault to browse/graph it."));
+  print(dim(theme, `  storage  ${storage.status} · honcho ${honcho} (optional context layer)`));
 }
 
 /**
@@ -1859,7 +2024,7 @@ function cmdMemory(args: readonly string[]): void {
  * active scope — semantically related to a query, ranked by BM25. The same relevance
  * signal that re-ranks the injected memory each turn, exposed as an explicit lookup.
  */
-function cmdRecall(args: readonly string[]): void {
+async function cmdRecall(args: readonly string[]): Promise<void> {
   const query = args.join(" ").trim();
   if (query.length === 0) {
     print(dim(theme, "Usage: /recall <what you're looking for>"));
@@ -1867,8 +2032,19 @@ function cmdRecall(args: readonly string[]): void {
   }
   const docs: { id: string; text: string }[] = [];
   const meta = new Map<string, { label: string; kind: string; scope: MemoryScope }>();
-  for (const { scope, store } of scopedMemory.activeStores()) {
-    for (const { fact } of store.list()) {
+  let memorySources: Array<{ scope: MemoryScope; entries: readonly MemoryFactEntry[] }>;
+  if (activeFactMemoryProvider === "postgres") {
+    try {
+      memorySources = [{ scope: "global", entries: await activeFactMemoryStore.list() }];
+    } catch {
+      print(colorize(theme, "yellow", "PostgreSQL memory is unavailable; no fallback was used. Run /memory status to recover."));
+      return;
+    }
+  } else {
+    memorySources = scopedMemory.activeStores().map(({ scope, store }) => ({ scope, entries: store.list() }));
+  }
+  for (const { scope, entries } of memorySources) {
+    for (const { fact } of entries) {
       if (fact.type === "learning") {
         continue;
       }
@@ -1879,13 +2055,18 @@ function cmdRecall(args: readonly string[]): void {
       docs.push({ id, text: `${fact.title} ${fact.description}` });
       meta.set(id, { label: `${fact.title} — ${fact.description}`, kind: "fact", scope });
     }
-    for (const learning of loadLearnings(store)) {
-      const id = `${scope}:learning:${learning.id}`;
-      if (meta.has(id)) {
-        continue;
+    if (activeFactMemoryProvider !== "postgres") {
+      const store = scopedMemory.storeFor(scope);
+      if (store) {
+        for (const learning of loadLearnings(store)) {
+          const id = `${scope}:learning:${learning.id}`;
+          if (meta.has(id)) {
+            continue;
+          }
+          docs.push({ id, text: `${learning.statement} ${learning.subject} ${learning.tools.join(" ")}` });
+          meta.set(id, { label: `(${learning.level}) ${learning.statement}`, kind: "learning", scope });
+        }
       }
-      docs.push({ id, text: `${learning.statement} ${learning.subject} ${learning.tools.join(" ")}` });
-      meta.set(id, { label: `(${learning.level}) ${learning.statement}`, kind: "learning", scope });
     }
   }
   const hits = queryRecall(buildRecallIndex(docs), query, 10);
@@ -2011,7 +2192,7 @@ function cmdRoleSuit(state: GuruState, description: string): void {
       print(dim(theme, `  ${moved} legacy learning(s) folded into the ${slug} role scope`));
     }
   }
-  refreshBootMemoryBlock();
+  void refreshBootMemoryBlock();
   state.toolsUsed = new Set<string>();
 }
 
@@ -2066,7 +2247,7 @@ function cmdRolePark(state: GuruState): void {
     state.usage.turns,
     state.sessionNumber
   );
-  refreshBootMemoryBlock();
+  void refreshBootMemoryBlock();
   print(
     colorize(theme, "green", `Parked ${role.label} in the garage.`) +
       dim(theme, `  receipt: ${receipt.stored} stored · ${receipt.rejected} rejected · ${receipt.gaps} gap(s) · ${receipt.verificationStatus}`)
@@ -2080,7 +2261,7 @@ function cmdRolePark(state: GuruState): void {
   }
   state.activeRole = null;
   scopedMemory.setRole(null); // role scope closes with the suit
-  refreshBootMemoryBlock();
+  void refreshBootMemoryBlock();
 }
 
 function cmdRole(state: GuruState, args: readonly string[]): void {
@@ -2110,7 +2291,7 @@ function cmdRole(state: GuruState, args: readonly string[]): void {
     state.activeRole = null;
     scopedMemory.setRole(null); // role scope closes with the suit
     state.toolsUsed = new Set<string>(); // drop the suit's earned-tool accumulator (review 2026-07-08)
-    refreshBootMemoryBlock();
+    void refreshBootMemoryBlock();
     print(colorize(theme, "green", "Suit off — back to the naked default surface (unparked changes discarded)."));
     return;
   }
@@ -2239,6 +2420,11 @@ function cmdSettings(): void {
   print(
     `  retry       enabled=${configResult.config.retry.enabled} max=${configResult.config.retry.maxRetries} base=${configResult.config.retry.baseDelayMs}ms delayCap=${configResult.config.retry.provider.maxRetryDelayMs}ms`
   );
+  const memory = configResult.config.memory;
+  print(
+    `  memory      ${memory.storage.provider}${memory.storage.provider === "postgres" ? ` (${memory.storage.postgres.connectionStringEnvVar}; ${memory.storage.postgres.schema}.${memory.storage.postgres.table})` : " (Markdown vault + MEMORY.md index)"}`
+  );
+  print(`  honcho      ${memory.honcho.enabled ? "enabled" : "disabled"} · key ${memory.honcho.apiKeyEnvVar} · workspace ${memory.honcho.workspaceId}`);
   print(dim(theme, "  Edit guruharness.config.json to change settings."));
 }
 
@@ -2697,18 +2883,25 @@ function cmdTools(state: GuruState): void {
   print(paint.bold(paint.fg("fgBright", "Session tools")) + paint.fg("muted", `  (${state.session.tools.length} registered)`));
   const rows = state.session.tools.map((tool) => {
     const modelFacing = activeChatToolIds(state).has(tool.id);
-    const gated = !READ_ONLY_TOOL_IDS.has(tool.id);
+    const access = getToolAccessMode(tool.id, state.yolo);
     return [
       modelFacing ? paint.fg("accent2", GLYPHS.agent) : " ",
       tool.id,
-      gated ? badge(paint, "GATED", "ghost") : paint.fg("success", "free"),
+      access === "free" ? paint.fg("success", "free") : access === "yolo" ? badge(paint, "YOLO", "warning") : badge(paint, "ASK", "ghost"),
       paint.fg("fgFaint", tool.description.length > 60 ? `${tool.description.slice(0, 59)}…` : tool.description)
     ];
   });
   for (const line of renderTable(paint, [{ header: " " }, { header: "tool" }, { header: "access" }, { header: "description" }], rows)) {
     print(`  ${line}`);
   }
-  print(paint.fg("fgFaint", `  ${GLYPHS.agent} = offered to the model in chat turns · GATED = prompts per-call (y/N/always)`));
+  print(
+    paint.fg(
+      "fgFaint",
+      state.yolo
+        ? `  ${GLYPHS.agent} = offered to the model in chat turns · YOLO = ordinary local work runs directly; destructive, spend, and credential/auth edges still ask.`
+        : `  ${GLYPHS.agent} = offered to the model in chat turns · ASK = safe mode prompts for mutations (y/N/always).`
+    )
+  );
   const mcpStatuses = state.runtime.getSessionMcpStatuses(state.session.id);
   if (mcpStatuses.length > 0) {
     print("");
@@ -4037,7 +4230,7 @@ async function printLaunchBriefing(state: GuruState, baselineHealth: { readonly 
     injectMemory: (): PhaseOutput => {
       const injected = new Set(injectedLearningIds);
       const learnings = loadLearnings(guruMemoryStore).filter((learning) => injected.has(learning.id));
-      const lines = [`${guruMemoryStore.list().length} fact(s) · honcho ${honcho} · ${injected.size} learning(s) injected (decay-ranked, with provenance)`];
+      const lines = [`${activeFactMemoryProvider === "postgres" ? "PostgreSQL" : "Markdown"} fact memory · honcho ${honcho} · ${injected.size} learning(s) injected (decay-ranked, with provenance)`];
       for (const learning of learnings.slice(0, 4)) {
         lines.push(`↳ (${learning.level}·cited ${learning.citations.length}×${learning.lastCitedSession !== null ? `·last #${learning.lastCitedSession}` : ""}) ${learning.statement}`);
       }
@@ -4367,8 +4560,9 @@ async function chatTurn(state: GuruState, text: string, retried401 = false): Pro
   // (BM25 over facts + a task-boost on learnings), so the model sees what matters
   // NOW — not just the newest/most-cited. No-op when memory is empty (block stays
   // "", system head unchanged), so the memory-less path is byte-identical.
-  if (scopedMemory.activeStores().some(({ store }) => store.list().length > 0)) {
-    refreshBootMemoryBlock(submitted);
+  if (activeHonchoSyncOnTurn || activeFactMemoryProvider === "postgres" || scopedMemory.activeStores().some(({ store }) => store.list().length > 0)) {
+    await refreshBootMemoryBlock(submitted);
+    await refreshHonchoMemoryContext(state);
     if (state.history[0]?.role === "system") {
       state.history[0] = { role: "system", content: systemPrompt() };
     }
@@ -4649,6 +4843,9 @@ async function chatTurn(state: GuruState, text: string, retried401 = false): Pro
     print("");
     const toolNote = result.toolCallCount > 0 ? ` · ${result.toolCallCount} tool call(s)` : "";
     print(paint.fg("fgFaint", `${result.routeId} · ${Date.now() - startedAt}ms · ${result.usage?.inputTokens ?? "?"} in / ${result.usage?.outputTokens ?? "?"} out${toolNote}`));
+    // Honcho sync is explicitly configured and deliberately backgrounded: its
+    // asynchronous inference must never hold the terminal chat loop hostage.
+    recordHonchoTurn(state, submitted, result.text);
   } catch (error) {
     // On-401 OAuth refresh + single retry (review 2026-07-08): a guru-native OAuth
     // token can expire between the pre-turn refresh and the request (or the pre-turn
@@ -4796,13 +4993,13 @@ async function handleLine(state: GuruState, line: string, rl: { close(): void })
       cmdSkills(state, slash.args);
       break;
     case "/remember":
-      cmdRemember(state, slash.args);
+      await cmdRemember(state, slash.args);
       break;
     case "/memory":
-      cmdMemory(slash.args);
+      await cmdMemory(state, slash.args);
       break;
     case "/recall":
-      cmdRecall(slash.args);
+      await cmdRecall(slash.args);
       break;
     case "/mandate":
       cmdMandate(state, slash.args);
@@ -4965,11 +5162,16 @@ export async function runGuru(): Promise<void> {
     await runRpcMode();
     return;
   }
+
+  // The interactive surface reads its config before it creates the runtime
+  // session. Bootstrap first so a fresh project's writable .guru config is the
+  // config used for this very first launch, not merely for a later resume.
+  bootstrapProjectHarness({ projectRoot: process.cwd() });
   process.stdout.write(banner());
 
   // Boot recall (push, not pull): load the memory index BEFORE the first system
   // prompt is built so the session starts already knowing what it knows.
-  refreshBootMemoryBlock();
+  await refreshBootMemoryBlock();
 
   // Note: composerStateRef is the MODULE-SCOPE ref (line ~131) — not redeclared
   // here. The old local `let composerStateRef` shadowed it, so cmdTheme (which
@@ -5029,6 +5231,18 @@ export async function runGuru(): Promise<void> {
   const mandateStore = createMandateStore();
   const harnessConfigLoad = loadHarnessConfig({});
   const harnessConfig = harnessConfigLoad.config;
+  // Configure the one fact-memory backend before the first session prompt is
+  // assembled. Garage/flywheel state stays local; this selects Markdown vs the
+  // configured PostgreSQL fact store for /remember, /recall, and boot injection.
+  const extensions = initExtensions({
+    memoryConfig: harnessConfig.memory,
+    memoryDirectory: getGuruHomePaths().memoryDirectory
+  });
+  activeFactMemoryStore = extensions.memoryStore;
+  activeFactMemoryProvider = harnessConfig.memory.storage.provider;
+  activeHonchoSyncOnTurn = harnessConfig.memory.honcho.enabled && harnessConfig.memory.honcho.syncOnTurn;
+  activeHonchoContextTokenBudget = harnessConfig.memory.honcho.contextTokenBudget;
+  await refreshBootMemoryBlock();
   // Surface invalid-config at boot instead of silently reverting to defaults
   // (review 2026-07-08): a single bad key used to wipe the operator's ENTIRE
   // config with no indication. Print a RED banner + the diagnostics so the
@@ -5129,7 +5343,11 @@ export async function runGuru(): Promise<void> {
     state.sessionTools = runtime.getSessionTools(state.session.id);
     // Bind the space scope (§7): the session repo's .guru/memory travels with it.
     scopedMemory.setRepoRoot(state.session.repo?.repoRoot ?? null);
-    refreshBootMemoryBlock();
+    await refreshBootMemoryBlock();
+    await refreshHonchoMemoryContext(state);
+    if (state.history[0]?.role === "system") {
+      state.history[0] = { role: "system", content: systemPrompt() };
+    }
     const sessionMs = Date.now() - sessionStartedAt;
     const slowNote = sessionMs >= 1_500 ? paint.fg("warning", ` · ${sessionMs}ms (slow disk/share?)`) : dim(theme, ` · ${sessionMs}ms`);
     print(
@@ -5164,9 +5382,9 @@ export async function runGuru(): Promise<void> {
     // policy are current per call; a worker can never exceed the parent's
     // mandate, and read-only scouts physically cannot mutate. Workers don't get
     // the spawn trio in v1 (recursion deferred; the session task cap backstops).
-    // Sibling isolation (§9): capture the mandate + session approvals at SPAWN time,
-    // so a later /mandate or approval change never reaches an already-spawned worker.
-    getSharedSwarmManager().setSnapshotProvider(() => ({ mandate: state.mandate, approvals: [...state.sessionApprovals] }));
+    // Sibling isolation (§9): capture the mandate, session approvals, and access mode
+    // at SPAWN time, so a later mode change never reaches an already-spawned worker.
+    getSharedSwarmManager().setSnapshotProvider(() => ({ mandate: state.mandate, approvals: [...state.sessionApprovals], yolo: state.yolo }));
     getSharedSwarmManager().setRunner(async (request) => {
       const route = state.connectedRoute;
       const session = state.session;
@@ -5174,9 +5392,10 @@ export async function runGuru(): Promise<void> {
         throw new Error("No connected model route for swarm workers.");
       }
       // Prefer the spawn-time snapshot over live state (sibling isolation).
-      const snapshot = request.mandateSnapshot as { mandate: MandateState; approvals: readonly MandateVerb[] } | undefined;
+      const snapshot = request.mandateSnapshot as { mandate: MandateState; approvals: readonly MandateVerb[]; yolo?: boolean } | undefined;
       const workerMandate = snapshot?.mandate ?? state.mandate;
       const workerApprovals = new Set<MandateVerb>(snapshot ? snapshot.approvals : state.sessionApprovals);
+      const workerYolo = resolveWorkerYolo(snapshot, state.yolo);
       const swarmToolIds = new Set(["spawn_agent", "get_task_output", "kill_task"]);
       const offered = state.sessionTools.filter((tool) => {
         if (swarmToolIds.has(tool.id)) {
@@ -5202,11 +5421,11 @@ export async function runGuru(): Promise<void> {
             }
             let decision = evaluateToolMandate(toolId, input, {
               cwd: session.repo?.repoRoot ?? process.cwd(),
-              // The SNAPSHOTTED mandate (frozen at spawn), not live state.
+              // The SNAPSHOTTED mandate and mode (frozen at spawn), not live state.
               state: workerMandate,
-              // YOLO NEVER cascades to workers (§9): a worker evaluates the mandate
-              // WITHOUT the parent's YOLO — hard edges + denies bind for workers.
-              yolo: false
+              // Normal workers inherit the parent's active mode. Read-only scouts
+              // above still cannot mutate, and input-specific hard edges remain explicit.
+              yolo: workerYolo
             });
             // Same PRESERVE, DON'T REPLACE backstop as the main turn — gutting
             // escalates to destructive (hard edge), so workers deny without a prompt.
@@ -5522,7 +5741,28 @@ export async function runGuru(): Promise<void> {
   print(dim(theme, "bye."));
 }
 
-const isDirectRun = process.argv[1]?.replace(/\\/gu, "/").endsWith("/guru.js") || process.argv[1]?.replace(/\\/gu, "/").endsWith("/guru.ts");
+const GURU_DIRECT_ENTRY_NAMES = new Set(["guru", "guru.js", "guru.ts", "guru.cmd", "guru.ps1"]);
+
+function entryPointName(value: string | undefined): string {
+  return value ? basename(value.replace(/\\/gu, "/")).toLowerCase() : "";
+}
+
+/**
+ * Detect a real guru process without auto-starting when this module is imported.
+ *
+ * npm's POSIX bin link invokes the package entrypoint through a path ending in
+ * /guru, while direct Node/tsx execution ends in guru.js/guru.ts. The
+ * module-name check keeps test runners and other importers from starting a TUI.
+ */
+export function isDirectGuruInvocation(
+  argvEntry = process.argv[1],
+  moduleEntry = fileURLToPath(import.meta.url)
+): boolean {
+  const moduleName = entryPointName(moduleEntry);
+  return (moduleName === "guru.js" || moduleName === "guru.ts") && GURU_DIRECT_ENTRY_NAMES.has(entryPointName(argvEntry));
+}
+
+const isDirectRun = isDirectGuruInvocation();
 if (isDirectRun) {
   runGuru().catch((error: unknown) => {
     console.error(error instanceof Error ? error.message : String(error));

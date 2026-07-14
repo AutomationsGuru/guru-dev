@@ -2,6 +2,26 @@
 
 All notable changes to GuruHarness are documented here.
 
+## [Unreleased]
+
+### Release discipline
+
+- Treat the current harness as pre-GA dogfood. Historical `1.x` labels are not
+  daily-driver acceptance evidence.
+- Do not bump the package version for a local build, test, install refresh,
+  routine PR/push, or ordinary fix. Record work here until a release owner and
+  Matthew make an explicit release/migration decision.
+- The approved release line remains `1.5.x`. The current gated target is
+  `1.5.1`; patch increments may continue, but do not create or publish
+  `1.6.0` or higher until Matthew explicitly accepts Guru as working well
+  enough to advance.
+
+### Fixed
+
+- **Linux npm launcher startup:** the guru binary now recognizes POSIX npm
+  symlink and Windows shim entrypoints instead of exiting silently when its
+  argv path ends in /guru rather than /guru.js.
+
 ## [1.5.0] - 2026-07-12
 
 Lane reconciliation release: merges the 2026-07-10/11 Windows daily-driver wave and the

@@ -71,6 +71,7 @@ export const MANDATE_READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   "skill.document.load",
   "memory_search",
   "memory_get",
+  "memory_status",
   "honcho_memory_status",
   "honcho_recall",
   "honcho_context",

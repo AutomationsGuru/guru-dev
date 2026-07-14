@@ -1,4 +1,5 @@
 import { MEMORY_INDEX_LINE_CAP, type FileMemoryStore } from "./store.js";
+import type { MemoryFactEntry } from "./store.js";
 import type { MemoryScope, ScopedStore } from "./scopes.js";
 import { buildRecallIndex, queryRecall, tokenizeRecall } from "./recall.js";
 import { loadLearnings } from "../garage/flywheelStore.js";
@@ -69,6 +70,41 @@ export function buildBootMemoryInjection(store: FileMemoryStore, options: BootIn
 /** Back-compat string-only form (the block without the injected-id tracking). */
 export function buildBootMemoryBlock(store: FileMemoryStore): string {
   return buildBootMemoryInjection(store).block;
+}
+
+/**
+ * Provider-neutral fact injection used when PostgreSQL is selected. Learnings
+ * remain in Guru's local garage/flywheel store; this function intentionally owns
+ * only the user-visible durable facts that can live in Markdown or PostgreSQL.
+ */
+export function buildFactMemoryInjection(entries: readonly MemoryFactEntry[], options: Pick<BootInjectionOptions, "query"> = {}): BootMemoryInjection {
+  const facts = entries.filter((entry) => entry.fact.type !== "learning");
+  const byRecency = [...facts];
+  let selected = byRecency;
+  const query = options.query?.trim() ?? "";
+  if (query.length > 0 && facts.length > 0) {
+    const index = buildRecallIndex(facts.map((entry) => ({ id: entry.fact.name, text: `${entry.fact.title} ${entry.fact.description}` })));
+    const matchingNames = queryRecall(index, query).map((hit) => hit.id);
+    const matched = new Set(matchingNames);
+    const byName = new Map(facts.map((entry) => [entry.fact.name, entry]));
+    selected = [
+      ...matchingNames.flatMap((name) => {
+        const entry = byName.get(name);
+        return entry ? [entry] : [];
+      }),
+      ...facts.filter((entry) => !matched.has(entry.fact.name))
+    ];
+  }
+  const lines = selected
+    .slice(0, MEMORY_INDEX_LINE_CAP)
+    .map((entry) => `- [${entry.fact.title}](${entry.fact.name}.md) — ${entry.fact.description}`);
+  if (lines.length === 0) {
+    return { block: "", injectedLearningIds: [] };
+  }
+  return {
+    block: ["", "## Guru memory (point-in-time facts — verify stale facts against current state; read bodies with memory_get)", ...lines].join("\n"),
+    injectedLearningIds: []
+  };
 }
 
 /** A short scope tag for injected lines (global is unlabeled — it's the floor). */

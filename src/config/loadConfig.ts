@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 
+import { GURU_HARNESS_CONFIG_FILE_NAME, resolveGuruHomeDirectory } from "../home/paths.js";
 import { DEFAULT_HARNESS_CONFIG, HarnessConfigSchema, type HarnessConfig } from "./schema.js";
 
 export type ConfigLoadVerdict = "GREEN" | "YELLOW" | "RED";
@@ -10,6 +11,7 @@ export type ConfigLoadStatus = "loaded" | "missing" | "invalid";
 export interface ConfigLoadResult {
   readonly status: ConfigLoadStatus;
   readonly verdict: ConfigLoadVerdict;
+  readonly source: "explicit" | "workspace" | "project" | "home" | "defaults";
   readonly path: string;
   readonly config: HarnessConfig;
   readonly diagnostics: readonly string[];
@@ -18,24 +20,54 @@ export interface ConfigLoadResult {
 export interface LoadHarnessConfigOptions {
   readonly configPath?: string;
   readonly cwd?: string;
+  /** Home-profile override for tests and portable installations. */
+  readonly homeDirectory?: string;
 }
 
-export const DEFAULT_CONFIG_FILE_NAME = "guruharness.config.json";
+export const DEFAULT_CONFIG_FILE_NAME = GURU_HARNESS_CONFIG_FILE_NAME;
 
 export function loadHarnessConfig(options: LoadHarnessConfigOptions = {}): ConfigLoadResult {
-  const cwd = options.cwd ?? process.cwd();
-  const configPath = resolveConfigPath(options.configPath ?? DEFAULT_CONFIG_FILE_NAME, cwd);
+  const cwd = resolve(options.cwd ?? process.cwd());
+  const candidates = resolveConfigCandidates(options, cwd);
 
-  if (!existsSync(configPath)) {
-    return {
-      status: "missing",
-      verdict: "YELLOW",
-      path: configPath,
-      config: DEFAULT_HARNESS_CONFIG,
-      diagnostics: [`Config file not found at ${configPath}; using safe defaults.`]
-    };
+  for (const candidate of candidates) {
+    if (existsSync(candidate.path)) {
+      return loadConfigAt(candidate.path, candidate.source);
+    }
   }
 
+  const missingPath = candidates[0]?.path ?? resolveConfigPath(DEFAULT_CONFIG_FILE_NAME, cwd);
+  return {
+    status: "missing",
+    verdict: "YELLOW",
+    source: "defaults",
+    path: missingPath,
+    config: DEFAULT_HARNESS_CONFIG,
+    diagnostics: [`Config file not found at ${missingPath}; using safe defaults.`]
+  };
+}
+
+interface ConfigCandidate {
+  readonly path: string;
+  readonly source: "explicit" | "workspace" | "project" | "home";
+}
+
+function resolveConfigCandidates(options: LoadHarnessConfigOptions, cwd: string): readonly ConfigCandidate[] {
+  if (options.configPath) {
+    return [{ path: resolveConfigPath(options.configPath, cwd), source: "explicit" }];
+  }
+
+  const homeDirectory = resolveGuruHomeDirectory(options.homeDirectory);
+  return [
+    // Source repositories may deliberately carry a root config; do not let a
+    // generated overlay silently supersede the developer's explicit contract.
+    { path: resolveConfigPath(DEFAULT_CONFIG_FILE_NAME, cwd), source: "workspace" },
+    { path: join(cwd, ".guru", DEFAULT_CONFIG_FILE_NAME), source: "project" },
+    { path: join(homeDirectory, DEFAULT_CONFIG_FILE_NAME), source: "home" }
+  ];
+}
+
+function loadConfigAt(configPath: string, source: ConfigCandidate["source"]): ConfigLoadResult {
   try {
     const rawText = readFileSync(configPath, "utf8");
     // Strip a UTF-8 BOM (the Windows Notepad default) — JSON.parse throws on it,
@@ -47,6 +79,7 @@ export function loadHarnessConfig(options: LoadHarnessConfigOptions = {}): Confi
       return {
         status: "invalid",
         verdict: "RED",
+        source,
         path: configPath,
         config: DEFAULT_HARNESS_CONFIG,
         diagnostics: parsedConfig.error.issues.map((issue) => {
@@ -60,6 +93,7 @@ export function loadHarnessConfig(options: LoadHarnessConfigOptions = {}): Confi
     return {
       status: "loaded",
       verdict: "GREEN",
+      source,
       path: configPath,
       config: parsedConfig.data,
       diagnostics: []
@@ -68,6 +102,7 @@ export function loadHarnessConfig(options: LoadHarnessConfigOptions = {}): Confi
     return {
       status: "invalid",
       verdict: "RED",
+      source,
       path: configPath,
       config: DEFAULT_HARNESS_CONFIG,
       diagnostics: [`Failed to read config at ${configPath}: ${formatError(error)}`]

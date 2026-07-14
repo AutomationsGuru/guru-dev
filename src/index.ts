@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 
 export * from "./config/loadConfig.js";
 export * from "./config/schema.js";
+export * from "./home/paths.js";
 export * from "./core/donePacket.js";
 export * from "./core/types.js";
 export * from "./direction/hereThere.js";
@@ -16,6 +17,8 @@ export * from "./operational/schemas.js";
 export * from "./operational/store.js";
 export * from "./planner/runtime.js";
 export * from "./planner/schemas.js";
+export * from "./project-harness/bootstrap.js";
+export * from "./project-harness/schemas.js";
 export * from "./repo/context.js";
 export * from "./review/gates.js";
 export * from "./mcp/schemas.js";
