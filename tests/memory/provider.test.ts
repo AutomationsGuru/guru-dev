@@ -20,7 +20,10 @@ class FakePostgresPool implements PostgresPoolLike {
   readonly calls: Array<{ text: string; values: readonly unknown[] }> = [];
   readonly rows: StoredRow[] = [];
 
+  constructor(private readonly onQuery: (text: string) => void = () => undefined) {}
+
   async query<Row extends Record<string, unknown> = Record<string, unknown>>(text: string, values: readonly unknown[] = []): Promise<{ rows: readonly Row[]; rowCount?: number }> {
+    this.onQuery(text);
     this.calls.push({ text, values });
     if (text === "SELECT 1" || text.startsWith("CREATE ")) {
       return { rows: [] };
@@ -86,6 +89,101 @@ function makeStore(env: Record<string, string> = { GURU_MEMORY_DATABASE_URL: "po
 }
 
 describe("PostgreSQL memory store", () => {
+  it.each([
+    {
+      label: "secret-shaped",
+      body: "Use sk-abcdefghijklmnopqrstuvwx1234 for the lane"
+    },
+    {
+      label: "over-cap",
+      body: "x".repeat(33 * 1024)
+    }
+  ])("blocks $label input before invoking the clock or database", async ({ body }) => {
+    let nowCalls = 0;
+    let poolFactoryCalls = 0;
+    const store = createPostgresMemoryStore({
+      config: MemoryPostgresConfigSchema.parse({}),
+      env: { GURU_MEMORY_DATABASE_URL: "postgres://test@example.test/guru" },
+      now: () => {
+        nowCalls += 1;
+        return new Date("2026-07-12T00:00:00.000Z");
+      },
+      poolFactory: () => {
+        poolFactoryCalls += 1;
+        return new FakePostgresPool();
+      }
+    });
+
+    const result = await store.remember({
+      title: "Blocked write",
+      description: "Must stop during preflight",
+      body,
+      type: "project",
+      edit: "replace",
+      confidence: 1
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(nowCalls).toBe(0);
+    expect(poolFactoryCalls).toBe(0);
+  });
+
+  it("captures a successful write timestamp after loading current facts", async () => {
+    const events: string[] = [];
+    const pool = new FakePostgresPool((text) => {
+      if (text.startsWith("SELECT name")) events.push("load");
+      if (text.startsWith("INSERT INTO")) events.push("persist");
+    });
+    const store = createPostgresMemoryStore({
+      config: MemoryPostgresConfigSchema.parse({}),
+      env: { GURU_MEMORY_DATABASE_URL: "postgres://test@example.test/guru" },
+      now: () => {
+        events.push("clock");
+        return new Date("2026-07-12T00:00:00.000Z");
+      },
+      poolFactory: () => pool
+    });
+
+    const result = await store.remember({
+      title: "Ordered timestamp",
+      description: "Timestamp follows fact loading",
+      body: "Verified ordering.",
+      type: "project",
+      edit: "replace",
+      confidence: 1
+    });
+
+    expect(result.status).toBe("created");
+    expect(events).toEqual(["load", "clock", "persist"]);
+  });
+
+  it("rejects invalid remember input before invoking the clock, pool factory, or query", async () => {
+    let nowCalls = 0;
+    let poolFactoryCalls = 0;
+    let queryCalls = 0;
+    const store = createPostgresMemoryStore({
+      config: MemoryPostgresConfigSchema.parse({}),
+      env: { GURU_MEMORY_DATABASE_URL: "postgres://test@example.test/guru" },
+      now: () => {
+        nowCalls += 1;
+        return new Date("2026-07-12T00:00:00.000Z");
+      },
+      poolFactory: () => {
+        poolFactoryCalls += 1;
+        return new FakePostgresPool(() => {
+          queryCalls += 1;
+        });
+      }
+    });
+
+    await expect(
+      store.remember({ title: "", description: "invalid", body: "body", type: "project", edit: "replace", confidence: 1 })
+    ).rejects.toThrow();
+    expect(nowCalls).toBe(0);
+    expect(poolFactoryCalls).toBe(0);
+    expect(queryCalls).toBe(0);
+  });
+
   it("reports a missing connection environment variable without exposing a value", async () => {
     const { store } = makeStore({});
 

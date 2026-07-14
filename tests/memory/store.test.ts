@@ -83,6 +83,39 @@ describe("memory store — the secret gate (the one that matters most)", () => {
   });
 });
 
+describe("memory store — write preflight ordering", () => {
+  it("rejects invalid input before creating the configured memory directory", () => {
+    const root = mkdtempSync(join(tmpdir(), "guru-memory-preflight-"));
+    cleanups.push(root);
+    const directory = join(root, "not-created");
+    const store = createFileMemoryStore({ directory });
+
+    expect(() =>
+      store.remember({ title: "", description: "invalid", body: "body", type: "project", edit: "replace", confidence: 1 })
+    ).toThrow();
+    expect(existsSync(directory)).toBe(false);
+  });
+
+  it("blocks a secret before creating the configured memory directory", () => {
+    const root = mkdtempSync(join(tmpdir(), "guru-memory-preflight-"));
+    cleanups.push(root);
+    const directory = join(root, "not-created");
+    const store = createFileMemoryStore({ directory });
+
+    const result = store.remember({
+      title: "Provider key note",
+      description: "How to authenticate",
+      body: "Use sk-abcdefghijklmnopqrstuvwx1234 for the lane",
+      type: "project",
+      edit: "replace",
+      confidence: 1
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(existsSync(directory)).toBe(false);
+  });
+});
+
 describe("memory store — update-not-duplicate", () => {
   it("remember with an existing name edits in place (one file, updatedAt bumped)", () => {
     let tick = 0;

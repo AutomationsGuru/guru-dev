@@ -35,6 +35,18 @@ export interface BootInjectionOptions {
   readonly query?: string;
 }
 
+/** Provider-neutral fact entries for one active memory scope. */
+export interface FactInjectionSource {
+  readonly scope: MemoryScope;
+  readonly entries: readonly MemoryFactEntry[];
+}
+
+/** Local flywheel learnings remain file-backed even when facts use PostgreSQL. */
+export interface LearningInjectionSource {
+  readonly scope: MemoryScope;
+  readonly learnings: readonly Learning[];
+}
+
 export function buildBootMemoryInjection(store: FileMemoryStore, options: BootInjectionOptions = {}): BootMemoryInjection {
   const now = options.now ?? (() => new Date());
   // General facts (everything except the flywheel's learnings), newest first.
@@ -121,25 +133,45 @@ function scopeTag(scope: MemoryScope): string {
  * regardless of scope. Returns the merged block + the injected learning ids.
  */
 export function mergeScopedBootInjection(stores: readonly ScopedStore[], options: BootInjectionOptions = {}): BootMemoryInjection {
+  return mergeFactSourceInjection(
+    stores.map(({ scope, store }) => ({ scope, entries: store.list() })),
+    stores.map(({ scope, store }) => ({ scope, learnings: loadLearnings(store) })),
+    options
+  );
+}
+
+/**
+ * Merge already-loaded facts from any MemoryFactStore implementation with the
+ * local flywheel learnings. Fact persistence is deliberately absent here: the
+ * caller chooses Markdown/PostgreSQL and supplies only provider-neutral entries.
+ */
+export function mergeFactSourceInjection(
+  factSources: readonly FactInjectionSource[],
+  learningSources: readonly LearningInjectionSource[],
+  options: BootInjectionOptions = {}
+): BootMemoryInjection {
   const now = options.now ?? (() => new Date());
 
   // General facts, deduped by name most-specific-wins (later = more specific).
-  const factByName = new Map<string, { line: string; order: number; text: string }>();
-  let order = 0;
+  const factByName = new Map<string, { line: string; ordinal: number; text: string; updatedAt: number }>();
+  let ordinal = 0;
   const learnings: Learning[] = [];
   const seenLearning = new Set<string>();
-  for (const { scope, store } of stores) {
-    for (const entry of store.list()) {
+  for (const { scope, entries } of factSources) {
+    for (const entry of entries) {
       if (entry.fact.type === "learning") {
         continue;
       }
       factByName.set(entry.fact.name, {
         line: `- [${entry.fact.title}](${entry.fact.name}.md) — ${entry.fact.description}${scopeTag(scope)}`,
-        order: order++,
-        text: `${entry.fact.title} ${entry.fact.description}`
+        ordinal: ordinal++,
+        text: `${entry.fact.title} ${entry.fact.description}`,
+        updatedAt: Date.parse(entry.fact.updatedAt)
       });
     }
-    for (const learning of loadLearnings(store)) {
+  }
+  for (const { learnings: sourceLearnings } of learningSources) {
+    for (const learning of sourceLearnings) {
       // One malformed learning (hand-edited frontmatter, a bad date string) must
       // never blank ALL boot memory — it used to throw through to the blunt catch
       // in refreshBootMemoryBlock that wipes every fact for the session. Skip the
@@ -158,7 +190,13 @@ export function mergeScopedBootInjection(stores: readonly ScopedStore[], options
   // first, best score first), then let recency fill the remaining budget. Without
   // a query, pure recency (newest first) — the cold-boot behavior, unchanged.
   const query = options.query?.trim() ?? "";
-  const byRecency = [...factByName.keys()].sort((left, right) => (factByName.get(right)?.order ?? 0) - (factByName.get(left)?.order ?? 0));
+  const byRecency = [...factByName.keys()].sort((left, right) => {
+    const leftFact = factByName.get(left);
+    const rightFact = factByName.get(right);
+    const leftUpdatedAt = Number.isFinite(leftFact?.updatedAt) ? (leftFact?.updatedAt ?? 0) : 0;
+    const rightUpdatedAt = Number.isFinite(rightFact?.updatedAt) ? (rightFact?.updatedAt ?? 0) : 0;
+    return rightUpdatedAt - leftUpdatedAt || (rightFact?.ordinal ?? 0) - (leftFact?.ordinal ?? 0);
+  });
   let orderedNames = byRecency;
   if (query.length > 0 && factByName.size > 0) {
     const index = buildRecallIndex([...factByName.entries()].map(([id, value]) => ({ id, text: value.text })));

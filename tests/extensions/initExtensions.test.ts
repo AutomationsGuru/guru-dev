@@ -1,3 +1,5 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -66,6 +68,63 @@ describe("initExtensions", () => {
 
     expect(statusTool).toBeDefined();
     expect(await statusTool!.execute({}, {})).toMatchObject({ provider: "postgres", status: "missing-env", missingEnvNames: ["GURU_TEST_UNSET_MEMORY_DATABASE_URL"] });
+  });
+
+  it("reuses the shared extension host when the memory configuration and directory are unchanged", () => {
+    const memoryDirectory = resolve(repoRoot, ".test-memory", "same-config");
+
+    const first = initExtensions({ memoryDirectory });
+    const second = initExtensions({ memoryDirectory });
+
+    expect(second.host).toBe(first.host);
+    expect(second.memoryStore).toBe(first.memoryStore);
+  });
+
+  it("rebuilds the shared extension host when the memory directory changes", () => {
+    const first = initExtensions({ memoryDirectory: resolve(repoRoot, ".test-memory", "directory-a") });
+    const second = initExtensions({ memoryDirectory: resolve(repoRoot, ".test-memory", "directory-b") });
+
+    expect(second.host).not.toBe(first.host);
+    expect(second.memoryStore).not.toBe(first.memoryStore);
+  });
+
+  it("rebuilds the shared extension host when the session provenance changes", async () => {
+    const memoryDirectory = mkdtempSync(resolve(tmpdir(), "guru-init-extensions-session-"));
+
+    try {
+      const memoryConfig = MemoryConfigSchema.parse({});
+      const first = initExtensions({ memoryConfig, memoryDirectory, sessionId: "one" });
+      const second = initExtensions({ memoryConfig, memoryDirectory, sessionId: "two" });
+      const remembered = await second.memoryStore.remember({
+        name: "session-provenance",
+        title: "Session provenance",
+        description: "The rebuilt store uses the latest session.",
+        body: "Latest session provenance.",
+        type: "project",
+        edit: "replace",
+        confidence: 1
+      });
+      const stored = await second.memoryStore.get("session-provenance");
+
+      expect(remembered.status).toBe("created");
+      expect(stored.fact?.originSessionId).toBe("two");
+      expect(second.host).not.toBe(first.host);
+      expect(second.memoryStore).not.toBe(first.memoryStore);
+    } finally {
+      rmSync(memoryDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("lets a bare runtime lookup reuse an explicitly configured extension host", () => {
+    const configured = initExtensions({
+      memoryConfig: MemoryConfigSchema.parse({}),
+      memoryDirectory: resolve(repoRoot, ".test-memory", "configured-runtime")
+    });
+
+    const retrieved = initExtensions();
+
+    expect(retrieved.host).toBe(configured.host);
+    expect(retrieved.memoryStore).toBe(configured.memoryStore);
   });
 });
 

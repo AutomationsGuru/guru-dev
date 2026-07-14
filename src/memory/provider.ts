@@ -1,17 +1,17 @@
 import { Pool } from "pg";
 
 import type { MemoryPostgresConfig, MemoryStorageConfig } from "../config/schema.js";
-import { containsSecretValue } from "../safety/secretSafety.js";
-import { detectPotentialSecrets } from "../safety/policyGuard.js";
 import { extractLinks } from "./frontmatter.js";
 import {
-  MEMORY_BODY_HARD_CAP,
-  MEMORY_BODY_SOFT_CAP,
+  buildMemoryGetResult,
+  planPreflightedMemoryRemember,
+  preflightMemoryRemember,
+  searchMemoryEntries,
+  type MemoryFactEntry
+} from "./policy.js";
+import {
   MemoryFactSchema,
-  MemoryRememberInputSchema,
-  slugifyFactName,
   type MemoryDoctorReport,
-  type MemoryFact,
   type MemoryForgetInput,
   type MemoryGetResult,
   type MemoryRememberInput,
@@ -20,7 +20,7 @@ import {
   type MemoryStoreStatus,
   type MemoryWriteResult
 } from "./schemas.js";
-import type { FileMemoryStore, MemoryFactEntry } from "./store.js";
+import type { FileMemoryStore } from "./store.js";
 
 type MaybePromise<T> = T | Promise<T>;
 
@@ -218,66 +218,49 @@ export function createPostgresMemoryStore(options: PostgresMemoryStoreOptions): 
     },
 
     async remember(rawInput) {
-      const input = MemoryRememberInputSchema.parse(rawInput);
-      const blockers = memoryWriteBlockers(input);
-      if (blockers.length > 0) {
-        return { status: "blocked", summary: "Write blocked by the secret-safety gate.", blockers };
-      }
-      if (input.body.length > MEMORY_BODY_HARD_CAP) {
-        return {
-          status: "blocked",
-          summary: "Write blocked: body exceeds the 32KB hard cap.",
-          blockers: [`body is ${input.body.length} bytes (> ${MEMORY_BODY_HARD_CAP}); split this fact into linked smaller facts`]
-        };
+      const preflight = preflightMemoryRemember(rawInput);
+      if (preflight.kind === "blocked") {
+        return preflight.result;
       }
 
       try {
         const entries = await listEntries();
-        const name = input.name ?? slugifyFactName(input.title);
-        const existing = entries.find((entry) => entry.fact.name === name);
         const timestamp = now().toISOString();
+        const plan = planPreflightedMemoryRemember(preflight, entries, {
+          timestamp,
+          ...(options.sessionId ? { sessionId: options.sessionId } : {})
+        });
+        if (plan.kind === "blocked") {
+          return plan.result;
+        }
         const activePool = await ensureSchema();
 
-        if (existing) {
-          const body = input.edit === "append" ? `${existing.body}\n\n${input.body}` : input.body;
-          if (body.length > MEMORY_BODY_HARD_CAP) {
-            return {
-              status: "blocked",
-              summary: "Update blocked: appended body exceeds the 32KB hard cap.",
-              blockers: [`resulting body would be ${body.length} bytes (> ${MEMORY_BODY_HARD_CAP}); split this fact`]
-            };
-          }
+        if (plan.kind === "update") {
           await activePool.query(
             `UPDATE ${table}
              SET title = $3, description = $4, body = $5, type = $6, confidence = $7, updated_at = $8, deleted_at = NULL, forget_reason = NULL
              WHERE namespace = $1 AND name = $2`,
-            [namespace, name, input.title, input.description, body, input.type, input.confidence, timestamp]
+            [namespace, plan.name, plan.fact.title, plan.fact.description, plan.body, plan.fact.type, plan.fact.confidence, plan.fact.updatedAt]
           );
-          return { status: "updated", name, summary: `Updated [[${name}]] in place (${input.edit}).`, blockers: [] };
-        }
-
-        if (!input.name) {
-          const inputTokens = tokenize(`${input.title} ${input.description}`);
-          for (const entry of entries) {
-            const normalizedEqual = entry.fact.title.trim().toLowerCase() === input.title.trim().toLowerCase();
-            const similar = overlapRatio(inputTokens, tokenize(`${entry.fact.title} ${entry.fact.description}`)) > 0.6;
-            if (normalizedEqual || similar) {
-              return {
-                status: "blocked",
-                summary: `Similar to existing fact [[${entry.fact.name}]] — update it instead, or pass an explicit name to confirm a new fact.`,
-                blockers: [`similar-to:${entry.fact.name}`]
-              };
-            }
-          }
+          return plan.result;
         }
 
         await activePool.query(
           `INSERT INTO ${table} (namespace, name, title, description, body, type, confidence, created_at, updated_at, origin_session_id)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $9)`,
-          [namespace, name, input.title, input.description, input.body, input.type, input.confidence, timestamp, options.sessionId ?? null]
+          [
+            namespace,
+            plan.name,
+            plan.fact.title,
+            plan.fact.description,
+            plan.body,
+            plan.fact.type,
+            plan.fact.confidence,
+            plan.fact.createdAt,
+            plan.fact.originSessionId ?? null
+          ]
         );
-        const softCapNote = input.body.length > MEMORY_BODY_SOFT_CAP ? " (over the 16KB soft cap — consider splitting)" : "";
-        return { status: "created", name, summary: `Remembered [[${name}]]${softCapNote}.`, blockers: [] };
+        return plan.result;
       } catch {
         return {
           status: "blocked",
@@ -290,58 +273,15 @@ export function createPostgresMemoryStore(options: PostgresMemoryStoreOptions): 
     async get(name) {
       try {
         const entries = await listEntries();
-        const entry = entries.find((candidate) => candidate.fact.name === name);
-        if (!entry) {
-          return { found: false, links: [], backlinks: [], danglingLinks: [], summary: `No memory fact named '${name}'.` };
-        }
-        const links = extractLinks(entry.body);
-        const names = new Set(entries.map((candidate) => candidate.fact.name));
-        const backlinks = entries.filter((candidate) => candidate.fact.name !== name && extractLinks(candidate.body).includes(name)).map((candidate) => candidate.fact.name);
-        const danglingLinks = links.filter((link) => !names.has(link));
-        const ageDays = Math.max(0, Math.floor((now().getTime() - Date.parse(entry.fact.updatedAt)) / 86_400_000));
-        return {
-          found: true,
-          fact: entry.fact,
-          body: entry.body,
-          stalenessBanner: `This memory is ${ageDays} day${ageDays === 1 ? "" : "s"} old. Memories are point-in-time observations, not live state — verify against current code/state before asserting as fact.`,
-          links: [...links],
-          backlinks,
-          danglingLinks,
-          summary: `[[${name}]] (${entry.fact.type}, updated ${entry.fact.updatedAt}).`
-        };
+        return buildMemoryGetResult(name, entries, now());
       } catch {
         return { found: false, links: [], backlinks: [], danglingLinks: [], summary: "PostgreSQL memory is unavailable; no fact was read." };
       }
     },
 
     async search(rawInput) {
-      const input = rawInput;
       const entries = await listEntries();
-      const queryTokens = tokenize(input.terms);
-      const hits = entries
-        .filter((entry) => (input.type ? entry.fact.type === input.type : true))
-        .map((entry) => {
-          const haystack = tokenize(`${entry.fact.name} ${entry.fact.title} ${entry.fact.description}`);
-          let score = 0;
-          for (const token of queryTokens) {
-            if (haystack.has(token)) {
-              score += 1;
-            }
-          }
-          return { entry, score: queryTokens.size > 0 ? score / queryTokens.size : 0 };
-        })
-        .filter(({ score }) => score > 0)
-        .sort((left, right) => right.score - left.score)
-        .slice(0, input.limit)
-        .map(({ entry, score }) => ({
-          name: entry.fact.name,
-          title: entry.fact.title,
-          description: entry.fact.description,
-          type: entry.fact.type,
-          updatedAt: entry.fact.updatedAt,
-          score: Number(score.toFixed(3))
-        }));
-      return { hits, summary: hits.length > 0 ? `${hits.length} memory fact(s) matched — read with memory_get.` : "No memory facts matched." };
+      return searchMemoryEntries(rawInput, entries);
     },
 
     async forget(input) {
@@ -426,40 +366,6 @@ function rowToEntry(row: FactRow): MemoryFactEntry {
 function toIso(value: string | Date): string {
   const date = value instanceof Date ? value : new Date(value);
   return Number.isNaN(date.getTime()) ? new Date(0).toISOString() : date.toISOString();
-}
-
-function memoryWriteBlockers(input: MemoryRememberInput): string[] {
-  const fields = [
-    { name: "title", value: input.title },
-    { name: "description", value: input.description },
-    { name: "body", value: input.body }
-  ];
-  const blockers = detectPotentialSecrets(fields).map(
-    (match) => `memory write blocked: potential secret (${match.kind}) detected in ${match.name} — memory stores must never hold secret values`
-  );
-  for (const field of fields) {
-    if (containsSecretValue(field.value)) {
-      blockers.push(`memory write blocked: token-shaped value detected in ${field.name} — memory stores must never hold secret values`);
-    }
-  }
-  return blockers;
-}
-
-function tokenize(text: string): Set<string> {
-  return new Set(text.toLowerCase().split(/[^a-z0-9]+/u).filter((token) => token.length >= 2));
-}
-
-function overlapRatio(left: Set<string>, right: Set<string>): number {
-  if (left.size === 0 || right.size === 0) {
-    return 0;
-  }
-  let hits = 0;
-  for (const token of left) {
-    if (right.has(token)) {
-      hits += 1;
-    }
-  }
-  return hits / Math.min(left.size, right.size);
 }
 
 class MemoryStoreUnavailableError extends Error {

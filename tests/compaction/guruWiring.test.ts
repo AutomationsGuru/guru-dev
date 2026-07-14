@@ -17,6 +17,7 @@ import {
 import { runCompaction, shouldCompact, SUMMARY_ENTRY_PREFIX } from "../../src/compaction/engine.js";
 import { CompactionConfigSchema } from "../../src/compaction/schemas.js";
 import { createConversationStore } from "../../src/guru/conversationStore.js";
+import { refreshMemorySystemHead } from "../../src/guru/memorySessionService.js";
 import { clearRegisteredSecretValues, registerSecretValue } from "../../src/safety/secretSafety.js";
 import type { ChatTurnMessage } from "../../src/model/directChat.js";
 
@@ -67,6 +68,37 @@ describe("history adapter", () => {
 });
 
 describe("rebuild + sendable window", () => {
+  it("awaits live memory before replacing only the resumed system head", async () => {
+    let release: (() => void) | undefined;
+    let refreshed = false;
+    const memory = {
+      refresh: () => new Promise<string>((resolve) => {
+        release = () => {
+          refreshed = true;
+          resolve("fresh memory");
+        };
+      }),
+      composeSystemPrompt: (basePrompt: string) => `${basePrompt}\n${refreshed ? "FRESH" : "STALE"}`
+    };
+    const history: ChatTurnMessage[] = [
+      { role: "system", content: "SAVED HEAD" },
+      { role: "system", content: `${SUMMARY_ENTRY_PREFIX}\nPRESERVE SUMMARY` },
+      { role: "user", content: "preserve turn" }
+    ];
+
+    const pending = refreshMemorySystemHead(memory, history, "LIVE BASE");
+    await Promise.resolve();
+    expect(history[0]?.content).toBe("SAVED HEAD");
+    release?.();
+    await pending;
+
+    expect(history).toEqual([
+      { role: "system", content: "LIVE BASE\nFRESH" },
+      { role: "system", content: `${SUMMARY_ENTRY_PREFIX}\nPRESERVE SUMMARY` },
+      { role: "user", content: "preserve turn" }
+    ]);
+  });
+
   it("rebuilds as [head, summary system message, ...kept]", () => {
     const rebuilt = rebuildHistoryAfterCompaction(
       { role: "system", content: "HEAD" },
@@ -82,6 +114,63 @@ describe("rebuild + sendable window", () => {
       { role: "user", content: "kept question" },
       { role: "assistant", content: "kept answer" }
     ]);
+  });
+
+  it("wires every resumed-session path through an awaited memory refresh", () => {
+    const source = readFileSync(join(process.cwd(), "src", "guru.ts"), "utf8");
+    const switchStart = source.indexOf("async function switchToSession");
+    const switchEnd = source.indexOf("\n}\n\n/** Leaving a branch", switchStart);
+    const switchBody = source.slice(switchStart, switchEnd);
+
+    expect(switchStart).toBeGreaterThanOrEqual(0);
+    expect(switchBody).toContain("await refreshStateMemory(state)");
+    expect(source.match(/await switchToSession\(/gu)).toHaveLength(5);
+    expect(source).not.toContain("activeFactMemoryProvider");
+    expect(source).not.toMatch(/executeTool\([^\n]*"honcho_context"/u);
+    expect(source).not.toMatch(/executeTool\([^\n]*"honcho_log_turn"/u);
+  });
+
+  it("awaits role scope changes before returning to chat or command dispatch", () => {
+    const source = readFileSync(join(process.cwd(), "src", "guru.ts"), "utf8");
+    const suitStart = source.indexOf("async function cmdRoleSuit");
+    const suitEnd = source.indexOf("\n}\n\nasync function cmdRolePark", suitStart);
+    const parkStart = source.indexOf("async function cmdRolePark");
+    const parkEnd = source.indexOf("\n}\n\nasync function cmdRole", parkStart);
+    const roleStart = source.indexOf("async function cmdRole(");
+    const roleEnd = source.indexOf("\n}\n\nconst MANDATE_VERB_PRESETS", roleStart);
+
+    expect(suitStart).toBeGreaterThanOrEqual(0);
+    expect(suitEnd).toBeGreaterThan(suitStart);
+    expect(parkStart).toBeGreaterThanOrEqual(0);
+    expect(parkEnd).toBeGreaterThan(parkStart);
+    expect(roleStart).toBeGreaterThanOrEqual(0);
+    expect(roleEnd).toBeGreaterThan(roleStart);
+    expect(source.slice(suitStart, suitEnd)).toContain("await refreshStateMemory(state)");
+    expect(source.slice(parkStart, parkEnd).match(/await refreshStateMemory\(state\)/gu)?.length).toBe(2);
+    expect(source.slice(roleStart, roleEnd)).toContain("await cmdRoleSuit(state");
+    expect(source.slice(roleStart, roleEnd)).toContain("await cmdRolePark(state)");
+    expect(source.slice(roleStart, roleEnd)).toContain("await refreshStateMemory(state)");
+    expect(source).toContain("await cmdRoleSuit(state, intent)");
+    expect(source).toContain("await cmdRole(state, slash.args)");
+    expect(source).toContain("await cmdRolePark(state)");
+    expect(source).toContain("await cmdRoleSuit(state, roleArg)");
+  });
+
+  it("wires memory commands, turn refresh, logging, briefing, settings, and startup through the service", () => {
+    const source = readFileSync(join(process.cwd(), "src", "guru.ts"), "utf8");
+    const adapterStart = source.indexOf("async function cmdMemorySession");
+    const adapterEnd = source.indexOf("\n}\n\n/**", adapterStart);
+    const adapter = source.slice(adapterStart, adapterEnd);
+
+    expect(adapter).toContain("await state.memory.runCommand");
+    expect(adapter).toContain("if (result.contextChanged");
+    expect(source).toContain("await cmdMemorySession(state, slash.command, slash.args)");
+    expect(source).toContain("await refreshStateMemory(state, submitted)");
+    expect(source).toContain("state.memory.recordTurn(memoryToolContext(state), submitted, result.text)");
+    expect(source).toContain("state.memory.briefingLines(honcho)");
+    expect(source).toContain("describeMemoryStorage(configResult.config.memory.storage)");
+    expect(source).toContain("state.memory.canonicalFactCount === 0");
+    expect(source).not.toContain("guruMemoryStore.list().length === 0");
   });
 
   it("sendableHistory: full history when compaction is on; the exact legacy slice(-13) when off", () => {

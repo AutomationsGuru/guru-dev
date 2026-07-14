@@ -20,6 +20,7 @@ import {
   withRuntimeCleanup
 } from "../../src/guru.js";
 import { createDirectProviderCatalog } from "../../src/providers/catalog.js";
+import { isMemorySlashCommand } from "../../src/guru/memorySessionService.js";
 
 describe("guru entrypoint detection", () => {
   const moduleEntry = "/repo/dist/guru.js";
@@ -57,6 +58,13 @@ describe("parseSlashCommand", () => {
   it("returns null for chat text", () => {
     expect(parseSlashCommand("hello there")).toBeNull();
     expect(parseSlashCommand("  what is 2+2?")).toBeNull();
+  });
+});
+
+describe("memory command adapter", () => {
+  it("routes exactly the three memory commands through the shared service", () => {
+    expect(["/remember", "/memory", "/recall"].filter(isMemorySlashCommand)).toEqual(["/remember", "/memory", "/recall"]);
+    expect(["/memo", "/settings", "remember"].filter(isMemorySlashCommand)).toEqual([]);
   });
 });
 

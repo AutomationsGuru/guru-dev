@@ -52,14 +52,22 @@ let sharedMemoryStore: MemoryFactStore | null = null;
 let sharedSwarm: SwarmManager | null = null;
 let sharedMemoryConfigSignature: string | null = null;
 
-export function initExtensions(options: InitExtensionsOptions = {}): HarnessExtensions {
-  const requestedMemoryConfig = options.memoryConfig ?? MemoryConfigSchema.parse({});
+export function initExtensions(options?: InitExtensionsOptions): HarnessExtensions {
+  // Runtime wiring calls this with no options to retrieve the host configured
+  // earlier by the session builder. Only an explicit options object requests a
+  // configuration comparison; the first-ever bare call still builds defaults.
+  if (sharedHost && options === undefined) {
+    return { host: sharedHost, tools: sharedTools!, memoryStore: sharedMemoryStore!, swarm: sharedSwarm! };
+  }
+  const requestedOptions = options ?? {};
+  const requestedMemoryConfig = requestedOptions.memoryConfig ?? MemoryConfigSchema.parse({});
   // The store location is just as important as its provider configuration.
   // Without it, a test/project-specific home could inherit the first process
   // session's user-home memory store.
   const requestedSignature = JSON.stringify({
     memoryConfig: requestedMemoryConfig,
-    memoryDirectory: options.memoryDirectory ?? null
+    memoryDirectory: requestedOptions.memoryDirectory ?? null,
+    sessionId: requestedOptions.sessionId ?? null
   });
   // Extension tools are process-shared, but a caller that explicitly starts a
   // session with a different memory configuration must not inherit whichever
@@ -76,7 +84,7 @@ export function initExtensions(options: InitExtensionsOptions = {}): HarnessExte
   if (!sharedHost) {
     sharedHost = createExtensionHost();
     const memoryConfig = requestedMemoryConfig;
-    sharedMemoryConfigSignature = JSON.stringify(memoryConfig);
+    sharedMemoryConfigSignature = requestedSignature;
     const honchoClient = createHonchoClient({
       config: HonchoConfigSchema.parse({
         enabled: memoryConfig.honcho.enabled,
@@ -91,13 +99,13 @@ export function initExtensions(options: InitExtensionsOptions = {}): HarnessExte
       })
     });
     const markdownStore = createFileMemoryStore({
-      ...(options.memoryDirectory ? { directory: options.memoryDirectory } : {}),
-      ...(options.sessionId ? { sessionId: options.sessionId } : {})
+      ...(requestedOptions.memoryDirectory ? { directory: requestedOptions.memoryDirectory } : {}),
+      ...(requestedOptions.sessionId ? { sessionId: requestedOptions.sessionId } : {})
     });
     sharedMemoryStore = createConfiguredMemoryStore(memoryConfig.storage, markdownStore, {
-      ...(options.sessionId ? { sessionId: options.sessionId } : {})
+      ...(requestedOptions.sessionId ? { sessionId: requestedOptions.sessionId } : {})
     });
-    sharedSwarm = getSharedSwarmManager(options.swarmConfig ?? {});
+    sharedSwarm = getSharedSwarmManager(requestedOptions.swarmConfig ?? {});
 
     sharedHost.registerExtension((api) => {
       api.registerTool({ factory: () => createHonchoTools({ client: honchoClient }) });
