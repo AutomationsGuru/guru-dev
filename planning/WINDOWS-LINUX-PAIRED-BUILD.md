@@ -75,8 +75,9 @@ Only a candidate green on the same SHA on Windows and Linux may advance to:
 
 Routine waves do not bump versions, publish packages, or create releases.
 The current release target is 1.5.1 and may publish only after every gate passes.
-Later dogfood releases remain on 1.5.x; 1.6.0 or higher is prohibited until
-Matthew explicitly says Guru is working well enough to advance.
+Later dogfood releases remain on 1.5.x for as long as needed (1.5.1, 1.5.2, …);
+1.6.0 or higher is prohibited until Matthew explicitly says Guru is working well
+enough to advance. CI and the release workflow enforce the 1.5.x ceiling.
 
 ## Communication
 

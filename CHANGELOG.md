@@ -11,10 +11,17 @@ All notable changes to GuruHarness are documented here.
 - Do not bump the package version for a local build, test, install refresh,
   routine PR/push, or ordinary fix. Record work here until a release owner and
   Matthew make an explicit release/migration decision.
-- The approved release line remains `1.5.x`. The current gated target is
-  `1.5.1`; patch increments may continue, but do not create or publish
-  `1.6.0` or higher until Matthew explicitly accepts Guru as working well
-  enough to advance.
+- **Stay on `1.5.x` until Matthew is happy with how Guru works.** Patch numbers
+  may climb without limit (`1.5.1` … `1.5.n` — even absurdly high is fine). The
+  current gated target is `1.5.1`. Do **not** create, tag, or publish `1.6.0` or
+  higher until Matthew explicitly accepts Guru as working well enough to advance.
+  CI (`scripts/verify-repo.ps1`) and the tag-triggered release workflow refuse
+  package versions outside `1.5.x`.
+
+### Changed
+
+- **Release line lock:** repository hygiene and the release publish workflow now
+  fail if `package.json` leaves the `1.5.x` dogfood line.
 
 ### Fixed
 

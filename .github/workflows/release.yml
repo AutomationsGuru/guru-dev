@@ -48,6 +48,30 @@ jobs:
             exit 1
           fi
 
+      - name: Enforce 1.5.x release line (no 1.6+ until Matthew accepts)
+        run: |
+          # Dogfood stays on 1.5.x indefinitely — patches may climb (1.5.1 … 1.5.n).
+          # 1.6.0 or higher requires Matthew's explicit "working well enough" acceptance.
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if ! node -e '
+            const v = process.argv[1];
+            const m = /^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(v);
+            if (!m) { console.error("unparseable version: " + v); process.exit(2); }
+            const major = Number(m[1]);
+            const minor = Number(m[2]);
+            if (major !== 1 || minor !== 5) {
+              console.error(
+                "Refusing to publish " + v + ": approved release line is 1.5.x only. " +
+                "1.6.0+ is blocked until Matthew explicitly accepts Guru as working well enough."
+              );
+              process.exit(1);
+            }
+            console.log("Release line OK: " + v + " is on 1.5.x");
+          ' "$PKG_VERSION"; then
+            echo "::error::Release blocked: package version must remain on 1.5.x until Matthew unlocks 1.6+"
+            exit 1
+          fi
+
       - name: Typecheck
         run: npm run typecheck
 
