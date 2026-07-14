@@ -463,13 +463,192 @@ export const READ_ONLY_TOOL_IDS: ReadonlySet<string> = new Set([
 ]);
 
 /** Access text for `/tools`: reflect the mode actually active in this session. */
-export type ToolAccessMode = "free" | "yolo" | "approval";
+export type ToolAccessMode = "free" | "denied" | "yolo" | "policy" | "session" | "approval";
 
-export function getToolAccessMode(toolId: string, yolo: boolean): ToolAccessMode {
+export function getToolAccessMode(
+  toolId: string,
+  yolo: boolean,
+  mandate: Pick<MandateState, "grants" | "denies"> = { grants: [], denies: [] },
+  sessionApprovals: ReadonlySet<MandateVerb> = new Set(),
+  cwd: string = process.cwd()
+): ToolAccessMode {
+  // Mirror the live approval pipeline's Guru-specific always-allowed floor
+  // before delegating path, deny, hard-edge, YOLO, and grant precedence.
   if (READ_ONLY_TOOL_IDS.has(toolId)) {
     return "free";
   }
-  return yolo ? "yolo" : "approval";
+
+  const decision = evaluateToolMandate(toolId, {}, { cwd, state: mandate, yolo });
+  if (decision.verbs.length === 0) {
+    return "free";
+  }
+  if (decision.outcome === "deny") {
+    return "denied";
+  }
+  if (decision.outcome === "allow") {
+    return yolo ? "yolo" : "policy";
+  }
+
+  const hardEdge = decision.verbs.some((verb) => HARD_EDGE_VERBS.has(verb));
+  const sessionCovered =
+    !hardEdge && decision.verbs.every((verb) => sessionApprovals.has(verb));
+  return sessionCovered ? "session" : "approval";
+}
+
+export interface EffectiveAccessInput {
+  readonly yolo: boolean;
+  readonly mandate: Pick<MandateState, "grants" | "denies">;
+  readonly sessionApprovals?: ReadonlySet<MandateVerb>;
+}
+
+export interface EffectiveAccessDescription {
+  readonly mode: "yolo" | "safe" | "policy";
+  readonly chip: string;
+  readonly summary: string;
+  readonly grantCount: number;
+  readonly grantsShadowed: boolean;
+}
+
+function savedGrantDescription(grant: MandateState["grants"][number]): string {
+  const scope = grant.scope === "space" ? `space ${grant.path ?? "(missing path)"}` : "machine";
+  return `${scope} ${grant.verbs.join("+")}`;
+}
+
+function directGrantDescription(
+  grant: MandateState["grants"][number],
+  denies: MandateState["denies"]
+): string | null {
+  const deniedVerbs = new Set(denies.filter((deny) => deny.path === undefined).map((deny) => deny.verb));
+  const directVerbs = grant.verbs.filter((verb) => !HARD_EDGE_VERBS.has(verb) && !deniedVerbs.has(verb));
+  if (directVerbs.length === 0) {
+    return null;
+  }
+  const scope = grant.scope === "space" ? `space ${grant.path ?? "(missing path)"}` : "machine";
+  return `${scope} ${directVerbs.join("+")}`;
+}
+
+/** One canonical, read-only description of the access policy effective now. */
+export function describeEffectiveAccess(input: EffectiveAccessInput): EffectiveAccessDescription {
+  const grantCount = input.mandate.grants.length;
+  const globallyDeniedVerbs = new Set(input.mandate.denies.filter((deny) => deny.path === undefined).map((deny) => deny.verb));
+  const sessionVerbs = [...(input.sessionApprovals ?? [])]
+    .filter((verb) => !HARD_EDGE_VERBS.has(verb) && !globallyDeniedVerbs.has(verb))
+    .sort();
+  const sessionCopy = sessionVerbs.length > 0
+    ? ` Session-approved ${sessionVerbs.join("+")} remain direct where no scoped deny applies for this session.`
+    : "";
+  const hardEdges = "Denies and destructive/spend/secret/auth hard edges still bind.";
+
+  if (input.yolo) {
+    const shadowCopy = grantCount > 0 ? ` ${grantCount} saved grant(s) are shadowed until YOLO is off.` : "";
+    return {
+      mode: "yolo",
+      chip: "⚡YOLO",
+      summary: `YOLO: ordinary machine read/write/exec run directly. ${hardEdges}${shadowCopy}`,
+      grantCount,
+      grantsShadowed: grantCount > 0
+    };
+  }
+
+  if (grantCount === 0) {
+    return {
+      mode: "safe",
+      chip: "SAFE",
+      summary: `Safe mode: no saved grants; ordinary mutations use per-call approval.${sessionCopy} ${hardEdges}`,
+      grantCount,
+      grantsShadowed: false
+    };
+  }
+
+  const directPolicy = input.mandate.grants
+    .map((grant) => directGrantDescription(grant, input.mandate.denies))
+    .filter((description): description is string => description !== null)
+    .join("; ");
+  const policyCopy = directPolicy.length > 0
+    ? `${directPolicy} remain direct where no scoped deny applies`
+    : "saved grants currently provide no direct ordinary verbs";
+  return {
+    mode: "policy",
+    chip: `POLICY:${grantCount}`,
+    summary: `Policy mode: ${policyCopy}; uncovered ordinary mutations use per-call approval.${sessionCopy} ${hardEdges}`,
+    grantCount,
+    grantsShadowed: false
+  };
+}
+
+/** Bare `/mandate` report. Formatting is data-only so every surface stays testable. */
+export function formatMandateOverview(input: EffectiveAccessInput & { readonly filePath: string }): readonly string[] {
+  const access = describeEffectiveAccess(input);
+  const lines = [
+    `mandates — ${access.grantCount} saved grant(s) · ${input.mandate.denies.length} saved deny rule(s)`,
+    "Persistent mandates are advanced policy for safe mode; YOLO shadows saved grants only, while matching denies remain binding.",
+    `Effective access: ${access.summary}`,
+    `Storage: ${input.filePath}`,
+    "Saved grants:"
+  ];
+  if (input.mandate.grants.length === 0) {
+    lines.push("  (none)");
+  } else {
+    for (const grant of input.mandate.grants) {
+      const hardEdges = grant.verbs.filter((verb) => HARD_EDGE_VERBS.has(verb));
+      const ordinaryVerbs = grant.verbs.filter((verb) => !HARD_EDGE_VERBS.has(verb));
+      const hardEdgeCopy = hardEdges.length > 0 ? `; ${hardEdges.join("+")} still require explicit approval` : "";
+      const state = input.yolo
+        ? `shadowed by YOLO${hardEdgeCopy}`
+        : ordinaryVerbs.length > 0
+          ? `ordinary verbs active when scope matches and no deny applies${hardEdgeCopy}`
+          : `no direct ordinary verbs${hardEdgeCopy}`;
+      lines.push(`  ${savedGrantDescription(grant)} · grantedAt ${grant.grantedAt} · ${state}`);
+    }
+  }
+  lines.push("Saved denies:");
+  if (input.mandate.denies.length === 0) {
+    lines.push("  (none)");
+  } else {
+    for (const deny of input.mandate.denies) {
+      const where = deny.path ? `path ${deny.path}` : "all paths";
+      const note = deny.note ? ` · note ${deny.note}` : "";
+      lines.push(`  ${deny.verb} · ${where}${note} · binding in every mode when matched, including YOLO`);
+    }
+  }
+  lines.push(
+    "Examples:",
+    "  /mandate grant space work    — read+write+exec for this project",
+    "  /mandate grant machine work  — read+write+exec for this computer",
+    "  /mandate revoke              — clear all saved grants and denies"
+  );
+  return lines;
+}
+
+/** Dynamic, executable access drill rows for the slash menu. */
+export function buildAccessDrillMenuItems(
+  parentId: "/status" | "/yolo" | "/mandate",
+  input: EffectiveAccessInput
+): readonly MenuItem[] {
+  const access = describeEffectiveAccess(input);
+  const items: MenuItem[] = [{ id: parentId, label: access.chip, hint: access.summary }];
+  if (parentId === "/yolo") {
+    const onAccess = describeEffectiveAccess({ ...input, yolo: true });
+    const offAccess = describeEffectiveAccess({ ...input, yolo: false });
+    items.push(
+      { id: "/yolo on", label: "YOLO on", hint: onAccess.summary },
+      { id: "/yolo off", label: "YOLO off", hint: offAccess.summary }
+    );
+  } else if (parentId === "/mandate") {
+    const grantHintSuffix = input.yolo ? "; shadowed while YOLO is active" : "";
+    items.push(
+      { id: "/mandate grant space work", label: "grant project work", hint: `persist read+write+exec for this project${grantHintSuffix}` },
+      { id: "/mandate grant machine work", label: "grant machine work", hint: `persist read+write+exec for this computer${grantHintSuffix}` }
+    );
+    if (access.grantCount > 0 || input.mandate.denies.length > 0) {
+      const revokedAccess = describeEffectiveAccess({
+        ...input,
+        mandate: { grants: [], denies: [] }
+      });
+      items.push({ id: "/mandate revoke", label: "revoke saved grants and denies", hint: revokedAccess.summary });
+    }
+  }
+  return items;
 }
 
 /** Read a spawn-time YOLO snapshot, falling back for older or foreign snapshots. */
@@ -489,7 +668,7 @@ export interface SlashCommand {
 
 export const SLASH_COMMANDS: readonly SlashCommand[] = [
   { name: "/help", usage: "/help", description: "Show commands and hotkeys" },
-  { name: "/status", usage: "/status", description: "Harness status: session, model, Honcho, routes" },
+  { name: "/status", usage: "/status", description: "Harness status and effective access" },
   { name: "/model", usage: "/model [routeId|#] [modelIdOverride]", description: "Browse providers or connect a route" },
   { name: "/models", usage: "/models", description: "Print the exhaustive model catalog" },
   { name: "/sessions", usage: "/sessions", description: "List saved conversations (resumable)" },
@@ -515,8 +694,8 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = [
   { name: "/logout", usage: "/logout <provider>", description: "How to disconnect a provider (guru holds no token file)" },
   { name: "/tools", usage: "/tools", description: "List live session tools" },
   { name: "/todo", usage: "/todo", description: "Show the agent task board (todo_list / todo_write)" },
-  { name: "/mandate", usage: "/mandate [grant space|machine <verbs> | list | revoke]", description: "Standing permission grants (this repo/computer is yours)" },
-  { name: "/yolo", usage: "/yolo [on|off]", description: "YOLO is the default; /yolo off engages safe mode (hard edges always hold)" },
+  { name: "/mandate", usage: "/mandate [grant space|machine <verbs> | list | revoke]", description: "Inspect effective access and persistent safe-mode policy" },
+  { name: "/yolo", usage: "/yolo [on|off]", description: "Inspect or toggle effective access (hard edges always hold)" },
   { name: "/context", usage: "/context", description: "Context window usage and session footprint (tokens / ctx%)" },
   { name: "/export", usage: "/export [path]", description: "Write the conversation transcript to a markdown file" },
   { name: "/copy", usage: "/copy [n]", description: "Copy the latest (or Nth-latest) assistant reply to the clipboard" },
@@ -814,16 +993,19 @@ export function resolveCompactRouteSelector(
   return routes.find((route) => route.routeId === routeId);
 }
 
-function banner(): string {
+export function banner(
+  accessInput: EffectiveAccessInput = { yolo: true, mandate: { grants: [], denies: [] } }
+): string {
   const info = getRuntimeInfo();
   const columns = process.stdout.columns ?? (Number(process.env.COLUMNS) || 80);
   const splash = renderSplash(paint, { version: info.version, themeName: paint.name, node: process.versions.node }, columns);
+  const access = describeEffectiveAccess(accessInput);
   return [
     "",
     splash.trimEnd(),
     "",
     paint.fg("muted", `  build ${resolveBuildStamp()} · agentic tools · streaming · resumable sessions`),
-    `  ${paint.fg("warning", "⚡ YOLO")} ${paint.fg("muted", "— the default. Guru does the job; it never pauses for permission. Only spend, destructive & secret/auth actions stop to ask. /yolo off for safe mode.")}`,
+    `  ${paint.fg(access.mode === "yolo" ? "warning" : "success", access.chip)} ${paint.fg("muted", `— ${access.summary}`)}`,
     paint.fg("muted", "  /help commands · /model connect a model · /resume continue a session · ctrl+d exit"),
     ""
   ].join("\n");
@@ -855,6 +1037,7 @@ function fmtTokens(value: number): string {
 export function buildStatusBar(state: GuruState, columns: number = process.stdout.columns ?? 80): string {
   const project = state.session?.repo ? basename(state.session.repo.repoRoot) : "no repo";
   const sep = paint.fg("muted", " · ");
+  const access = describeEffectiveAccess({ yolo: state.yolo, mandate: state.mandate, sessionApprovals: state.sessionApprovals });
 
   const leftParts: string[] = [`${paint.fg("accent2", GLYPHS.agent)} ${paint.fg("fgBright", project)}`];
   if (state.activeRole) {
@@ -864,14 +1047,10 @@ export function buildStatusBar(state: GuruState, columns: number = process.stdou
   if (state.busy) {
     chips.push(paint.fg("warning", "…run"));
   }
-  if (state.yolo) {
-    chips.push(paint.fg("warning", "⚡YOLO"));
-  }
+  const accessTone = access.mode === "yolo" ? "warning" : access.mode === "policy" ? "success" : "muted";
+  chips.push(paint.fg(accessTone, access.chip));
   if (state.lookahead.enabled) {
     chips.push(paint.fg("accent2", "⛃scout"));
-  }
-  if (state.mandate.grants.length > 0) {
-    chips.push(paint.fg("success", "⛨mandate"));
   }
   // Follow-up / steer queue depth (§5) — only when something is waiting.
   const queue = state.agentSession?.queueDepth() ?? 0;
@@ -910,7 +1089,7 @@ export function buildStatusBar(state: GuruState, columns: number = process.stdou
   // model, and drop accounting detail that would hard-wrap the pinned chrome.
   const compactChipLabels = [
     ...(state.busy ? ["…run"] : []),
-    ...(state.yolo ? ["⚡YOLO"] : []),
+    access.chip,
     ...(queue > 0 ? [`q:${queue}`] : [])
   ];
   const rightBudget = Math.max(8, Math.min(24, Math.floor(usable * 0.48)));
@@ -938,6 +1117,7 @@ function print(text: string): void {
 async function cmdStatus(state: GuruState): Promise<void> {
   const honchoTool = state.session?.tools.find((tool) => tool.id === "honcho_memory_status");
   const summary = summarizeReadiness(mapRoutesToProviders(state.routes, { lastCheckedAt: new Date().toISOString(), env: process.env }));
+  const access = describeEffectiveAccess({ yolo: state.yolo, mandate: state.mandate, sessionApprovals: state.sessionApprovals });
   print(paint.bold(paint.fg("fgBright", "Guru Harness status")));
   const rows: string[][] = [
     [paint.fg("muted", "runtime"), `${getRuntimeInfo().name} ${getRuntimeInfo().version}`],
@@ -946,12 +1126,7 @@ async function cmdStatus(state: GuruState): Promise<void> {
     [paint.fg("muted", "model"), state.connectedRoute ? `${state.connectedRoute.routeId} ${paint.fg("fgFaint", `[${state.connectedRoute.apiFamily ?? "?"}]`)}` : "not connected"],
     [paint.fg("muted", "routes"), `${state.routes.length} in catalog · ${summary.active} active · ${summary.readyUnverified} ready · ${summary.missingOrLogin} missing/login`],
     [paint.fg("muted", "usage"), `${state.usage.inputTokens} in / ${state.usage.outputTokens} out · ${state.usage.turns} turn(s)`],
-    [
-      paint.fg("muted", "approval"),
-      state.sessionApprovals.size > 0
-        ? `${badge(paint, "PER-CALL", "brand")} ${paint.fg("fgFaint", `${[...state.sessionApprovals].join("+")} approved this session`)}`
-        : `${badge(paint, "PER-CALL", "brand")} ${paint.fg("fgFaint", "each mutating call prompts (y/N/always)")}`
-    ]
+    [paint.fg("muted", "access"), `${badge(paint, access.chip, access.mode === "yolo" ? "warning" : access.mode === "policy" ? "success" : "brand")} ${paint.fg("fgFaint", access.summary)}`]
   ];
   for (const row of rows) {
     print(`  ${row[0]!.padEnd(paint.level === "none" ? 8 : 30)} ${row[1]!}`);
@@ -2039,23 +2214,21 @@ function cmdMandate(state: GuruState, args: readonly string[]): void {
   const sub = (args[0] ?? "list").toLowerCase();
 
   if (sub === "list") {
-    const grants = state.mandate.grants;
-    print(bold(theme, `mandates — ${grants.length} grant(s)`) + dim(theme, `  (${state.mandateStore.filePath})`));
-    for (const grant of grants) {
-      const where = grant.scope === "space" ? `space ${grant.path}` : "machine";
-      print(`  ${colorize(theme, "cyan", where.padEnd(40))} ${dim(theme, grant.verbs.join("+"))}`);
-    }
-    if (grants.length === 0) {
-      print(dim(theme, "  No standing grants. Each mutating tool call prompts per-call (y/N/always)."));
-      print(dim(theme, "  /mandate grant machine work   -> 'this computer is yours' (read+write+exec)"));
-    }
-    print(dim(theme, `  YOLO: ${state.yolo ? colorize(theme, "yellow", "ON") : "off"} - hard edges (destructive/spend) always prompt below YOLO`));
+    const lines = formatMandateOverview({
+      yolo: state.yolo,
+      mandate: state.mandate,
+      sessionApprovals: state.sessionApprovals,
+      filePath: state.mandateStore.filePath
+    });
+    lines.forEach((line, index) => print(index === 0 ? bold(theme, line) : dim(theme, line)));
     return;
   }
 
   if (sub === "revoke") {
     state.mandate = state.mandateStore.revokeAll();
-    print(colorize(theme, "green", "All standing mandates revoked. Per-call approval is back in force."));
+    const access = describeEffectiveAccess({ yolo: state.yolo, mandate: state.mandate, sessionApprovals: state.sessionApprovals });
+    print(colorize(theme, "green", "All saved mandates revoked."));
+    print(dim(theme, `  ${access.summary}`));
     return;
   }
 
@@ -2079,8 +2252,9 @@ function cmdMandate(state: GuruState, args: readonly string[]): void {
     const cwd = state.session?.repo?.repoRoot ?? process.cwd();
     state.mandate = state.mandateStore.grant(scope === "space" ? { scope, path: cwd, verbs: [...verbs] } : { scope, verbs: [...verbs] });
     const where = scope === "space" ? `this repo (${cwd})` : "this computer";
-    print(colorize(theme, "green", `Granted ${verbs.join("+")} for ${where}.`) + dim(theme, " Per-call prompts for these verbs now collapse into the grant."));
-    print(dim(theme, "  Hard edges (rm -rf, force-push, spend) still prompt below YOLO."));
+    const access = describeEffectiveAccess({ yolo: state.yolo, mandate: state.mandate, sessionApprovals: state.sessionApprovals });
+    print(colorize(theme, "green", `Saved ${verbs.join("+")} for ${where}.`));
+    print(dim(theme, `  ${access.summary}`));
     return;
   }
 
@@ -2093,17 +2267,22 @@ function cmdYolo(state: GuruState, args: readonly string[]): void {
   const arg = (args[0] ?? "").toLowerCase();
   if (arg === "off") {
     state.yolo = false;
-    print(colorize(theme, "green", "Safe mode ON — ordinary permission gates restored (per-call prompts + standing mandates)."));
-    print(dim(theme, "  This is the leash, not the default. /yolo on to return to YOLO (guru's baseline)."));
+    const access = describeEffectiveAccess({ yolo: state.yolo, mandate: state.mandate, sessionApprovals: state.sessionApprovals });
+    print(colorize(theme, "green", access.summary));
+    print(dim(theme, "  /yolo on returns to Guru's default YOLO mode."));
     return;
   }
-  if (arg === "on" || arg === "") {
+  if (arg === "on") {
     state.yolo = true;
-    print(colorize(theme, "yellow", "⚡ YOLO — the default. Ordinary permission gates lifted."));
-    print(dim(theme, "  Hard edges — destructive / spend / secrets-adjacent / ecosystem-auth — STILL prompt every time. /yolo off for safe mode."));
+    const access = describeEffectiveAccess({ yolo: state.yolo, mandate: state.mandate, sessionApprovals: state.sessionApprovals });
+    const offAccess = describeEffectiveAccess({ yolo: false, mandate: state.mandate, sessionApprovals: state.sessionApprovals });
+    print(colorize(theme, "yellow", access.summary));
+    print(dim(theme, `  /yolo off: ${offAccess.summary}`));
     return;
   }
-  print(dim(theme, `YOLO is ${state.yolo ? "ON (the default)" : "OFF (safe mode)"}. Use /yolo off for safe mode, /yolo on for YOLO.`));
+  const access = describeEffectiveAccess({ yolo: state.yolo, mandate: state.mandate, sessionApprovals: state.sessionApprovals });
+  print((access.mode === "yolo" ? colorize(theme, "yellow", access.summary) : colorize(theme, "green", access.summary)));
+  print(dim(theme, "  Usage: /yolo [on|off]"));
 }
 
 function cmdLookahead(state: GuruState, args: readonly string[]): void {
@@ -2608,28 +2787,37 @@ function cmdTools(state: GuruState): void {
     print(dim(theme, "No session."));
     return;
   }
+  const effectiveAccess = describeEffectiveAccess({
+    yolo: state.yolo,
+    mandate: state.mandate,
+    sessionApprovals: state.sessionApprovals
+  });
+  const cwd = state.session.repo?.repoRoot ?? process.cwd();
   print(paint.bold(paint.fg("fgBright", "Session tools")) + paint.fg("muted", `  (${state.session.tools.length} registered)`));
   const rows = state.session.tools.map((tool) => {
     const modelFacing = activeChatToolIds(state).has(tool.id);
-    const access = getToolAccessMode(tool.id, state.yolo);
+    const access = getToolAccessMode(tool.id, state.yolo, state.mandate, state.sessionApprovals, cwd);
     return [
       modelFacing ? paint.fg("accent2", GLYPHS.agent) : " ",
       tool.id,
-      access === "free" ? paint.fg("success", "free") : access === "yolo" ? badge(paint, "YOLO", "warning") : badge(paint, "ASK", "ghost"),
+      access === "free"
+        ? paint.fg("success", "free")
+        : access === "yolo"
+          ? badge(paint, "YOLO", "warning")
+          : access === "policy"
+            ? badge(paint, "POLICY", "success")
+            : access === "session"
+              ? badge(paint, "SESSION", "brand")
+              : access === "denied"
+                ? badge(paint, "DENY", "error")
+                : badge(paint, "ASK", "ghost"),
       paint.fg("fgFaint", tool.description.length > 60 ? `${tool.description.slice(0, 59)}…` : tool.description)
     ];
   });
   for (const line of renderTable(paint, [{ header: " " }, { header: "tool" }, { header: "access" }, { header: "description" }], rows)) {
     print(`  ${line}`);
   }
-  print(
-    paint.fg(
-      "fgFaint",
-      state.yolo
-        ? `  ${GLYPHS.agent} = offered to the model in chat turns · YOLO = ordinary local work runs directly; destructive, spend, and credential/auth edges still ask.`
-        : `  ${GLYPHS.agent} = offered to the model in chat turns · ASK = safe mode prompts for mutations (y/N/always).`
-    )
-  );
+  print(paint.fg("fgFaint", `  ${GLYPHS.agent} = offered to the model in chat turns · ${effectiveAccess.summary}`));
   const mcpStatuses = state.runtime.getSessionMcpStatuses(state.session.id);
   if (mcpStatuses.length > 0) {
     print("");
@@ -3925,13 +4113,14 @@ async function printLaunchBriefing(state: GuruState, baselineHealth: { readonly 
   const readiness = summarizeReadiness(mapRoutesToProviders(state.routes, { lastCheckedAt: new Date().toISOString(), env: process.env }));
   const cwd = state.session?.repo?.repoRoot ?? process.cwd();
   const registeredToolIds = new Set(state.sessionTools.map((tool) => tool.id));
+  const access = describeEffectiveAccess({ yolo: state.yolo, mandate: state.mandate, sessionApprovals: state.sessionApprovals });
 
   const hooks: BootRitualHooks = {
     kernelAssert: (): PhaseOutput => ({
       status: "ok",
       lines: [
         `I am guru harness ${info.version} · node ${process.versions.node}`,
-        `model: ${state.connectedRoute?.routeId ?? "none — /model to connect"} · access: ${state.yolo ? "YOLO (gates lifted)" : state.mandate.grants.length > 0 ? `${state.mandate.grants.length} standing mandate(s)` : "per-call approval"}`,
+        `model: ${state.connectedRoute?.routeId ?? "none — /model to connect"} · access: ${access.summary}`,
         `resolver: ${registeredToolIds.size > 0 ? "bound (never-stuck ready)" : "not bound"} · cwd: ${cwd}`
       ]
     }),
@@ -4762,7 +4951,7 @@ async function handleLine(state: GuruState, line: string, rl: { close(): void })
       break;
     case "/clear":
       process.stdout.write("\x1b[2J\x1b[H");
-      process.stdout.write(banner());
+      process.stdout.write(banner({ yolo: state.yolo, mandate: state.mandate, sessionApprovals: state.sessionApprovals }));
       break;
     case "/exit":
     case "/quit":
@@ -5229,7 +5418,14 @@ export async function runGuru(): Promise<void> {
       id: command.name,
       label: command.name,
       hint: command.description,
-      drillable: command.name === "/model" || command.name === "/models" || command.name === "/resume" || command.name === "/sessions"
+      drillable:
+        command.name === "/model" ||
+        command.name === "/models" ||
+        command.name === "/resume" ||
+        command.name === "/sessions" ||
+        command.name === "/status" ||
+        command.name === "/yolo" ||
+        command.name === "/mandate"
     }));
     // Prompt templates ride the / menu alongside built-in commands.
     const templates = state.promptTemplates
@@ -5238,6 +5434,13 @@ export async function runGuru(): Promise<void> {
     return [...commands, ...templates];
   };
   const drillItems = (parentId: string): MenuItem[] => {
+    if (parentId === "/status" || parentId === "/yolo" || parentId === "/mandate") {
+      return [...buildAccessDrillMenuItems(parentId, {
+        yolo: state.yolo,
+        mandate: state.mandate,
+        sessionApprovals: state.sessionApprovals
+      })];
+    }
     if (parentId === "/model" || parentId === "/models") {
       return buildModelDrillMenuItems(state.routes, { ...(state.connectedRoute ? { connectedRouteId: state.connectedRoute.routeId } : {}) });
     }
@@ -5257,7 +5460,6 @@ export async function runGuru(): Promise<void> {
   };
   const composerModeLabel = (): string => {
     const chips: string[] = [];
-    if (state.yolo) chips.push("YOLO");
     if (state.lookahead.enabled) chips.push("scout");
     if (state.activeRole) chips.push(state.activeRole.label);
     return chips.length > 0 ? `▸ ${chips.join(" · ")}` : "";

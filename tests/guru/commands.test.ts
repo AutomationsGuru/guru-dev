@@ -22,6 +22,35 @@ import {
 import { createDirectProviderCatalog } from "../../src/providers/catalog.js";
 import { isMemorySlashCommand } from "../../src/guru/memorySessionService.js";
 
+type EffectiveAccessDescription = {
+  readonly mode: "yolo" | "safe" | "policy";
+  readonly chip: string;
+  readonly summary: string;
+  readonly grantCount: number;
+  readonly grantsShadowed: boolean;
+};
+
+type DescribeEffectiveAccess = (input: {
+  readonly yolo: boolean;
+  readonly mandate: {
+    readonly grants: readonly {
+      readonly scope: "space" | "machine";
+      readonly path?: string;
+      readonly verbs: readonly string[];
+      readonly grantedAt: string;
+    }[];
+    readonly denies: readonly unknown[];
+  };
+  readonly sessionApprovals?: ReadonlySet<string>;
+}) => EffectiveAccessDescription;
+
+type FormatMandateOverview = (input: Parameters<DescribeEffectiveAccess>[0] & { readonly filePath: string }) => readonly string[];
+
+type BuildAccessDrillMenuItems = (
+  parentId: "/status" | "/yolo" | "/mandate",
+  input: Parameters<DescribeEffectiveAccess>[0]
+) => readonly { readonly id: string; readonly label: string; readonly hint?: string }[];
+
 describe("guru entrypoint detection", () => {
   const moduleEntry = "/repo/dist/guru.js";
 
@@ -75,10 +104,328 @@ describe("YOLO access presentation", () => {
     expect(getToolAccessMode("write", false)).toBe("approval");
   });
 
+  it("labels mutation tools as policy-controlled when saved grants are effective", () => {
+    const resolveMode = getToolAccessMode as unknown as (
+      toolId: string,
+      yolo: boolean,
+      mandate: Parameters<DescribeEffectiveAccess>[0]["mandate"],
+      sessionApprovals?: ReadonlySet<string>,
+      cwd?: string
+    ) => string;
+    expect(resolveMode("write", false, {
+      grants: [{ scope: "machine", verbs: ["read", "write", "exec"], grantedAt: "2026-07-14T16:01:58.903Z" }],
+      denies: []
+    })).toBe("policy");
+    expect(resolveMode("write", false, {
+      grants: [{ scope: "machine", verbs: ["read"], grantedAt: "2026-07-14T16:01:58.903Z" }],
+      denies: []
+    })).toBe("approval");
+    expect(resolveMode("write", false, { grants: [], denies: [] }, new Set(["write"]))).toBe("session");
+  });
+
+  describe("path-aware /tools access rows", () => {
+    const activeRepo = process.platform === "win32" ? "C:\\work\\project" : "/work/project";
+    const activeSpace = process.platform === "win32" ? "C:\\work" : "/work";
+    const otherRepo = process.platform === "win32" ? "C:\\other" : "/other";
+    const resolveMode = getToolAccessMode as unknown as (
+      toolId: string,
+      yolo: boolean,
+      mandate: Parameters<DescribeEffectiveAccess>[0]["mandate"],
+      sessionApprovals: ReadonlySet<string> | undefined,
+      cwd: string
+    ) => string;
+
+    it("renders ASK for a SPACE write grant outside the active repo", () => {
+      expect(resolveMode("write", false, {
+        grants: [{ scope: "space", path: otherRepo, verbs: ["write"], grantedAt: "t" }],
+        denies: []
+      }, undefined, activeRepo)).toBe("approval");
+    });
+
+    it("renders POLICY for a SPACE write grant covering the active repo", () => {
+      expect(resolveMode("write", false, {
+        grants: [{ scope: "space", path: activeSpace, verbs: ["write"], grantedAt: "t" }],
+        denies: []
+      }, undefined, activeRepo)).toBe("policy");
+    });
+
+    it("renders DENY when a scoped write deny covers the active repo under YOLO", () => {
+      expect(resolveMode("write", true, {
+        grants: [],
+        denies: [{ verb: "write", path: activeSpace }]
+      }, undefined, activeRepo)).toBe("denied");
+    });
+
+    it("renders DENY when a scoped write deny covers the active repo despite session approval", () => {
+      expect(resolveMode("write", false, {
+        grants: [],
+        denies: [{ verb: "write", path: activeSpace }]
+      }, new Set(["write"]), activeRepo)).toBe("denied");
+    });
+
+    it("does not treat a non-covering scoped deny as a global DENY", () => {
+      expect(resolveMode("write", true, {
+        grants: [],
+        denies: [{ verb: "write", path: otherRepo }]
+      }, undefined, activeRepo)).toBe("yolo");
+    });
+  });
+
   it("uses the spawn-time YOLO snapshot when present", () => {
     expect(resolveWorkerYolo({ yolo: true }, false)).toBe(true);
     expect(resolveWorkerYolo({ yolo: false }, true)).toBe(false);
     expect(resolveWorkerYolo(undefined, true)).toBe(true);
+  });
+
+  it("derives one truthful effective mode for YOLO, safe, and saved-policy states", async () => {
+    const module = (await import("../../src/guru.js")) as unknown as {
+      readonly describeEffectiveAccess?: DescribeEffectiveAccess;
+    };
+    expect(module.describeEffectiveAccess, "shared effective-access descriptor must be exported").toBeTypeOf("function");
+    if (!module.describeEffectiveAccess) return;
+
+    const grant = {
+      scope: "machine" as const,
+      verbs: ["read", "write", "exec"],
+      grantedAt: "2026-07-14T16:01:58.903Z"
+    };
+    const empty = { grants: [], denies: [] } as const;
+    const saved = { grants: [grant], denies: [] } as const;
+
+    const yolo = module.describeEffectiveAccess({ yolo: true, mandate: saved });
+    expect(yolo).toMatchObject({ mode: "yolo", chip: "⚡YOLO", grantCount: 1, grantsShadowed: true });
+    expect(yolo.summary).toMatch(/ordinary machine read\/write\/exec.*direct/iu);
+    expect(yolo.summary).toMatch(/saved grant.*shadowed/iu);
+
+    const safe = module.describeEffectiveAccess({ yolo: false, mandate: empty });
+    expect(safe).toMatchObject({ mode: "safe", chip: "SAFE", grantCount: 0, grantsShadowed: false });
+    expect(safe.summary).toMatch(/no saved grants.*per-call approval/iu);
+
+    const policy = module.describeEffectiveAccess({ yolo: false, mandate: saved });
+    expect(policy).toMatchObject({ mode: "policy", chip: "POLICY:1", grantCount: 1, grantsShadowed: false });
+    expect(policy.summary).toMatch(/machine read\+write\+exec.*direct/iu);
+    expect(policy.summary).toMatch(/uncovered.*per-call approval/iu);
+
+    for (const description of [yolo, safe, policy]) {
+      expect(description.summary).toMatch(/denies.*destructive.*spend.*secret.*auth.*bind/iu);
+    }
+  });
+
+  it("never describes denied or hard-edge persisted verbs as direct", async () => {
+    const module = (await import("../../src/guru.js")) as unknown as {
+      readonly describeEffectiveAccess?: DescribeEffectiveAccess;
+    };
+    expect(module.describeEffectiveAccess).toBeTypeOf("function");
+    if (!module.describeEffectiveAccess) return;
+
+    const hardEdges = module.describeEffectiveAccess({
+      yolo: false,
+      mandate: {
+        grants: [{ scope: "machine", verbs: ["destructive", "spend"], grantedAt: "2026-07-14T16:01:58.903Z" }],
+        denies: []
+      }
+    });
+    expect(hardEdges.summary).not.toMatch(/(?:destructive|spend).*remain direct/iu);
+    expect(hardEdges.summary).toMatch(/no direct ordinary verbs/iu);
+    expect(hardEdges.summary).toMatch(/destructive.*spend.*bind/iu);
+
+    const denyWins = module.describeEffectiveAccess({
+      yolo: false,
+      mandate: {
+        grants: [{ scope: "machine", verbs: ["read", "write"], grantedAt: "2026-07-14T16:01:58.903Z" }],
+        denies: [{ verb: "write" }]
+      }
+    });
+    expect(denyWins.summary).toMatch(/machine read.*direct/iu);
+    expect(denyWins.summary).not.toMatch(/read\+write.*direct/iu);
+
+    const scopedDeny = module.describeEffectiveAccess({
+      yolo: false,
+      mandate: {
+        grants: [{ scope: "machine", verbs: ["read"], grantedAt: "2026-07-14T16:01:58.903Z" }],
+        denies: [{ verb: "read", path: "/restricted" }]
+      }
+    });
+    expect(scopedDeny.summary).toMatch(/machine read.*direct where no scoped deny applies/iu);
+
+    const deniedSessionApproval = module.describeEffectiveAccess({
+      yolo: false,
+      mandate: { grants: [], denies: [{ verb: "write" }] },
+      sessionApprovals: new Set(["write"])
+    });
+    expect(deniedSessionApproval.summary).not.toMatch(/session-approved write.*direct/iu);
+  });
+
+  it("renders a state-aware banner after /clear instead of re-announcing YOLO", async () => {
+    const module = (await import("../../src/guru.js")) as unknown as {
+      readonly banner?: (input?: Parameters<DescribeEffectiveAccess>[0]) => string;
+    };
+    expect(module.banner, "the clearable banner must accept live access state").toBeTypeOf("function");
+    if (!module.banner) return;
+
+    const output = module.banner({ yolo: false, mandate: { grants: [], denies: [] } });
+    expect(output).toContain("SAFE");
+    expect(output).toMatch(/per-call approval/iu);
+    expect(output).not.toMatch(/YOLO.*default|never pauses/iu);
+  });
+
+  it("always explains persisted mandates, timestamps, shadowing, storage, and examples", async () => {
+    const module = (await import("../../src/guru.js")) as unknown as {
+      readonly formatMandateOverview?: FormatMandateOverview;
+    };
+    expect(module.formatMandateOverview, "bare /mandate formatter must be exported").toBeTypeOf("function");
+    if (!module.formatMandateOverview) return;
+
+    const lines = module.formatMandateOverview({
+      yolo: true,
+      mandate: {
+        grants: [{ scope: "space", path: "/work/project", verbs: ["read", "write", "exec"], grantedAt: "2026-07-14T16:01:58.903Z" }],
+        denies: []
+      },
+      filePath: "/home/test/.guruharness/mandates.json"
+    });
+    const output = lines.join("\n");
+
+    expect(output).toMatch(/persistent.*advanced policy.*safe mode/iu);
+    expect(output).toContain("/home/test/.guruharness/mandates.json");
+    expect(output).toContain("space /work/project");
+    expect(output).toContain("read+write+exec");
+    expect(output).toContain("2026-07-14T16:01:58.903Z");
+    expect(output).toMatch(/shadowed by YOLO/iu);
+    expect(output).toContain("/mandate grant space work");
+    expect(output).toContain("/mandate grant machine work");
+    expect(output).toContain("/mandate revoke");
+  });
+
+  describe("bare /mandate deny truth", () => {
+    it("enumerates deny-only policy and says matching denies remain binding under YOLO", async () => {
+      const module = (await import("../../src/guru.js")) as unknown as {
+        readonly formatMandateOverview?: FormatMandateOverview;
+      };
+      expect(module.formatMandateOverview).toBeTypeOf("function");
+      if (!module.formatMandateOverview) return;
+
+      const output = module.formatMandateOverview({
+        yolo: true,
+        mandate: {
+          grants: [],
+          denies: [{ verb: "write", path: "/work/project", note: "protect generated data" }]
+        },
+        filePath: "/home/test/.guruharness/mandates.json"
+      }).join("\n");
+
+      expect(output).toContain("Saved denies:");
+      expect(output).toMatch(/write.*\/work\/project.*protect generated data/iu);
+      expect(output).toMatch(/YOLO.*shadows.*grants only/iu);
+      expect(output).toMatch(/matching denies.*remain binding/iu);
+      expect(output).toMatch(/\/mandate revoke.*(?:clear|remove).*saved grants and denies/iu);
+    });
+
+    it("distinguishes saved grants from saved denies in a mixed policy", async () => {
+      const module = (await import("../../src/guru.js")) as unknown as {
+        readonly formatMandateOverview?: FormatMandateOverview;
+      };
+      expect(module.formatMandateOverview).toBeTypeOf("function");
+      if (!module.formatMandateOverview) return;
+
+      const output = module.formatMandateOverview({
+        yolo: false,
+        mandate: {
+          grants: [{
+            scope: "space",
+            path: "/work/project",
+            verbs: ["read", "write"],
+            grantedAt: "2026-07-14T18:20:00.000Z"
+          }],
+          denies: [{ verb: "write", path: "/work/project/secrets", note: "keep secrets manual" }]
+        },
+        filePath: "/home/test/.guruharness/mandates.json"
+      }).join("\n");
+
+      expect(output).toMatch(/Saved grants:[\s\S]*space \/work\/project read\+write/iu);
+      expect(output).toMatch(/Saved denies:[\s\S]*write.*\/work\/project\/secrets.*keep secrets manual/iu);
+    });
+
+    it("offers a deny-only revoke action that truthfully clears grants and denies", async () => {
+      const module = (await import("../../src/guru.js")) as unknown as {
+        readonly buildAccessDrillMenuItems?: BuildAccessDrillMenuItems;
+      };
+      expect(module.buildAccessDrillMenuItems).toBeTypeOf("function");
+      if (!module.buildAccessDrillMenuItems) return;
+
+      const items = module.buildAccessDrillMenuItems("/mandate", {
+        yolo: true,
+        mandate: {
+          grants: [],
+          denies: [{ verb: "write", path: "/work/project", note: "protect generated data" }]
+        }
+      });
+      const revoke = items.find((item) => item.id === "/mandate revoke");
+
+      expect(revoke).toBeDefined();
+      expect(`${revoke?.label ?? ""} ${revoke?.hint ?? ""}`).toMatch(
+        /(?:clear|remove|revoke).*saved grants and denies/iu
+      );
+    });
+  });
+
+  it("uses the shared effective-access summary in executable slash drilldowns", async () => {
+    const module = (await import("../../src/guru.js")) as unknown as {
+      readonly describeEffectiveAccess?: DescribeEffectiveAccess;
+      readonly buildAccessDrillMenuItems?: BuildAccessDrillMenuItems;
+    };
+    expect(module.describeEffectiveAccess).toBeTypeOf("function");
+    expect(module.buildAccessDrillMenuItems).toBeTypeOf("function");
+    if (!module.describeEffectiveAccess || !module.buildAccessDrillMenuItems) return;
+
+    const input = {
+      yolo: true,
+      mandate: {
+        grants: [{ scope: "machine" as const, verbs: ["read", "write", "exec"], grantedAt: "2026-07-14T16:01:58.903Z" }],
+        denies: []
+      }
+    };
+    const summary = module.describeEffectiveAccess(input).summary;
+
+    for (const parent of ["/status", "/yolo", "/mandate"] as const) {
+      const items = module.buildAccessDrillMenuItems(parent, input);
+      expect(items[0]?.hint).toBe(summary);
+      expect(items.every((item) => item.id.startsWith("/"))).toBe(true);
+    }
+
+    const yoloItems = module.buildAccessDrillMenuItems("/mandate", input);
+    const revokedYoloSummary = module.describeEffectiveAccess({ yolo: true, mandate: { grants: [], denies: [] } }).summary;
+    expect(yoloItems.find((item) => item.id === "/mandate revoke")?.hint).toBe(revokedYoloSummary);
+
+    const noGrantItems = module.buildAccessDrillMenuItems("/yolo", {
+      yolo: true,
+      mandate: { grants: [], denies: [] }
+    });
+    expect(noGrantItems.find((item) => item.id === "/yolo off")?.hint).toMatch(/per-call approval/iu);
+    expect(noGrantItems.find((item) => item.id === "/yolo off")?.hint).not.toMatch(/saved policy/iu);
+
+    const hardEdgeGrant = {
+      yolo: true,
+      mandate: {
+        grants: [{ scope: "machine" as const, verbs: ["destructive"], grantedAt: "2026-07-14T16:01:58.903Z" }],
+        denies: []
+      }
+    };
+    const hardEdgeOff = module.buildAccessDrillMenuItems("/yolo", hardEdgeGrant);
+    expect(hardEdgeOff.find((item) => item.id === "/yolo off")?.hint).toMatch(/no direct ordinary verbs/iu);
+
+    const yoloOn = module.buildAccessDrillMenuItems("/yolo", { ...input, yolo: false });
+    expect(yoloOn.find((item) => item.id === "/yolo on")?.hint).toMatch(/saved grant.*shadowed/iu);
+
+    const revokeWithSessionApproval = module.buildAccessDrillMenuItems("/mandate", {
+      yolo: false,
+      mandate: {
+        grants: input.mandate.grants,
+        denies: [{ verb: "exec" }]
+      },
+      sessionApprovals: new Set(["exec"])
+    });
+    expect(revokeWithSessionApproval.find((item) => item.id === "/mandate revoke")?.hint).toMatch(/session-approved exec.*direct/iu);
   });
 });
 
@@ -208,6 +555,17 @@ describe("SLASH_COMMANDS", () => {
     }
     // /allow-writes was retired in v0.22 — per-call approval replaced the binary.
     expect(names).not.toContain("/allow-writes");
+  });
+
+  it("describes status, YOLO, and mandates as one effective-access surface", () => {
+    for (const name of ["/status", "/yolo", "/mandate"] as const) {
+      expect(SLASH_COMMANDS.find((command) => command.name === name)?.description).toMatch(/effective access/iu);
+    }
+  });
+
+  it("describes /mandate as inclusive persistent policy", () => {
+    const description = SLASH_COMMANDS.find((command) => command.name === "/mandate")?.description ?? "";
+    expect(description).toMatch(/persistent.*(?:policy|grants?.*denies?)/iu);
   });
 });
 
