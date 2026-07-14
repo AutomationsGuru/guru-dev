@@ -20,6 +20,9 @@ All notable changes to GuruHarness are documented here.
 
 ### Changed
 
+- **Linux-first paired-build contracts:** Codex01 owns platform-neutral construction;
+  Windows owns quality coordination, candidate identity, and Windows validation;
+  code-review exchange path and package-install wave rules are explicit.
 - **Release line lock:** repository hygiene and the release publish workflow now
   fail if `package.json` leaves the `1.5.x` dogfood line.
 
