@@ -10,7 +10,7 @@
 **Windows counterpart:** Matthew daily-drives `guru` on Windows; Windows owns Windows-specific fixes and Windows acceptance.
 **Goal:** Make Codex01 the primary **implementation + build + test + deep debug** machine for GuruHarness, using its workers, sub-agents, and other harnesses where useful.
 
-Read this first, then `README.md`, then the code map below. Do **not** invent a second remote history.
+Read this first, then `README.md` (this planning index), `../README.md` (product), then the code map below. Active PR reviews: `../../handoffs/code-reviews/INDEX.md`. Do **not** invent a second remote history.
 
 ---
 

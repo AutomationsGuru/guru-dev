@@ -1,29 +1,24 @@
 > **Note (2026-07-10):** CodeRabbit is retired from GuruHarness. Review is peer-agent + native critic panel + CI only. Historical mentions of CodeRabbit below are archival.
 
-Facts confirmed. The executor builds both runtimes without `mandatePolicy`, `nativeReviewer` is only forwarded (never constructed), review degrades to YELLOW-by-absence, `SelfBuildConfigSchema` is `.strict()` with two fields, and spend detection is bash-string-only. Here is the plan.
+> **Superseded (2026-07-15, doc-control):** P7 **`runDevCycle`** and **`guru self-build-run`** ship in `src/selfbuild/`. Current spine: `SELF-BUILD-DEVELOPER-LOOP.md` (§P7). Open defects: `SELF-BUILD-LOOP-HARDENING.md`. Live doc-vs-built gaps: `../../gaps/README.md`. The body below is a pre-P7 snapshot — do not use for builder routing.
 
-## HERE (current state)
+## Builder routing (v1.5.x — doc-control pass-359)
 
-The self-build **organs exist but the running loop is a single-shot pipeline**. `runSelfBuildExecutor` (`src/executor/selfBuildExecutor.ts:115`) is what actually runs from all three surfaces (`cli.ts:197`, `surfaces/api.ts:500`, `surfaces/tui.ts:44`). Per invocation it runs one task, linearly and fail-closed: start/resume session → `collectRunSafetyBlockers` (dirty-workspace/risky-path/secret static scan) → resolve planner candidates → `runPlannerWithRetries` (provider retry/fallback only) → `runReviewGates` over **static `config.validationCommands`** → optional `runGitPrAutomation` (gated on `options.git.enabled` + `approvalPolicy.autoCommitPushPr`, dry-run by default) → done packet. The first RED stage early-returns; there is no continuation.
+Use **`SELF-BUILD-DEVELOPER-LOOP.md`** (§Phases / P7), **`SELF-BUILD-LOOP-HARDENING.md`**, and **`../../gaps/README.md`** — not the historical sections below. Residual holes called out in DEVELOPER-LOOP “Current state” (e.g. G8 API/TUI mandate, G52 persistence).
 
-Verified against code:
-- **No `runDevCycle`** anywhere in `src/` (only in `planning/SELF-BUILD-DEVELOPER-LOOP.md`). The 0→7 state machine does not exist.
-- **The executor builds BOTH its runtimes with no `mandatePolicy`** (`selfBuildExecutor.ts:125-129` main, `:469-474` planner). Enforcement in `runtime/session.ts:151/193` and `planner/runtime.ts:89` is guarded by `if (mandatePolicy)`, so the spend/destructive/secret/auth hard-edge **never fires on the executor path** — even the API `/run` path drops the policy (`defaultRun` never forwards a runtime; the executor takes no runtime param).
-- **Review degrades to YELLOW-by-absence.** `makeNativeReviewer` (`src/review/nativeCriticPanel.ts:189`) has zero production callers; `gates.ts` routes native gates to `nativeGateUnavailable()` → YELLOW when none is injected (confirmed at `gates.ts:99-104`). YELLOW never blocks ship.
-- **TEST/SMOKE modules are orphaned.** `discoverGates` and `runSmokeStage` (`src/selfbuild/*`) are imported only by their own tests; the executor never calls them.
-- **No DEBUG, no scoreTask, no LEARN write-back, no local-only SHIP fallback.** `runSelfBuildLoop` (`kernel/selfBuildLoop.ts:402`) is the only multi-task engine and has zero non-test callers. The flywheel/resolver/gap-records are fully built but wired only into the `guru.ts` REPL — disjoint from the executor.
-- **`SelfBuildConfigSchema` is `.strict()`** with exactly `{maxIterations, completedTaskIds}` (`config/schema.ts:64-69`) — no budget/repair/spend knobs; adding any requires a schema change.
-- **Spend is bash-string-only** (`SPEND_PATTERNS`, `evaluate.ts:87-97`) — a paid net call or paid-tool attach is invisible; no host-allowlist classifier, no `SpendBudget`, no persisted approval ledger.
+## Historical snapshot (pre-P7 — provenance only)
 
-## THERE (definition of done)
+> Obsolete claims (no `runDevCycle`, orphaned TEST/SMOKE, etc.) are **false at 1.5.x** — gap **G163**. Kept for audit trail; do not route builders here.
+
+## THERE (definition of done — target, partially met on dev-cycle path)
 
 An **unattended** `runDevCycle` orchestrator that WRAPS (not replaces) `runSelfBuildExecutor` and drives one task end-to-end through **SELECT → BUILD → TEST(discovered) → SMOKE(self-call) → DEBUG(bounded repair) → SELF-REVIEW(live native panel) → SHIP(git-if-present, else on-disk change-record) → LEARN(one validated fact)**, on nothing but guru + one model key, with git/gh/CodeRabbit all absent. Every action routes through a single mandate choke point whose spend hard-edge YOLO cannot lift; the loop and all nested guru-calls are bound by an attempt cap **and** a token/$ budget with a `$0`-denies-all `SpendBudget`, VETO/STEER/BATCH/KILL levers + an escalation circuit-breaker; every mutation ships a done packet carrying validation + native-review evidence + a **persisted approval ledger that survives a restart**. Acceptance = the 8 stages run unattended + a spend verb hard-stops even in YOLO + the ledger survives restart.
 
 ## Definition of done met?
 
-**No.** The developer loop is not complete: the running executor is a single-shot pipeline, the 0→7 orchestrator does not exist, and the built organs (TEST/SMOKE/native-review/DEBUG/LEARN) are not wired into it. Worse, the one un-liftable guarantee — SPEND is the hard gate — is **false on the exact path an autonomous run takes**. Remaining blocking gaps:
+> **Status (pass-359):** **Partial** on `guru self-build-run` / `runDevCycle`; **not** on bare `guru run` / API `/run` / TUI `run`. See DEVELOPER-LOOP §P7 and `gaps/README.md`. Historical “not met” bullets below are pre-P7.
 
-- **P7 `runDevCycle` orchestrator does not exist** — no 0→7 state machine, no `guru self-build --run` surface, no whole-cycle `--dry-run` no-op preview, no per-stage 0→7 events, no cross-task resume.
+- **P7 `runDevCycle` orchestrator does not exist** _(obsolete — shipped; see DEVELOPER-LOOP)_ — no 0→7 state machine, no `guru self-build --run` surface, no whole-cycle `--dry-run` no-op preview, no per-stage 0→7 events, no cross-task resume.
 - **Mandate/spend hard-edge is not injected into the executor runtime** — both `createHarnessRuntime` calls omit `mandatePolicy`; no surface (CLI, TUI, or API `/run`) supplies one, so an autonomous run has no per-tool spend gate.
 - **No `SpendBudget` / token / wall-clock budget** bounding the loop or nested guru-calls; bounding is integer attempt/step counts only.
 - **No host-allowlist net-spend classifier** and **paid-tool attach carries no `spend` verb** (`resolve_capability_gap` → `[]`).

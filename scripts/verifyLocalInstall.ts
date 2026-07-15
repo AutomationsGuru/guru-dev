@@ -1,3 +1,4 @@
+/** Dev handoff gate: after `npm run dev:sync`, confirms global `guru` resolves to this checkout (see `package.json` `dev:sync`). */
 import { execSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";

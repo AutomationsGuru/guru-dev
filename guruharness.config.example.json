@@ -27,7 +27,7 @@
     "required": true
   },
   "approvalPolicy": {
-    "autoCommitPushPr": true,
+    "autoCommitPushPr": false,
     "allowLocalMerge": false,
     "allowForcePush": false
   },

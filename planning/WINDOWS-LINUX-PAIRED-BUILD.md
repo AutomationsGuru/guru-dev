@@ -5,6 +5,8 @@ the Codex01 Linux-first build lane. An implementation wave does not begin until
 its clean base can be identified exactly; a validation wave does not begin
 until its clean candidate can be reproduced on both machines.
 
+**Exchange folder:** `../../handoffs/code-reviews/` (see `INDEX.md` for the active PR chain).
+
 ## Wave packet
 
 Every wave delegation must contain:

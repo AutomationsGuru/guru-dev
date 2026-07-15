@@ -20,6 +20,9 @@ All notable changes to GuruHarness are documented here.
 
 ### Changed
 
+- **Merged PR #37 (2026-07-15):** access-UX (U1–U4), memory/home/Honcho UX, path `/tools`, mandate-deny honesty — integrated on `guru-dev/main` @ `6c826c6` (product ancestry `49a1a871`; record `../handoffs/code-reviews/2026-07-15T0444Z-pr37-merged-integrated.md`). Not a npm release; stay on **1.5.x**. Residuals B5–B7 non-blocking.
+- **Workspace documentation:** ongoing **doc-control** + **gap-review** + **harness-matrix** schedulers (`handoffs/doc-control/STATE.md`, `../gaps/README.md` indexed pass **69**, `../handoffs/harness-matrix/README.md` pass **03**; code-review idle `0830Z`) — README/AGENTS/planning cross-links only; no runtime behavior change.
+- **Config template:** `guruharness.config.example.json` recommends `approvalPolicy.autoCommitPushPr: false` (gap **G253**); shipped repo `guruharness.config.json` unchanged until builder lane.
 - **Linux-first paired-build contracts:** Codex01 owns platform-neutral construction;
   Windows owns quality coordination, candidate identity, and Windows validation;
   code-review exchange path and package-install wave rules are explicit.

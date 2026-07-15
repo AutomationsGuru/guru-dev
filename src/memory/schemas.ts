@@ -4,10 +4,12 @@ import { z } from "zod";
  * Guru memory organ — file-based L1 (Foundation Wave PR 2, 2026-07-04).
  *
  * One fact per markdown file with minimal Obsidian-standard frontmatter, plus a
- * DERIVED MEMORY.md index injected into the system prompt at boot. Design doc:
- * handoffs/guru-memory-design.md. The record shape is deliberately field-compatible
- * with the operational store inputs and the Honcho remember contract so the L2
- * (SQL) and L3 (Honcho) layers become a replay, not a redesign.
+ * DERIVED MEMORY.md index injected into the system prompt at boot. Design archive:
+ * `../../../archive/handoffs-history/vision-corpus/guru-memory-design.md`
+ * (role path: `~/.guruharness/roles/<slug>/memory` per ADR 2026-07-05-memory-scopes).
+ * Record shape matches operational-store inputs and Honcho remember — L2 Postgres
+ * (`provider.ts`) and L3 Honcho (`honcho/`, `syncOnTurn`) replay the same fields;
+ * cross-layer `syncUp` writer is not shipped yet (see `../../gaps/README.md` G21).
  */
 
 /** Slug = filename base = [[link]] key (same regex family as operational slugs). */

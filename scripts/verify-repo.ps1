@@ -1,3 +1,4 @@
+# Repo hygiene gate (CI + local): typecheck, build, test, 1.5.x version lock — mirror of README Development / release workflow.
 $ErrorActionPreference = "Stop"
 
 function Fail {

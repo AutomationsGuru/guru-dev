@@ -33,7 +33,8 @@ export type { MemoryFactEntry } from "./policy.js";
  *
  * Guarantees: atomic writes (tmp+rename), dedupe-before-save, secret-scrub gate
  * on every write (detectPotentialSecrets — blockers carry KINDS, never values),
- * safeParse-skip-corrupt reads, size caps, 30-day trash GC.
+ * safeParse-skip-corrupt reads, size caps, 30-day trash GC. Multi-scope roots:
+ * `scopes.ts`. Optional L2: `provider.ts`. Boot block: `inject.ts`.
  */
 
 const DEFAULT_SUBDIR = join(".guruharness", "memory");
