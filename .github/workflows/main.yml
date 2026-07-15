@@ -1,0 +1,35 @@
+stale-management:
+  name: Close stale issues and PRs
+  runs-on: ubuntu-latest
+  permissions:
+    issues: write
+    pull-requests: write
+  steps:
+    - uses: actions/stale@v10.4.0
+      with:
+        # Issues: close after 90 days of inactivity
+        days-before-issue-stale: 90
+        days-before-issue-close: 14
+        stale-issue-message: |
+          This issue hasn't been updated in 90 days. Closing due to inactivity.
+          Please reopen if still relevant.
+        close-issue-reason: not_planned
+        
+        # Pull requests: close after 30 days (higher velocity signal)
+        days-before-pr-stale: 30
+        days-before-pr-close: 7
+        stale-pr-message: |
+          This PR hasn't been updated in 30 days. Closing due to inactivity.
+          Feel free to reopen.
+        
+        # Exempt in-progress work
+        exempt-issue-labels: bug,in-progress,blocked
+        exempt-pr-labels: in-progress,blocked
+        
+        # Remove stale label if activity resumes
+        remove-stale-when-updated: true
+        remove-issue-stale-when-updated: true
+        remove-pr-stale-when-updated: true
+        
+        # Don't touch draft PRs
+        exempt-draft-pr: true
