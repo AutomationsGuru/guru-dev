@@ -1,8 +1,6 @@
 - name: Close Stale Issues
   uses: actions/stale@v10.4.0
   with:
-    # Token for the repository. Can be passed in using `{{ secrets.GITHUB_TOKEN }}`.
-    repo-token: # optional, default is ${{ github.token }}
     # The message to post on the issue when tagging it. If none provided, will not mark issues stale.
     stale-issue-message: # optional
     # The message to post on the pull request when tagging it. If none provided, will not mark pull requests stale.
