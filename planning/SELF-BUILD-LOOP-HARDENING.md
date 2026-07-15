@@ -1,6 +1,8 @@
 > **Note (2026-07-10):** CodeRabbit is retired from GuruHarness. Review is peer-agent + native critic panel + CI only. Historical mentions of CodeRabbit below are archival.
 
-CONFIRMED 23 | PLAUSIBLE 3 | REFUTED 5
+> **Reconciled (doc-control pass-374, v1.5.x P7):** Adversarial audit snapshot — body retained for provenance. **Closed in `main/`:** **[1]** commit exit (`gitDelivery.ts`); **[2]** empty queue → YELLOW (`runDevCycle` `!reachedWork`); **[4]/[6]** mandate before live `git push` when policy set; **[7]** REVIEW `timeoutMs` 120s (`askModelAdapter`); **[8]** gate default timeout (`gates.ts`); **[10]** `makeGatedGitDelivery` on SHIP; **[11]** LEARN `softVerdict`; **[13]** `self-build-run --loop`; **[14]** SHIP `overallVerdict` roll-up; **[16]** CLI SMOKE default self-call (`smokeDeps` / `defaultSmokeSelfCall` — gap **G241**; optional model `driveTurn` inject only). **Still open:** **[3]** token budget drawdown; **[5]** live-git config posture; **[9]** wall-clock during in-flight stage; **[12]** CLI `recordFact` / `outcomeStore` (G52); **[15]** dry-run plan flags (G121); **[17–18]** tests/ledger seams. Index: `../../gaps/README.md` (G118).
+
+CONFIRMED 23 | PLAUSIBLE 3 | REFUTED 5 _(header stale — see reconciliation banner)_
 
 ### [1] HIGH — src/selfbuild/gitDelivery.ts (correctness)
 TITLE: git commit exit code ignored in makeGatedGitDelivery → false GREEN ship when no commit was created

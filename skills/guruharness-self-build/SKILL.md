@@ -14,8 +14,8 @@ Use this skill when executing a GuruHarness self-build task from `npm run cli --
 2. Keep the change small, schema-first, and test-backed.
 3. Update docs/decisions when future behavior changes.
 4. Run validation commands from `guruharness.config.json`.
-5. Peer agent code review (or native critic panel) before claiming GREEN — **no CodeRabbit**.
-6. Commit, push, open a PR, wait for CI (`repo-hygiene` + CodeQL), merge, clean up the branch.
+5. Peer agent code review (or native critic panel) before claiming GREEN — **no CodeRabbit** (see `../../planning/SELF-BUILD-DEVELOPER-LOOP.md`).
+6. **Workspace builder lanes:** local edits + evidence in `../../handoffs/code-reviews/` only — no commit/push/PR (reviewer lane publishes). **Release owner** commits, pushes, opens PR, waits for CI (`repo-hygiene` + CodeQL), merges.
 
 ## Guardrails
 

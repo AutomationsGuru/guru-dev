@@ -1,3 +1,8 @@
+/**
+ * Memory fact store providers — Markdown L1 (`FileMemoryStore`) and optional Postgres L2.
+ * Selected by `guruharness.config.json` → `memory.storage` (`createConfiguredMemoryStore`).
+ * Garage/operational state stays out of this contract (see `../garage/`).
+ */
 import { Pool } from "pg";
 
 import type { MemoryPostgresConfig, MemoryStorageConfig } from "../config/schema.js";

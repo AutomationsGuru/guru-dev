@@ -1,3 +1,9 @@
+/**
+ * Memory write/read policy — preflight for `memory_remember`, term-overlap search,
+ * and `memory_get` assembly. Every persist path runs `detectPotentialSecrets` /
+ * `containsSecretValue` (presence-over-value). Wired by `store.ts`, `provider.ts`,
+ * and `tools.ts`; scopes choose the backing directory via `scopes.ts`.
+ */
 import { detectPotentialSecrets } from "../safety/policyGuard.js";
 import { containsSecretValue } from "../safety/secretSafety.js";
 import { extractLinks } from "./frontmatter.js";

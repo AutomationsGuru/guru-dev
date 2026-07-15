@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+/** `npm run dogfood:portfolio` — multi-repo dogfood orchestrator smoke (`src/dogfood/`). */
 
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";

@@ -3,7 +3,7 @@
 [![CI](https://github.com/AutomationsGuru/guru-dev/actions/workflows/ci.yml/badge.svg)](https://github.com/AutomationsGuru/guru-dev/actions/workflows/ci.yml)
 ![guru harness](https://img.shields.io/badge/guru%20harness-AI%20agent%20harness-8C11E1?labelColor=1A1130&style=flat-square)
 ![node](https://img.shields.io/badge/node-%E2%89%A522-B56EF1?labelColor=1A1130&style=flat-square)
-![tests](https://img.shields.io/badge/tests-1400%20passing-31C48D?labelColor=1A1130&style=flat-square)
+![tests](https://img.shields.io/badge/tests-1480%20passing-31C48D?labelColor=1A1130&style=flat-square)
 ![package](https://img.shields.io/badge/package-v1.5.0-E958BE?labelColor=1A1130&style=flat-square)
 ![maturity](https://img.shields.io/badge/maturity-dogfood-F59E0B?labelColor=1A1130&style=flat-square)
 ![license](https://img.shields.io/badge/license-MIT-31C48D?labelColor=1A1130&style=flat-square)
@@ -201,7 +201,7 @@ PostgreSQL is the canonical fact store for this first database-backed release an
 | Session tree (`/tree` `/fork` `/clone`) | Append-only JSONL DAG (`id`/`parentId`, `schemaVersion`, audit markers); lossless stream — a fork/clone keeps every line of both branches alive; crash-resume by deterministic replay; branch summaries via the compaction summarizer; legacy flat-JSON sessions still load |
 | Terminal Design System | Operator-owned truecolor theme (`~/.guruharness/theme.json`), 256/16/`NO_COLOR` fallbacks, full-width splash, pinned composer + status bar |
 | Direct-first routing | Plan/OAuth routes never touch a router; an external routing sidecar is optional, not embedded |
-| Self-build developer loop (`guru self-build-run`, v1.2.0) | The 0→7 **unattended** dev cycle SELECT→BUILD→TEST→SMOKE→DEBUG→REVIEW→SHIP→LEARN, spend-gated: the mandate/spend policy is injected into the executor runtime (spend/destructive escalate **even in YOLO**); TEST runs the project's **own discovered gates** (never assumed); DEBUG parses gate output → re-plans, budget-bounded; REVIEW is guru's **live native critic panel** (RED blocks ship); SHIP routes the push through the gate and degrades to a durable on-disk change-record when git is absent; SELECT scoring + LEARN write-back close the loop; an **approval ledger survives restart**. `--dry-run` previews the stage plan (executes nothing); a multi-cycle driver runs it across tasks. Every model loop is bounded by an attempt cap **and** a token budget **and** wall-clock, with a `$0`-denies-all spend ceiling. |
+| Self-build developer loop (`guru self-build-run`, v1.2.0) | The 0→7 spend-gated dev cycle SELECT→BUILD→TEST→SMOKE→DEBUG→REVIEW→SHIP→LEARN: mandate/spend policy is injected into the executor runtime (spend/destructive escalate **even in YOLO**); TEST runs the project's **own discovered gates** (never assumed); DEBUG parses gate output → re-plans, budget-bounded; REVIEW is guru's **live native critic panel** (RED blocks ship); SHIP routes the push through the gate and degrades to a durable on-disk change-record when git is absent; SELECT scoring + LEARN write-back close the loop (cross-run outcome persistence pending — `planning/SELF-BUILD-LOOP-HARDENING.md`); **`approvalLedger`** can record mandate decisions and persist to disk when wired into `runDevCycle` (default CLI path pending). `--dry-run` previews the stage plan (executes nothing); `--loop` drives multiple tasks in one process. Every model loop is bounded by attempt cap, token budget, wall-clock, and a `$0`-denies-all spend ceiling. |
 
 ## The plan (where this is going)
 
@@ -215,7 +215,7 @@ Explicitly **out of scope**, by design: an external routing sidecar in the loop 
 
 ## Theme
 
-The look is operator-owned: drop hex tokens into `~/.guruharness/theme.json` (see `assets/default-theme.json` for the schema). Truecolor first, honest fallbacks, `NO_COLOR` respected everywhere. Brand palette deliberately avoids stock terminal green/yellow/blue/cyan.
+The look is operator-owned: drop hex tokens into `~/.guruharness/theme.json` (see `assets/default-theme.json` for the schema). Truecolor first, honest fallbacks, `NO_COLOR` respected everywhere. Brand palette deliberately avoids stock terminal green/yellow/blue/cyan. Workspace design reference: [`../terminal-design-system/README.md`](../terminal-design-system/README.md).
 
 ## Development
 
@@ -226,7 +226,7 @@ pwsh -NoProfile -File scripts/verify-repo.ps1      # repo hygiene gate (powershe
 node scripts/render-readme-shots.mjs               # regenerate the README screenshots from the real renderer
 ```
 
-- Design records, the finished-product definition, and the requirements/gap research are kept outside the runtime package (they are not needed to build or run guru).
+- Design records and coordination docs live in the workspace `archive/` tree and `../handoffs/` — workspace hub [`../README.md`](../README.md); see `planning/README.md`, `../handoffs/README.md`, [doc-control loop](../handoffs/DOCUMENT-CONTROL-LOOP.md) (`../handoffs/doc-control/README.md` · `../handoffs/doc-control/STATE.md`). Doc-vs-built gap index: [`../gaps/README.md`](../gaps/README.md) (scheduler `019f6329792d`; indexed pass **69**). Harness cross-compare matrix: [`../handoffs/harness-matrix/README.md`](../handoffs/harness-matrix/README.md) (pass **03**). Shipped skills: `skills/README.md`. Tests: `tests/README.md`. Review handoffs: `../handoffs/code-reviews/INDEX.md` (PR #37 **merged** · `0444Z` integrated; no open product PRs).
 - Dependabot watches Actions/npm weekly; its PRs may auto-approve and queue for auto-merge, but branch protection and CI still gate the merge.
 
 ## Safety boundaries
@@ -234,7 +234,7 @@ node scripts/render-readme-shots.mjs               # regenerate the README scree
 - No secrets in git; credential presence by env NAME / file PRESENCE only — values are never read, printed, or logged. The encrypted vault stores values as ciphertext (AES-256-GCM) and never surfaces them; listings are names-only.
 - Resolved credential values live in process memory, non-enumerable, registered with the scrubber; compaction summaries are scrubbed both directions and again at the disk boundary.
 - Mutating tools run under **YOLO by default** (guru's baseline); engage **safe mode** (`/yolo off`) for per-call prompts (`y`/always/deny), or scope with a standing `/mandate`; model writes are contained to the session repo; **hard edges always prompt, in every mode**.
-- After local validation and review pass, agents may commit, push, and open PRs for this repo. No force-merges, no branch-protection bypasses, no unrelated live-system mutation.
+- **Paired-build builder lanes** (see `AGENTS.md`): implement and hand off evidence locally — the **code-reviewer** lane commits, pushes, and opens PRs after review. No force-merges, no branch-protection bypasses, no unrelated live-system mutation.
 - No GREEN handoff for repo mutations without review evidence or an explicit blocker.
 
 ## Runtime internals
@@ -248,8 +248,10 @@ The interactive `guru` surface sits on a schema-first runtime (all contracts are
 - **Retry policy** (`src/model/retryPolicy.ts`): classification, exponential backoff + jitter, Retry-After honor with a fail-fast cap; wraps every provider request in the agent turn loop.
 - **Readiness proof**: the CLI prints a capability report (runtime, repo context, tools, provider routing, extension host).
 
-Runtime policy loads from `guruharness.config.json` (`guruharness.config.example.json` is the non-secret template) — including `compaction.*`, `retry.*`, `swarm.*`, and `lookahead.*`.
+Runtime policy loads from `guruharness.config.json` (`guruharness.config.example.json` is the non-secret template) — including `compaction.*`, `retry.*`, `swarm.*`, and `lookahead.*`. For self-build git automation, prefer **`approvalPolicy.autoCommitPushPr`: false** in new configs (live push requires explicit opt-in + mandate); see `../gaps/README.md` (**G253**) if the repo default differs.
 
 ## Self-build loop
 
 A bounded self-build scaffold selects dependency-ready tasks with direction evidence and keeps validation/review/PR gates in front of every repository change. It is a construction mechanism, not the product definition.
+
+**Operator CLI:** `guru self-build-run` drives the 0→7 dev cycle (`--dry-run` stage plan only, `--loop` for multi-task). Details: `planning/SELF-BUILD-DEVELOPER-LOOP.md` · open seams: `../gaps/README.md` (e.g. **G52**, **G121**, **G266**).

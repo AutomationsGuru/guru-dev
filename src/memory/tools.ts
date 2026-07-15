@@ -18,8 +18,10 @@ const EmptyInputSchema = z.object({}).strict();
 
 /**
  * Memory tools — self-registered through the extension host (no api.ts change).
- * memory_search + memory_get are read-only (chat-safe without approval);
- * memory_remember + memory_forget are writes and ride the normal approval gate.
+ * `memory_search` + `memory_get` are read-only; `memory_remember` + `memory_forget`
+ * are writes on the normal approval gate. Factory accepts `MemoryFactStore` from
+ * `createConfiguredMemoryStore` (Markdown L1 or Postgres L2). Multi-scope routing:
+ * `guru/memorySessionService.ts` + `scopes.ts`. BM25 ranker: `recall.ts`.
  */
 export interface MemoryToolFactoryOptions {
   readonly store: MemoryFactStore;
