@@ -1,0 +1,194 @@
+name: Dependabot Cleanup
+
+on:
+  schedule:
+    # Run daily at 2 AM UTC to clean up stale dependabot artifacts
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+jobs:
+  cleanup:
+    name: Clean up orphaned Dependabot PRs and branches
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@b4ffde65f46336ab88eb53be0f245c8287259371 # v4.1.0
+        with:
+          fetch-depth: 0
+
+      - name: Close stale Dependabot PRs
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const STALE_DAYS = 14;
+            const now = new Date();
+            const staleDate = new Date(now.getTime() - STALE_DAYS * 24 * 60 * 60 * 1000);
+            
+            const prs = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              creator: 'dependabot[bot]',
+              per_page: 100,
+            });
+            
+            const staleClosures = [];
+            
+            for (const pr of prs.data) {
+              const lastUpdated = new Date(pr.updated_at);
+              
+              if (lastUpdated < staleDate) {
+                await github.rest.pulls.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: pr.number,
+                  state: 'closed',
+                });
+                
+                staleClosures.push({
+                  number: pr.number,
+                  title: pr.title,
+                  lastUpdated: pr.updated_at,
+                });
+                
+                console.log(`Closed stale PR #${pr.number}: ${pr.title}`);
+              }
+            }
+            
+            core.setOutput('closed_count', staleClosures.length);
+            core.setOutput('closed_prs', JSON.stringify(staleClosures, null, 2));
+
+      - name: Delete orphaned Dependabot branches
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const branches = await github.rest.repos.listBranches({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100,
+            });
+            
+            const deletedBranches = [];
+            
+            for (const branch of branches.data) {
+              // Only touch dependabot branches that have no active PR
+              if (branch.name.startsWith('dependabot/')) {
+                try {
+                  // Check if there's an open PR for this branch
+                  const prList = await github.rest.pulls.list({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    state: 'open',
+                    head: `${context.repo.owner}:${branch.name}`,
+                  });
+                  
+                  if (prList.data.length === 0) {
+                    // No open PR, safe to delete
+                    await github.rest.git.deleteRef({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      ref: `heads/${branch.name}`,
+                    });
+                    
+                    deletedBranches.push(branch.name);
+                    console.log(`Deleted orphaned branch: ${branch.name}`);
+                  }
+                } catch (error) {
+                  console.log(`Could not delete ${branch.name}: ${error.message}`);
+                }
+              }
+            }
+            
+            core.setOutput('deleted_count', deletedBranches.length);
+            core.setOutput('deleted_branches', JSON.stringify(deletedBranches, null, 2));
+
+      - name: Auto-merge ready Dependabot PRs
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const prs = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              creator: 'dependabot[bot]',
+              per_page: 100,
+            });
+            
+            const mergedPrs = [];
+            
+            for (const pr of prs.data) {
+              // Only auto-merge patch/minor versions, not majors
+              const isMajor = pr.title.toLowerCase().includes('major');
+              
+              if (!isMajor && pr.mergeable) {
+                try {
+                  // Get the latest commit status
+                  const statusCheck = await github.rest.repos.getCombinedStatusForRef({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    ref: pr.head.sha,
+                  });
+                  
+                  // Only merge if all checks pass
+                  if (statusCheck.state === 'success') {
+                    await github.rest.pulls.merge({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      pull_number: pr.number,
+                      merge_method: 'squash',
+                    });
+                    
+                    mergedPrs.push({
+                      number: pr.number,
+                      title: pr.title,
+                    });
+                    
+                    console.log(`Merged PR #${pr.number}: ${pr.title}`);
+                  }
+                } catch (error) {
+                  console.log(`Could not merge PR #${pr.number}: ${error.message}`);
+                }
+              }
+            }
+            
+            core.setOutput('merged_count', mergedPrs.length);
+            core.setOutput('merged_prs', JSON.stringify(mergedPrs, null, 2));
+
+      - name: Generate cleanup summary
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          CLOSED_COUNT: ${{ steps.close-stale.outputs.closed_count }}
+          DELETED_COUNT: ${{ steps.delete-orphans.outputs.deleted_count }}
+          MERGED_COUNT: ${{ steps.auto-merge.outputs.merged_count }}
+        with:
+          script: |
+            const closedCount = parseInt(process.env.CLOSED_COUNT || '0');
+            const deletedCount = parseInt(process.env.DELETED_COUNT || '0');
+            const mergedCount = parseInt(process.env.MERGED_COUNT || '0');
+            
+            const summary = `
+            ## Dependabot Cleanup Summary
+            
+            - **Closed stale PRs**: ${closedCount}
+            - **Deleted orphaned branches**: ${deletedCount}
+            - **Auto-merged ready PRs**: ${mergedCount}
+            - **Total actions**: ${closedCount + deletedCount + mergedCount}
+            
+            Run triggered at: ${new Date().toISOString()}
+            `;
+            
+            core.summary.addRaw(summary);
+            await core.summary.write();
+
+      - name: Notify on major actions
+        if: failure()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            console.log('Dependabot cleanup workflow completed with warnings. Check logs above.');
