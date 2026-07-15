@@ -4,7 +4,8 @@
 ![guru harness](https://img.shields.io/badge/guru%20harness-AI%20agent%20harness-8C11E1?labelColor=1A1130&style=flat-square)
 ![node](https://img.shields.io/badge/node-%E2%89%A522-B56EF1?labelColor=1A1130&style=flat-square)
 ![tests](https://img.shields.io/badge/tests-1400%20passing-31C48D?labelColor=1A1130&style=flat-square)
-![version](https://img.shields.io/badge/release-v1.5.0-E958BE?labelColor=1A1130&style=flat-square)
+![package](https://img.shields.io/badge/package-v1.5.0-E958BE?labelColor=1A1130&style=flat-square)
+![maturity](https://img.shields.io/badge/maturity-dogfood-F59E0B?labelColor=1A1130&style=flat-square)
 ![license](https://img.shields.io/badge/license-MIT-31C48D?labelColor=1A1130&style=flat-square)
 
 **`guru` is a repo-aware terminal agent harness.** `cd` into any project, launch it, connect the model you want — your own provider API keys or a provider subscription/plan — and it does real coding work: reads your code, edits files, runs your tests, and iterates to green, with every action shown and every mutation behind an approval gate.
@@ -13,7 +14,7 @@
 
 ## The idea
 
-Guru does not sit on top of an agent framework. No orchestration SDK, no framework-of-the-week underneath — the entire runtime is **independent TypeScript with exactly one runtime dependency (`zod`)**, hand-rolled down to the ANSI escape codes. That isn't minimalism for its own sake; it's the thesis:
+Guru does not sit on top of an agent framework. No orchestration SDK, no framework-of-the-week underneath — the runtime is **independent TypeScript**, hand-rolled down to the ANSI escape codes. `zod` is its core runtime dependency; PostgreSQL and Honcho adapters are optional, explicit memory integrations. That isn't minimalism for its own sake; it's the thesis:
 
 > **A harness that depends on someone else's framework inherits someone else's ceiling.**
 > Guru builds its own — and then keeps building.
@@ -21,6 +22,18 @@ Guru does not sit on top of an agent framework. No orchestration SDK, no framewo
 The name means both things at once, on purpose. A harness **captures the value** of every model and tool it touches, and **directs that power** where the operator points it. And *Guru* because it **knows from experience** — every day it works, it saves what it learned, and tomorrow it's sharper.
 
 The finished-product definition is present-tense and testable, and a line-by-line, adversarially-verified capability audit drives the build order.
+
+## Release maturity
+
+Guru is currently in dogfood development. It is **not** yet the fully working
+daily-driver harness represented by a product-quality `v1.0`. Existing `1.x`
+package identifiers are historical distribution labels, not proof that the
+acceptance bar has been met.
+
+Local fixes, builds, test runs, and routine merges do not change the package
+version. They belong in the `Unreleased` changelog while real target-project
+dogfooding establishes reliability. A public version correction or migration is
+a separate release-owner decision because `1.x` has already been published.
 
 ## How it works
 
@@ -60,8 +73,20 @@ npm install guruharness
 
 # Development (from source)
 git clone https://github.com/AutomationsGuru/guru-dev.git && cd guru-dev
-npm install && npm run build && npm link
+npm install && npm run dev:install
 ```
+
+`npm run dev:install` builds the checkout, globally links it, and verifies that
+the `guru` command resolves to that checkout. After every runnable source-code
+change, run `npm run dev:sync` before testing: it rebuilds and refreshes the
+global link without publishing or changing the package version. Restart a
+running Guru process after syncing; a newly launched `guru` then uses the
+latest local build.
+
+On Linux, run this from a user-owned clone on a native Linux filesystem with
+Node 22+ and a writable `npm root -g`. Do not use `sudo npm link`; if the global
+npm directory is root-owned, use the builder's user-owned Node installation
+instead. Shared CIFS/no-exec mounts are unsuitable for npm's native binaries.
 
 > Prefer the npm package. A GitHub release tarball (`gh release download v1.4.1 …`)
 > still works as a fallback if you need an offline/air-gapped install.
@@ -90,19 +115,58 @@ cd your-project
 guru
 ```
 
-You get the full-width splash, then a **briefing**: connected model + context window, registered tools and what is gated, skills, memory status, saved conversations, route readiness, theme. The composer pins a live status bar under the input — cwd · role · YOLO/scout/mandate chips · tokens · ctx% · model — and reflows on resize.
+You get the full-width splash, then a **briefing**: connected model + context window, registered tools with their live access/availability, skills, memory status, saved conversations, route readiness, theme. The composer pins a live status bar under the input — cwd · role · YOLO/scout/mandate chips · tokens · ctx% · model — and reflows on resize.
+
+### Home profile and project harness
+
+Guru keeps its reusable installed profile at `~/.guruharness` (for example, `C:\Users\agentos\.guruharness` on Windows). On its first normal launch in a target folder, it creates a project-specific `<project>/.guru` harness:
+
+- `harness.json` records the generated harness, its linked assets, and the current native tool/skill catalog.
+- `skills/local/`, `memory/`, `hooks/`, `agent/prompts/`, `state/`, and `change-records/` belong to the project.
+- `skills/global`, `garage`, and `tools` are live directory links to the reusable home profile—never copied snapshots—so home-side updates are immediately available to every project.
+- `.guru/guruharness.config.json` is seeded once from the home default, then belongs to that project. Edit it freely without changing other projects or the home profile.
+
+Configuration resolves in this order: an explicit config path, a root `guruharness.config.json` owned by the project, the generated `.guru/guruharness.config.json`, then the reusable home default. This keeps the Guru source repo's own config authoritative during development while ordinary projects receive a tailor-made writable default.
 
 - **The composer is a real editor**: **Ctrl+J** newline (multi-line prompts in place; Shift+Enter where the terminal reports it), **@path** opens a fuzzy picker AND **expands the file contents into the prompt** (50KB + context-window guards, secret-scrubbed), **Tab** completes paths — history and the menu intact
 - **Prompt templates** — drop `.guru/agent/prompts/*.md` (frontmatter arg schema); `/name arg…` expands with `{{arg}}`, surfaced in the / menu
 - **`/`** opens the command menu — type to filter, **↑/↓** navigate, **→** drills into live lists (`/model` → routes, `/resume` → saved sessions), **⇥** accepts, **⏎** runs
 - **`/model`** — the 101-route catalog across 20 providers (direct API keys, native plan/OAuth auth, local models); credential presence by env NAME only — values are never read or printed
 - **`/login` / `/accounts` / `/logout` / `/keys`** — **two auth mechanisms, nothing else**: an **API key** (layered resolution: env NAME → the **encrypted guru vault** → optional `$VAR`/`$(cmd)` template), or a **guru-native OAuth login** for plan/subscription providers. `/login <provider>` runs guru's OWN sign-in — a browser loopback (ChatGPT/Codex plan) or an **RFC 8628 device-code** flow (SuperGrok plan) — and stores the token in the **AES-256-GCM vault** (`~/.guruharness/vault.enc`); if a provider CLI already signed in (`~/.codex`, `~/.grok`), guru reuses that cache as an opportunistic **shortcut, never a dependency**. No CLI delegation, ever. `/keys` (+ `guru keys set <NAME>`) saves an API key to the vault as an env-var alternative
-- **YOLO by default, `/mandate`, safe mode** — guru boots in **YOLO** (its baseline: ordinary permission gates lifted from the start). Engage **safe mode** with `/yolo off` — the opt-IN leash — and a mutating tool call not covered by a standing grant **prompts you per-call** (`y` once · `a` always this session · `enter`/`N` deny); standing mandates grant space/machine scope ("this repo is yours"). In **every** mode, YOLO included, **hard edges prompt every time**
+- **YOLO by default, `/mandate`, safe mode** — guru boots in **YOLO** (its baseline: ordinary permission gates lifted from the start). Routine project-contained argv commands are open to ordinary executables; the runner remains argv-only, cwd-contained, and bounded. Engage **safe mode** with `/yolo off` — the opt-IN leash — and a mutating tool call not covered by a standing grant **prompts you per-call** (`y` once · `a` always this session · `enter`/`N` deny); standing mandates grant space/machine scope ("this repo is yours"). In **every** mode, YOLO included, **hard edges prompt every time**
 - **`/compact [instructions]`** — manual compaction; it also auto-triggers near the window (tool-pair-safe cut, scrubbed, resumable)
-- **`/remember [global|space|role]` / `/memory` / `/recall`** — the file-based memory organ (markdown + frontmatter + `[[links]]`, Obsidian-vault-native), **scoped** (§7): **global** (`~/.guruharness/memory/`), **space** (`<repo>/.guru/memory/` — travels with the repo), and **role** (`~/.guruharness/roles/<slug>/memory/`). Boot injection merges the active scopes most-specific-first — and with **Smart Connections**, the injected facts are re-ranked by **BM25 relevance to the current turn**, so the auth facts lead on an auth turn and the ledger facts on a ledger turn. `/recall <query>` surfaces related memory on demand. Facts survive restarts into the next boot's briefing.
+- **`/remember [global|space|role]` / `/memory` / `/recall`** — Markdown fact memory is the zero-setup default: frontmatter + `[[links]]`, an Obsidian-compatible vault, and a derived `MEMORY.md` index. It is scoped as **global** (`~/.guruharness/memory/`), **space** (`<repo>/.guru/memory/`), and **role** (`~/.guruharness/roles/<slug>/memory/`). Set `memory.storage.provider` to `postgres` to use any PostgreSQL database via the configured connection-string environment-variable name; `/memory` reports which backend is really active. `memory.honcho` is an optional, disabled-by-default context layer using the official Honcho SDK; it never pretends to be connected until configured. Boot injection re-ranks facts by BM25 relevance to the current turn, and `/recall <query>` surfaces related memory on demand.
 - **`/role`** — dynamic load and save of a role on a **typed capability manifest**: a role is verified layers (tool/skill/extension/provider/command) with per-layer verification hashes; saving is verified-only (a BUILT layer refused without its done packet) via an atomic two-phase commit, and loading **re-verifies stale/changed layers first** (failed layers skipped, a clean role loads on the fast path); **`/lookahead`** — the scout/commit engine (off by default = byte-identical turns)
 - **`/sessions` / `/resume`** — conversations persist and resume with route, compaction state, and file tracking intact
 - **`/tree` / `/fork` / `/clone`** — the session **tree**: an append-only JSONL DAG (`id`/`parentId`, audit markers, crash-resume by replay); `/tree` navigates fork points and child branches, `/fork <#>` branches from a prior user turn, `/clone` duplicates the active branch for destructive experiments — with **branch summaries** folded on leave and injected on return
+
+### Memory configuration
+
+`/memory` shows the active backend and Honcho state; `/settings` shows the configured names. For a normal project launch, edit `.guru/guruharness.config.json` to change them, then restart Guru; a root `guruharness.config.json` remains the explicit project/development override. After selecting PostgreSQL, `/memory migrate` explicitly copies eligible global Markdown facts without deleting the source. Connection strings and API keys stay in environment variables, never in this file.
+
+```json
+{
+  "memory": {
+    "storage": {
+      "provider": "postgres",
+      "postgres": {
+        "connectionStringEnvVar": "GURU_MEMORY_DATABASE_URL",
+        "schema": "guru_memory",
+        "table": "facts",
+        "ssl": "require"
+      }
+    },
+    "honcho": {
+      "enabled": true,
+      "apiKeyEnvVar": "HONCHO_API_KEY",
+      "workspaceId": "my-workspace",
+      "sessionId": "guru-memory"
+    }
+  }
+}
+```
+
+PostgreSQL is the canonical fact store for this first database-backed release and uses one configured global namespace. Markdown retains the existing global/space/role vault scopes. Honcho adds derived context and turn sync; it does not replace the deterministic fact store.
 
 ## What's inside (all ground-truth verified)
 
@@ -118,7 +182,7 @@ You get the full-width splash, then a **briefing**: connected model + context wi
 | Native plan/subscription auth (no CLI dependency) | Every model runs through guru's OWN engine — **two auth mechanisms only**: an API key, or a **guru-native OAuth login**. On the plan lanes — ChatGPT/Codex (`openai-codex`, browser loopback PKCE) and SuperGrok (`grok`, RFC 8628 device-code) — guru signs in through its own flow, vaults the token, and turns bill to your **subscription** (no provider CLI is spawned, no per-token API charges); the API-key lanes bill per token as usual. An existing CLI cache (`~/.codex`/`~/.grok`) is reused as a shortcut when present, never required. |
 | Per-call approval (§12) | A mutating tool call that escalates **prompts the operator per-call** — `y` once / `a` always-this-session / `enter`·`N` deny (fail-safe default). **Hard edges** (destructive / spend / secrets-adjacent / ecosystem-auth) prompt **every time**, never auto-approved by a session grant; swarm workers never prompt (escalate = deny unless already session-approved). Approval is per verb, per call. |
 | Layered credential resolver + encrypted vault | env NAME → the **encrypted guru vault** (AES-256-GCM, `~/.guruharness/vault.enc`, an env-var alternative for keys that can't live in the shell) → optional `$VAR`/`$(cmd)` template → provider-ecosystem cache. Vault values resolve by name **without touching `process.env`** (no child-process leak); everything is in-memory, non-enumerable, scrubbed from every surface, names-only listing. |
-| Memory organ (file-based) | `/remember` facts survive restart into the next boot's briefing (acceptance-proven live) |
+| Memory organ (Markdown or PostgreSQL) | Markdown vault + derived `MEMORY.md` is the default; a configured PostgreSQL table is a selectable canonical fact store, and `/remember` facts are injected into future boots. Honcho is optional context enrichment, not a fake database client. |
 | Mandates + YOLO permission model | Read-only floor → deny-wins → hard-edge escalation → YOLO → covering grant; the constitution survives YOLO (deny + hard edges resolve **before** YOLO, so YOLO can never lift them) |
 | Swarm v1 + look-ahead engine | Workers ≤ parent mandate at execution time; scouts read-only + dead-time-only; per-spawn token/iteration budgets + a structured recursion-depth error; the look-ahead governor bounds speculation (idempotency allowlist default-nothing, per-session budget, miss-rate throttle) |
 | Dynamic roles + never-stuck resolver | Roles save/resume on the typed manifest; capability gaps resolve build/attach/learn with evidence, gated at risk edges |
@@ -144,8 +208,8 @@ You get the full-width splash, then a **briefing**: connected model + context wi
 The finished product is written down, present-tense and testable — the pillars: the naked kernel, the one frozen extension seam, native direct provider lanes, nothing-at-rest secrets, the memory organ, dynamic roles, the swarm, self-building, mandates. A line-by-line capability audit, adversarially verified, drives the build order:
 
 - **P0 — runtime survival: CLOSED** (v0.9.0 compaction, v0.10.0 retry + cancellation). Long and autonomous sessions no longer die.
-- **P1 — daily-driver ergonomics: COMPLETE (v1.0.0).** Composer, typed grep/glob/ls + the bash token optimizer + the render-layer secret sanitizer, @-content expansion + prompt templates + mandate-everywhere (v0.11–v0.13); the **session tree** (v0.14); the **role/capability spine** (typed manifest + verified-only save + re-verify-before-load, v0.15); the **knowledge flywheel** (v0.16); the **enforced 5-phase boot ritual** (v0.17); the **AgentSession engine** + the TUI driving it (v0.18); the **headless RPC surface** (v0.19); **npm publish readiness** (v0.20); the **L0→L3 promotion diagonal** (v0.21); the **per-call approval prompt** (v0.22); **memory scopes** (v0.23); **cross-harness import** (v0.24); **Smart Connections** (v0.25); **bridge skills** (v0.26). Then the hardening pass that closed every acceptance-scenario partial: the **spend hard edge** (v0.27), the **look-ahead governor** (v0.28), the **swarm governor** (v0.29), the **flywheel end-to-end test** (v0.30), the **natural-language role trigger** (v0.31), and **mid-run steer + real abort** (v0.32). **The acceptance board reached 14/14 pass, 0 partial — and v1.0.0 is CUT.** Every core pillar is shipped.
-- **P2/P3 — breadth.** RPC + npm (on the engine), memory scopes, the L0→L3 promotion diagonal, cross-harness import, Smart Connections, and bridge skills — shipped; the dynamic extension loader + hot-reload, themes, the encrypted credential vault (v1.1.0), the **spend-gated self-build developer loop** (`guru self-build-run`, v1.2.0 — a governed build cycle, every model loop bounded and spend as the one hard gate), **native plan/OAuth provider auth** (v1.3.0 — two auth mechanisms only, ChatGPT/Codex and SuperGrok sign in through guru's OWN flow, the CLI delegate removed), and **YOLO-by-default agency + preserve-don't-replace** (v1.4.0 — the daily-driver identity and content-preservation guard, plus the working-stack UX/MCP/self-build hardening) — the post-1.0 track.
+- **P1 — daily-driver ergonomics: IN PROGRESS.** The prior “v1.0 complete” claim is retired. Existing capabilities and test counts are inputs to acceptance, not proof that normal work is dependable. Guru remains pre-GA until real target-project sessions reliably start, type, use menus and chat, operate ordinary workspace tools in YOLO, persist Markdown memory, and resume. `v1.0` is the explicit quality gate, not a routine increment.
+- **P2/P3 — breadth.** Breadth work remains secondary to closing P1; it is not a substitute for daily-driver acceptance.
 
 Explicitly **out of scope**, by design: an external routing sidecar in the loop (on-tap only), SaaS/web/multi-user/billing, and **ungoverned self-improvement** — guru mutating its own constitution or capabilities without gates (constitutionally excluded, not deferred). This is distinct from the v1.2.0 **self-build developer loop**, which is *governed* unattended execution: every stage is mandate- and review-gated, RED blocks ship, and spend is a hard edge YOLO cannot lift — the constitution runs the loop, the loop never edits the constitution.
 

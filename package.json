@@ -38,6 +38,8 @@
     "cli": "tsx src/cli.ts",
     "guru": "tsx src/guru.ts",
     "build": "tsc -p tsconfig.build.json",
+    "dev:sync": "npm run build && npm link --ignore-scripts && tsx scripts/verifyLocalInstall.ts",
+    "dev:install": "npm run dev:sync",
     "test": "vitest run",
     "test:ci": "vitest run --reporter=dot",
     "typecheck": "tsc --noEmit",
@@ -55,10 +57,13 @@
   ],
   "license": "MIT",
   "dependencies": {
+    "@honcho-ai/sdk": "^2.2.0",
+    "pg": "^8.22.0",
     "zod": "4.4.3"
   },
   "devDependencies": {
     "@types/node": "^24.13.2",
+    "@types/pg": "^8.20.0",
     "supabase": "^2.109.0",
     "tsx": "^4.23.0",
     "typescript": "^6.0.3",

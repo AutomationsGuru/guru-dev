@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -15,6 +15,31 @@ describe("HarnessConfigSchema", () => {
     expect(config.approvalPolicy.allowLocalMerge).toBe(false);
     expect(config.plannerModel).toBeUndefined();
     expect(config.selfBuild.maxIterations).toBe(1);
+    expect(config.memory.storage.provider).toBe("markdown");
+    expect(config.memory.honcho.enabled).toBe(false);
+  });
+
+  it("accepts a PostgreSQL fact-memory backend and an explicit Honcho integration without secrets in config", () => {
+    const config = HarnessConfigSchema.parse({
+      runtimeName: "GuruHarness",
+      memory: {
+        storage: {
+          provider: "postgres",
+          postgres: { connectionStringEnvVar: "TEAM_MEMORY_DATABASE_URL", schema: "agent_memory", table: "facts", ssl: "require" }
+        },
+        honcho: {
+          enabled: true,
+          apiKeyEnvVar: "TEAM_HONCHO_API_KEY",
+          workspaceId: "team-memory",
+          sessionId: "guru",
+          userPeerId: "matthew",
+          agentPeerId: "guru"
+        }
+      }
+    });
+
+    expect(config.memory.storage).toMatchObject({ provider: "postgres", postgres: { connectionStringEnvVar: "TEAM_MEMORY_DATABASE_URL", schema: "agent_memory" } });
+    expect(config.memory.honcho).toMatchObject({ enabled: true, apiKeyEnvVar: "TEAM_HONCHO_API_KEY", workspaceId: "team-memory" });
   });
 
   it("P0: reviewGate defaults to the native critic panel (no external tool assumed)", () => {
@@ -85,12 +110,63 @@ describe("loadHarnessConfig", () => {
 
   it("should return a yellow diagnostic for a missing config", () => {
     const directory = makeTempDirectory();
-    const result = loadHarnessConfig({ cwd: directory });
+    const result = loadHarnessConfig({ cwd: directory, homeDirectory: join(directory, "missing-home") });
 
     expect(result.status).toBe("missing");
     expect(result.verdict).toBe("YELLOW");
     expect(result.diagnostics[0]).toContain("Config file not found");
     expect(result.config.runtimeName).toBe("GuruHarness");
+
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  it("loads a generated project overlay before the reusable home default", () => {
+    const directory = makeTempDirectory();
+    const homeDirectory = join(directory, "home");
+    const projectConfigDirectory = join(directory, ".guru");
+    mkdirSync(projectConfigDirectory, { recursive: true });
+    mkdirSync(homeDirectory, { recursive: true });
+    writeFileSync(join(homeDirectory, "guruharness.config.json"), JSON.stringify({ runtimeName: "Home Guru" }));
+    writeFileSync(join(projectConfigDirectory, "guruharness.config.json"), JSON.stringify({ runtimeName: "Project Guru" }));
+
+    const result = loadHarnessConfig({ cwd: directory, homeDirectory });
+
+    expect(result.status).toBe("loaded");
+    expect(result.source).toBe("project");
+    expect(result.config.runtimeName).toBe("Project Guru");
+
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  it("keeps an explicit workspace config ahead of a generated project overlay", () => {
+    const directory = makeTempDirectory();
+    const homeDirectory = join(directory, "home");
+    const projectConfigDirectory = join(directory, ".guru");
+    mkdirSync(projectConfigDirectory, { recursive: true });
+    writeFileSync(join(directory, "guruharness.config.json"), JSON.stringify({ runtimeName: "Workspace Guru" }));
+    writeFileSync(join(projectConfigDirectory, "guruharness.config.json"), JSON.stringify({ runtimeName: "Project Guru" }));
+
+    const result = loadHarnessConfig({ cwd: directory, homeDirectory });
+
+    expect(result.status).toBe("loaded");
+    expect(result.source).toBe("workspace");
+    expect(result.config.runtimeName).toBe("Workspace Guru");
+
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  it("does not hide a missing explicit config behind the project or home defaults", () => {
+    const directory = makeTempDirectory();
+    const homeDirectory = join(directory, "home");
+    const explicitPath = join(directory, "does-not-exist.json");
+    mkdirSync(homeDirectory, { recursive: true });
+    writeFileSync(join(homeDirectory, "guruharness.config.json"), JSON.stringify({ runtimeName: "Home Guru" }));
+
+    const result = loadHarnessConfig({ cwd: directory, configPath: explicitPath, homeDirectory });
+
+    expect(result.status).toBe("missing");
+    expect(result.source).toBe("defaults");
+    expect(result.path).toBe(explicitPath);
 
     rmSync(directory, { recursive: true, force: true });
   });

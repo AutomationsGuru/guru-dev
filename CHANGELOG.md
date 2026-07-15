@@ -2,6 +2,36 @@
 
 All notable changes to GuruHarness are documented here.
 
+## [Unreleased]
+
+### Release discipline
+
+- Treat the current harness as pre-GA dogfood. Historical `1.x` labels are not
+  daily-driver acceptance evidence.
+- Do not bump the package version for a local build, test, install refresh,
+  routine PR/push, or ordinary fix. Record work here until a release owner and
+  Matthew make an explicit release/migration decision.
+- **Stay on `1.5.x` until Matthew is happy with how Guru works.** Patch numbers
+  may climb without limit (`1.5.1` … `1.5.n` — even absurdly high is fine). The
+  current gated target is `1.5.1`. Do **not** create, tag, or publish `1.6.0` or
+  higher until Matthew explicitly accepts Guru as working well enough to advance.
+  CI (`scripts/verify-repo.ps1`) and the tag-triggered release workflow refuse
+  package versions outside `1.5.x`.
+
+### Changed
+
+- **Linux-first paired-build contracts:** Codex01 owns platform-neutral construction;
+  Windows owns quality coordination, candidate identity, and Windows validation;
+  code-review exchange path and package-install wave rules are explicit.
+- **Release line lock:** repository hygiene and the release publish workflow now
+  fail if `package.json` leaves the `1.5.x` dogfood line.
+
+### Fixed
+
+- **Linux npm launcher startup:** the guru binary now recognizes POSIX npm
+  symlink and Windows shim entrypoints instead of exiting silently when its
+  argv path ends in /guru rather than /guru.js.
+
 ## [1.5.0] - 2026-07-12
 
 Lane reconciliation release: merges the 2026-07-10/11 Windows daily-driver wave and the

@@ -40,6 +40,18 @@ export const MemoryFactSchema = z
 
 export type MemoryFact = z.infer<typeof MemoryFactSchema>;
 
+/** Live storage readiness — location is safe metadata, never a connection string. */
+export const MemoryStoreStatusSchema = z
+  .object({
+    provider: z.enum(["markdown", "postgres"]),
+    status: z.enum(["ready", "missing-env", "offline", "error"]),
+    summary: z.string().trim().min(1),
+    missingEnvNames: z.array(z.string().trim().min(1)).default([]),
+    location: z.string().trim().min(1)
+  })
+  .strict();
+export type MemoryStoreStatus = z.infer<typeof MemoryStoreStatusSchema>;
+
 export const MemoryRememberInputSchema = z
   .object({
     /**

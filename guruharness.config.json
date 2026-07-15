@@ -83,11 +83,29 @@
     ],
     "secretAllowList": [],
     "shellAllowlist": [
-      "npm",
-      "node",
-      "git",
-      "pwsh"
+      "*"
     ]
+  },
+  "memory": {
+    "storage": {
+      "provider": "markdown",
+      "postgres": {
+        "connectionStringEnvVar": "GURU_MEMORY_DATABASE_URL",
+        "schema": "guru_memory",
+        "table": "facts",
+        "ssl": "prefer"
+      }
+    },
+    "honcho": {
+      "enabled": false,
+      "apiKeyEnvVar": "HONCHO_API_KEY",
+      "workspaceId": "guruharness",
+      "sessionId": "guru-memory",
+      "userPeerId": "operator",
+      "agentPeerId": "guru",
+      "syncOnTurn": true,
+      "contextTokenBudget": 1200
+    }
   },
   "selfBuild": {
     "maxIterations": 5,

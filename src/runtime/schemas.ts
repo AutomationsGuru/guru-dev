@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import { DirectionAlignmentTaskSchema } from "../direction/hereThere.js";
+import { ProjectHarnessReportSchema } from "../project-harness/schemas.js";
 import { SkillCatalogSchema, SkillDocumentSchema } from "../skills/schemas.js";
 
 export const HarnessSessionStatusSchema = z.enum(["ready", "blocked"]);
@@ -10,6 +11,8 @@ export const RuntimeConfigSummarySchema = z
   .object({
     status: z.enum(["loaded", "missing", "invalid"]),
     verdict: z.enum(["GREEN", "YELLOW", "RED"]),
+    // Optional for persisted sessions created before config-origin reporting.
+    source: z.enum(["explicit", "workspace", "project", "home", "defaults"]).optional(),
     path: z.string(),
     diagnostics: z.array(z.string()),
     runtimeName: z.string(),
@@ -101,6 +104,8 @@ export const HarnessSessionSchema = z
     there: z.string().trim().min(1),
     direction: RuntimeDirectionReportSchema,
     config: RuntimeConfigSummarySchema,
+    /** Present for new sessions; optional so persisted pre-bootstrap sessions still resume. */
+    projectHarness: ProjectHarnessReportSchema.optional(),
     repo: RuntimeRepositoryContextSchema.nullable(),
     skills: z
       .object({
@@ -120,6 +125,8 @@ export type HarnessSession = z.infer<typeof HarnessSessionSchema>;
 export const StartHarnessSessionOptionsSchema = z
   .object({
     configPath: z.string().trim().min(1).optional(),
+    /** Home/profile override. Defaults to ~/.guruharness. */
+    guruHomeDirectory: z.string().trim().min(1).optional(),
     cwd: z.string().trim().min(1).optional(),
     targetPath: z.string().trim().min(1).optional(),
     taskId: z.string().trim().min(1).optional(),

@@ -58,6 +58,30 @@ describe("createShellExecTool", () => {
     expect(calls[0]?.context.gate.name).toBe("shell.command.run");
   });
 
+  it("allows any executable when configured with the YOLO wildcard", async () => {
+    const repoRoot = makeTempDirectory();
+    const calls: Array<readonly string[]> = [];
+    const registry = createToolRegistry([
+      createShellExecTool({
+        executor: async (command) => {
+          calls.push(command);
+          return successResult("ok");
+        },
+        shellAllowlist: ["*"],
+        secretAllowList: []
+      })
+    ]);
+
+    const observation = await executeRegisteredTool(registry, "shell.command.run", {
+      repoRoot,
+      command: ["rg", "version"],
+      dryRun: false
+    });
+
+    expect(observation.output).toMatchObject({ executed: true, dryRun: false, exitCode: 0 });
+    expect(calls).toEqual([["rg", "version"]]);
+  });
+
   it("blocks non-allowlisted executables and dashed arguments", async () => {
     const repoRoot = makeTempDirectory();
     const registry = createRegistry(async () => successResult("unexpected"));

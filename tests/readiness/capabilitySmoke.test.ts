@@ -12,6 +12,7 @@ interface CapabilitySmokeOutput {
   repo?: { resolved?: boolean; agentsChainCount?: number; repoRoot?: string };
   tools?: { count?: number; ids?: string[] };
   readOnlyToolRun?: { status?: string; output?: { repoRoot?: string } };
+  memory?: { provider?: string; status?: string };
   honcho?: { status?: string; writeEnabled?: boolean };
   providerRouting?: {
     routeCount?: number;
@@ -70,8 +71,9 @@ describe("capability-smoke", () => {
 
     expect(parsed.tools?.ids).toContain("repo.context.resolve");
     expect(parsed.readOnlyToolRun).toMatchObject({ status: "succeeded", output: { repoRoot } });
+    expect(parsed.memory).toMatchObject({ provider: "markdown", status: "ready" });
     expect(parsed.honcho?.status).not.toBe("not-implemented");
-    expect(["read-only", "missing-env", "ready"]).toContain(parsed.honcho?.status);
+    expect(["disabled", "missing-env", "offline", "ready"]).toContain(parsed.honcho?.status);
     expect(parsed.honcho?.writeEnabled).toBe(false);
     expect(parsed.providerRouting?.catalogSource).toBe("direct-provider-catalog");
     expect(parsed.providerRouting?.routeCount).toBeGreaterThanOrEqual(10);
@@ -92,7 +94,7 @@ describe("capability-smoke", () => {
     expect(parsed.extensionHost?.honchoStatusToolReachable).toBe(true);
     expect(parsed.extensionHost?.registeredToolIds).toContain("honcho_memory_status");
     expect(parsed.extensionHost?.registeredToolIds).toContain("service_readiness_report");
-    expect(["read-only", "missing-env", "ready"]).toContain(parsed.extensionHost?.honchoToolStatus);
+    expect(["disabled", "missing-env", "offline", "ready"]).toContain(parsed.extensionHost?.honchoToolStatus);
   });
 
   it("surfaces the folded provider-CLI inventory", () => {

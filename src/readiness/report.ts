@@ -38,7 +38,7 @@ export async function buildReadinessReport(options: ReadinessReportOptions = {})
   );
 
   if (options.honchoClient) {
-    const status = options.honchoClient.status();
+    const status = await options.honchoClient.status();
     rows.push(
       row({
         id: "honcho",

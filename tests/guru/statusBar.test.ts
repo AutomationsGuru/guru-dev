@@ -63,12 +63,28 @@ describe("buildStatusBar — full-width indicator bar", () => {
     expect(bar).toContain("tok");
   });
 
-  it("renders mode chips only when active (YOLO / scout / mandate / busy / queue)", () => {
-    expect(strip(buildStatusBar(baseState(), 160))).not.toContain("YOLO");
-    expect(strip(buildStatusBar(baseState({ yolo: true }), 160))).toContain("YOLO");
+  it("renders exactly one effective-access chip at wide and narrow widths", () => {
+    const grant = { scope: "machine", verbs: ["read", "write", "exec"], grantedAt: "2026-07-14T16:01:58.903Z" };
 
-    const withMandate = baseState({ mandate: { grants: [{ scope: "machine", verbs: ["read"], grantedAt: "t" }], denies: [] } });
-    expect(strip(buildStatusBar(withMandate, 160))).toContain("mandate");
+    for (const columns of [40, 160]) {
+      const yoloWithGrant = strip(buildStatusBar(baseState({ yolo: true, mandate: { grants: [grant], denies: [] } }), columns));
+      expect(yoloWithGrant.match(/YOLO/gu)).toHaveLength(1);
+      expect(yoloWithGrant).not.toMatch(/mandate|POLICY|SAFE/iu);
+      expect(visibleWidth(yoloWithGrant)).toBeLessThanOrEqual(columns - 1);
+
+      const safe = strip(buildStatusBar(baseState(), columns));
+      expect(safe).toContain("SAFE");
+      expect(safe).not.toMatch(/YOLO|mandate|POLICY/iu);
+      expect(visibleWidth(safe)).toBeLessThanOrEqual(columns - 1);
+
+      const policy = strip(buildStatusBar(baseState({ mandate: { grants: [grant], denies: [] } }), columns));
+      expect(policy).toContain("POLICY:1");
+      expect(policy).not.toMatch(/YOLO|mandate|⛨/iu);
+      expect(visibleWidth(policy)).toBeLessThanOrEqual(columns - 1);
+    }
+  });
+
+  it("renders non-access mode chips only when active (scout / busy / queue)", () => {
 
     const scout = createLookAheadEngine({ config: { enabled: true }, spawnScout: () => ({ taskId: "t" }), enumerateForks: () => [] });
     expect(strip(buildStatusBar(baseState({ lookahead: scout }), 160))).toContain("scout");

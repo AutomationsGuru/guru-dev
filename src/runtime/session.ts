@@ -1,9 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { dirname } from "node:path";
+import { statSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 
 import { loadHarnessConfig } from "../config/loadConfig.js";
-import type { RuntimeHardeningConfig } from "../config/schema.js";
+import type { MemoryConfig, RuntimeHardeningConfig } from "../config/schema.js";
 import type { MandateDecision } from "../mandates/evaluate.js";
+import { getGuruHomePaths } from "../home/paths.js";
 import { createDirectionAlignmentReport } from "../direction/hereThere.js";
 import { applySelfBuildProgress, createSelfBuildState, planNextSelfBuildTask, type SelfBuildTask } from "../kernel/selfBuildLoop.js";
 import { attachConfiguredMcpServers, type McpAttachment } from "../mcp/attach.js";
@@ -43,6 +45,7 @@ import { createShellExecTool } from "../tools/builtins/shellExecTool.js";
 import { BashOptimizerConfigSchema, type BashOptimizerConfig } from "../tools/bashOptimizer.js";
 import { createToolRegistry, executeRegisteredTool, type ToolObservation, type ToolRegistry } from "../tools/registry.js";
 import { initExtensions } from "../extensions/initExtensions.js";
+import { bootstrapProjectHarness, refreshProjectHarnessManifest } from "../project-harness/bootstrap.js";
 import type { CommandExecutor } from "../review/gates.js";
 import {
   HarnessSessionSchema,
@@ -117,6 +120,9 @@ interface CreateDefaultHarnessToolRegistryOptions {
   readonly skillLoaderOptions: Partial<SkillLoaderOptions>;
   readonly operationalStore: OperationalStore;
   readonly runtimeHardening: RuntimeHardeningConfig;
+  readonly memoryConfig: MemoryConfig;
+  /** The active Guru home Markdown vault; injectable for portable installs/tests. */
+  readonly memoryDirectory?: string;
   readonly commandExecutor?: CommandExecutor;
   readonly bashOptimizer?: BashOptimizerConfig;
   readonly interactiveCallbacks?: HarnessRuntimeDependencies["interactiveCallbacks"];
@@ -360,7 +366,10 @@ export function createDefaultHarnessToolRegistry(options: CreateDefaultHarnessTo
     createCreateOperationalBacklogItemTool(options.operationalStore, { secretAllowList: options.runtimeHardening.secretAllowList }),
     createListOperationalBacklogItemsTool(options.operationalStore),
     createCreateOperationalImplementationTool(options.operationalStore, { secretAllowList: options.runtimeHardening.secretAllowList }),
-    ...initExtensions().tools
+    ...initExtensions({
+      memoryConfig: options.memoryConfig,
+      ...(options.memoryDirectory ? { memoryDirectory: options.memoryDirectory } : {})
+    }).tools
   ]);
 }
 
@@ -371,15 +380,25 @@ async function rebuildHarnessSession(
 ): Promise<BuiltHarnessSession> {
   const parsedOptions = StartHarnessSessionOptionsSchema.parse(options);
   const cwd = parsedOptions.cwd ?? session.repo?.repoRoot ?? process.cwd();
+  const projectRoot = session.repo?.repoRoot ?? resolveProjectRoot(parsedOptions.targetPath, cwd);
+  const projectHarness = bootstrapProjectHarness({
+    projectRoot,
+    ...(parsedOptions.guruHomeDirectory ? { homeDirectory: parsedOptions.guruHomeDirectory } : {})
+  });
+  const homePaths = getGuruHomePaths(parsedOptions.guruHomeDirectory);
   const configResult = loadHarnessConfig({
     ...(parsedOptions.configPath ? { configPath: parsedOptions.configPath } : {}),
-    cwd
+    cwd,
+    ...(parsedOptions.guruHomeDirectory ? { homeDirectory: parsedOptions.guruHomeDirectory } : {})
   });
   const configCwd = configResult.status === "loaded" ? dirname(configResult.path) : cwd;
+  const catalog = discoverSessionSkills(configResult.config.skillDirectories, configCwd, []);
   const { registry, mcpAttachment } = await createSessionTooling({
     skillLoaderOptions: { directories: configResult.config.skillDirectories, cwd: configCwd },
     operationalStore: dependencies.operationalStore,
     runtimeHardening: configResult.config.runtimeHardening,
+    memoryConfig: configResult.config.memory,
+    memoryDirectory: homePaths.memoryDirectory,
     bashOptimizer: configResult.config.bashOptimizer,
     mcpServers: configResult.config.mcpServers,
     ...(dependencies.commandExecutor ? { commandExecutor: dependencies.commandExecutor } : {}),
@@ -388,6 +407,16 @@ async function rebuildHarnessSession(
 
   const rebuiltSession = HarnessSessionSchema.parse({
     ...session,
+    config: materializeConfigSummary(configResult),
+    projectHarness: refreshProjectHarnessManifest({
+      report: projectHarness,
+      toolIds: registry.list().map((tool) => tool.id),
+      skillIds: catalog.skills.map((skill) => skill.id)
+    }),
+    skills: {
+      ...session.skills,
+      catalog
+    },
     tools: materializeTools(registry)
   });
 
@@ -400,9 +429,21 @@ async function buildHarnessSession(
 ): Promise<BuiltHarnessSession> {
   const parsedOptions = StartHarnessSessionOptionsSchema.parse(options);
   const cwd = parsedOptions.cwd ?? process.cwd();
+  const blockers: string[] = [];
+  // Guru is useful in a new/plain directory too. A missing Git context is
+  // surfaced as absent repo metadata, not as a reason to prevent the project
+  // harness from starting and creating its .guru overlay.
+  const repo = resolveSessionRepositoryContext(parsedOptions.targetPath, cwd, []);
+  const projectRoot = repo?.repoRoot ?? resolveProjectRoot(parsedOptions.targetPath, cwd);
+  const projectHarness = bootstrapProjectHarness({
+    projectRoot,
+    ...(parsedOptions.guruHomeDirectory ? { homeDirectory: parsedOptions.guruHomeDirectory } : {})
+  });
+  const homePaths = getGuruHomePaths(parsedOptions.guruHomeDirectory);
   const configResult = loadHarnessConfig({
     ...(parsedOptions.configPath ? { configPath: parsedOptions.configPath } : {}),
-    cwd
+    cwd,
+    ...(parsedOptions.guruHomeDirectory ? { homeDirectory: parsedOptions.guruHomeDirectory } : {})
   });
   const configCwd = configResult.status === "loaded" ? dirname(configResult.path) : cwd;
   const baseState = createSelfBuildState();
@@ -415,14 +456,14 @@ async function buildHarnessSession(
     there: state.there,
     ...(task ? { task } : {})
   });
-  const blockers: string[] = [];
-  const repo = resolveSessionRepositoryContext(parsedOptions.targetPath, cwd, blockers);
   const catalog = discoverSessionSkills(configResult.config.skillDirectories, configCwd, blockers);
   const loadedSkills = loadSessionSkills(parsedOptions.skillIds, configResult.config.skillDirectories, configCwd, blockers);
   const { registry, mcpAttachment } = await createSessionTooling({
     skillLoaderOptions: { directories: configResult.config.skillDirectories, cwd: configCwd },
     operationalStore: dependencies.operationalStore,
     runtimeHardening: configResult.config.runtimeHardening,
+    memoryConfig: configResult.config.memory,
+    memoryDirectory: homePaths.memoryDirectory,
     bashOptimizer: configResult.config.bashOptimizer,
     mcpServers: configResult.config.mcpServers,
     ...(dependencies.commandExecutor ? { commandExecutor: dependencies.commandExecutor } : {}),
@@ -457,14 +498,12 @@ async function buildHarnessSession(
     here: state.here,
     there: state.there,
     direction,
-    config: {
-      status: configResult.status,
-      verdict: configResult.verdict,
-      path: configResult.path,
-      diagnostics: [...configResult.diagnostics],
-      runtimeName: configResult.config.runtimeName,
-      referenceRuntime: configResult.config.referenceRuntime
-    },
+    config: materializeConfigSummary(configResult),
+    projectHarness: refreshProjectHarnessManifest({
+      report: projectHarness,
+      toolIds: registry.list().map((tool) => tool.id),
+      skillIds: catalog.skills.map((skill) => skill.id)
+    }),
     repo: repo ? materializeRepositoryContext(repo) : null,
     skills: {
       catalog,
@@ -485,7 +524,7 @@ async function buildHarnessSession(
     },
     tools: materializeTools(registry),
     blockers,
-    nextActions: buildNextActions(blockers, task)
+    nextActions: buildNextActions(blockers, task, projectHarness)
   });
 
   return { session, registry, mcpAttachment };
@@ -609,16 +648,39 @@ function loadSessionSkills(
   });
 }
 
-function buildNextActions(blockers: readonly string[], task: SelfBuildTask | null): readonly string[] {
+function buildNextActions(blockers: readonly string[], task: SelfBuildTask | null, projectHarness?: { readonly status: "ready" | "degraded"; readonly nextActions: readonly string[] }): readonly string[] {
   if (blockers.length > 0) {
     return ["Resolve session blocker(s), then restart the harness session."];
   }
 
   return [
+    ...(projectHarness?.status === "degraded" ? projectHarness.nextActions : []),
     task ? `Use the assembled runtime context to work on ${task.id}.` : "Select a task before executing harness work.",
     "Dispatch typed tools through the session registry as needed.",
     "Run validation and peer/native review before repository handoff."
   ];
+}
+
+function materializeConfigSummary(configResult: ReturnType<typeof loadHarnessConfig>) {
+  return {
+    status: configResult.status,
+    verdict: configResult.verdict,
+    source: configResult.source,
+    path: configResult.path,
+    diagnostics: [...configResult.diagnostics],
+    runtimeName: configResult.config.runtimeName,
+    referenceRuntime: configResult.config.referenceRuntime
+  };
+}
+
+/** A project overlay is useful in an ordinary folder too; a Git repo is optional. */
+function resolveProjectRoot(targetPath: string | undefined, cwd: string): string {
+  const candidate = resolve(targetPath ?? cwd);
+  try {
+    return statSync(candidate).isFile() ? dirname(candidate) : candidate;
+  } catch {
+    return candidate;
+  }
 }
 
 function materializeTask(task: SelfBuildTask) {

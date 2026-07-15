@@ -17,6 +17,8 @@ import { createInterface } from "node:readline";
 import { StringDecoder } from "node:string_decoder";
 
 import { getRuntimeInfo, loadHarnessConfig } from "./index.js";
+import { getGuruHomePaths } from "./home/paths.js";
+import { bootstrapProjectHarness } from "./project-harness/bootstrap.js";
 import { createHarnessRuntime, type HarnessRuntime } from "./runtime/session.js";
 import type { HarnessSession } from "./runtime/schemas.js";
 import type { McpServerStatus } from "./mcp/schemas.js";
@@ -48,9 +50,16 @@ import {
 
 export { preserveHistoryOnModelSwitch } from "./guru/turnMessages.js";
 import { createFileMemoryStore } from "./memory/store.js";
-import { mergeScopedBootInjection } from "./memory/inject.js";
-import { buildRecallIndex, queryRecall } from "./memory/recall.js";
-import { createScopedMemory, MEMORY_SCOPES, type MemoryScope } from "./memory/scopes.js";
+import {
+  createMemorySessionService,
+  describeMemoryStorage,
+  isMemorySlashCommand,
+  refreshMemorySystemHead,
+  type MemoryCommandLine,
+  type MemorySessionService,
+  type MemoryToolContext
+} from "./guru/memorySessionService.js";
+import { initExtensions } from "./extensions/initExtensions.js";
 import { citeLearning, decaySweep, extractLearnings, gateLearning, promoteSweep, type Learning } from "./garage/flywheel.js";
 import { loadLearnings, migrateRoleLearnings, pruneLearning, storeLearning } from "./garage/flywheelStore.js";
 import { describeLoginFlow, formatExpiry } from "./model/loginFlow.js";
@@ -167,6 +176,7 @@ let theme = buildBrandAnsiTheme();
 
 interface GuruState {
   runtime: HarnessRuntime;
+  memory: MemorySessionService;
   session: HarnessSession | null;
   sessionTools: readonly ToolDefinition[];
   routes: readonly ProviderRouteDescriptor[];
@@ -278,39 +288,25 @@ BE HONEST. Report what you actually did and what you actually found. If somethin
  * prompt; /remember updates it live so the current session sees new facts too.
  */
 const guruMemoryStore = createFileMemoryStore();
-/**
- * The scoped-memory organ (§7): global (the store above — garage/gaps live here),
- * plus a space store for the session repo and a role store for the worn suit, both
- * bound lazily (setRepoRoot at session start, setRole at suit-up/park). Boot
- * injection merges across the active scopes; /remember + the flywheel address one.
- */
-const scopedMemory = createScopedMemory(guruMemoryStore);
-let bootMemoryBlock = "";
-/** Learning ids injected into THIS session's boot block — the CITE candidates. */
-let injectedLearningIds: readonly string[] = [];
-
-function systemPrompt(): string {
+function baseSystemPrompt(): string {
   // §17 scenario 14: the model always knows the actual date (point-in-time context).
-  return `${SYSTEM_PROMPT}\n\n${formatTodayLine(new Date())}${bootMemoryBlock}`;
+  return `${SYSTEM_PROMPT}\n\n${formatTodayLine(new Date())}`;
 }
 
-/**
- * Rebuild the injected memory block. With a `query` (Smart Connections, §7), the
- * facts are BM25-ranked by relevance to it (the current turn) and its terms seed
- * the learnings task-boost; without one, the cold recency/decay ordering.
- */
-function refreshBootMemoryBlock(query?: string): void {
-  try {
-    const injection = mergeScopedBootInjection(scopedMemory.activeStores(), query ? { query } : {});
-    bootMemoryBlock = injection.block;
-    injectedLearningIds = injection.injectedLearningIds;
-  } catch {
-    // Keep the LAST good block instead of blanking to "" (review 2026-07-08): the
-    // old catch wiped EVERY fact for the whole session on any throw, so a single
-    // transient parse failure made the model "forget" everything until restart.
-    // Per-learning skipping in mergeScopedBootInjection handles the common case;
-    // this is the last line of defense — preserve, don't erase.
-  }
+function systemPrompt(state: Pick<GuruState, "memory">): string {
+  return state.memory.composeSystemPrompt(baseSystemPrompt());
+}
+
+function memoryToolContext(state: GuruState): MemoryToolContext | undefined {
+  return state.session ? { sessionId: state.session.id, runtime: state.runtime } : undefined;
+}
+
+async function refreshStateMemory(state: GuruState, query?: string): Promise<void> {
+  const toolContext = memoryToolContext(state);
+  await refreshMemorySystemHead(state.memory, state.history, baseSystemPrompt(), {
+    ...(query ? { query } : {}),
+    ...(toolContext ? { toolContext } : {})
+  });
 }
 
 /** Flywheel decay clocks: sessions primary (§8), days as the fallback for pre-counter learnings. */
@@ -325,7 +321,7 @@ const FLYWHEEL_PROMOTION = { promoteToSkill: 2, promoteToRule: 4, demoteAfterSes
  * learnings this session actually used, then DECAY-sweep (supersede / prune stale
  * / surface review + cross-level conflicts). Returns a one-line receipt tail.
  */
-function runFlywheelAtPark(roleSlug: string, earnedTools: readonly string[], usedTools: ReadonlySet<string>, routeId: string, turns: number, sessionNumber: number): string {
+function runFlywheelAtPark(memory: MemorySessionService, roleSlug: string, earnedTools: readonly string[], usedTools: ReadonlySet<string>, routeId: string, turns: number, sessionNumber: number): string {
   let extracted = 0;
   let cited = 0;
   let pruned = 0;
@@ -334,7 +330,7 @@ function runFlywheelAtPark(roleSlug: string, earnedTools: readonly string[], use
   let demoted = 0;
   // Address the role scope (§7): a suit's learnings compound in its own namespace.
   // Falls back to global if the role store isn't resolvable (should not happen at park).
-  const store = scopedMemory.storeFor("role") ?? guruMemoryStore;
+  const store = memory.localStoreFor("role") ?? guruMemoryStore;
   try {
     // EXTRACT + GATE + STORE.
     const existing = new Set(loadLearnings(store).map((learning) => learning.id));
@@ -347,7 +343,7 @@ function runFlywheelAtPark(roleSlug: string, earnedTools: readonly string[], use
       }
     }
     // CITE — an injected learning whose tools were all used this session earns a citation.
-    const injected = new Set(injectedLearningIds);
+    const injected = new Set(memory.injectedLearningIds);
     for (const learning of loadLearnings(store)) {
       if (!injected.has(learning.id) || learning.tools.length === 0) {
         continue;
@@ -414,6 +410,7 @@ export const GURU_CHAT_TOOL_IDS: ReadonlySet<string> = new Set([
   "memory_remember",
   "memory_search",
   "memory_get",
+  "memory_status",
   "spawn_agent",
   "get_task_output",
   "kill_task",
@@ -448,6 +445,7 @@ export const READ_ONLY_TOOL_IDS: ReadonlySet<string> = new Set([
   "honcho_context",
   "memory_search",
   "memory_get",
+  "memory_status",
   "get_task_output",
   "resolve_capability_gap",
   "todo_list",
@@ -464,6 +462,204 @@ export const READ_ONLY_TOOL_IDS: ReadonlySet<string> = new Set([
   "read_diagnostics"
 ]);
 
+/** Access text for `/tools`: reflect the mode actually active in this session. */
+export type ToolAccessMode = "free" | "denied" | "yolo" | "policy" | "session" | "approval";
+
+export function getToolAccessMode(
+  toolId: string,
+  yolo: boolean,
+  mandate: Pick<MandateState, "grants" | "denies"> = { grants: [], denies: [] },
+  sessionApprovals: ReadonlySet<MandateVerb> = new Set(),
+  cwd: string = process.cwd()
+): ToolAccessMode {
+  // Mirror the live approval pipeline's Guru-specific always-allowed floor
+  // before delegating path, deny, hard-edge, YOLO, and grant precedence.
+  if (READ_ONLY_TOOL_IDS.has(toolId)) {
+    return "free";
+  }
+
+  const decision = evaluateToolMandate(toolId, {}, { cwd, state: mandate, yolo });
+  if (decision.verbs.length === 0) {
+    return "free";
+  }
+  if (decision.outcome === "deny") {
+    return "denied";
+  }
+  if (decision.outcome === "allow") {
+    return yolo ? "yolo" : "policy";
+  }
+
+  const hardEdge = decision.verbs.some((verb) => HARD_EDGE_VERBS.has(verb));
+  const sessionCovered =
+    !hardEdge && decision.verbs.every((verb) => sessionApprovals.has(verb));
+  return sessionCovered ? "session" : "approval";
+}
+
+export interface EffectiveAccessInput {
+  readonly yolo: boolean;
+  readonly mandate: Pick<MandateState, "grants" | "denies">;
+  readonly sessionApprovals?: ReadonlySet<MandateVerb>;
+}
+
+export interface EffectiveAccessDescription {
+  readonly mode: "yolo" | "safe" | "policy";
+  readonly chip: string;
+  readonly summary: string;
+  readonly grantCount: number;
+  readonly grantsShadowed: boolean;
+}
+
+function savedGrantDescription(grant: MandateState["grants"][number]): string {
+  const scope = grant.scope === "space" ? `space ${grant.path ?? "(missing path)"}` : "machine";
+  return `${scope} ${grant.verbs.join("+")}`;
+}
+
+function directGrantDescription(
+  grant: MandateState["grants"][number],
+  denies: MandateState["denies"]
+): string | null {
+  const deniedVerbs = new Set(denies.filter((deny) => deny.path === undefined).map((deny) => deny.verb));
+  const directVerbs = grant.verbs.filter((verb) => !HARD_EDGE_VERBS.has(verb) && !deniedVerbs.has(verb));
+  if (directVerbs.length === 0) {
+    return null;
+  }
+  const scope = grant.scope === "space" ? `space ${grant.path ?? "(missing path)"}` : "machine";
+  return `${scope} ${directVerbs.join("+")}`;
+}
+
+/** One canonical, read-only description of the access policy effective now. */
+export function describeEffectiveAccess(input: EffectiveAccessInput): EffectiveAccessDescription {
+  const grantCount = input.mandate.grants.length;
+  const globallyDeniedVerbs = new Set(input.mandate.denies.filter((deny) => deny.path === undefined).map((deny) => deny.verb));
+  const sessionVerbs = [...(input.sessionApprovals ?? [])]
+    .filter((verb) => !HARD_EDGE_VERBS.has(verb) && !globallyDeniedVerbs.has(verb))
+    .sort();
+  const sessionCopy = sessionVerbs.length > 0
+    ? ` Session-approved ${sessionVerbs.join("+")} remain direct where no scoped deny applies for this session.`
+    : "";
+  const hardEdges = "Denies and destructive/spend/secret/auth hard edges still bind.";
+
+  if (input.yolo) {
+    const shadowCopy = grantCount > 0 ? ` ${grantCount} saved grant(s) are shadowed until YOLO is off.` : "";
+    return {
+      mode: "yolo",
+      chip: "⚡YOLO",
+      summary: `YOLO: ordinary machine read/write/exec run directly. ${hardEdges}${shadowCopy}`,
+      grantCount,
+      grantsShadowed: grantCount > 0
+    };
+  }
+
+  if (grantCount === 0) {
+    return {
+      mode: "safe",
+      chip: "SAFE",
+      summary: `Safe mode: no saved grants; ordinary mutations use per-call approval.${sessionCopy} ${hardEdges}`,
+      grantCount,
+      grantsShadowed: false
+    };
+  }
+
+  const directPolicy = input.mandate.grants
+    .map((grant) => directGrantDescription(grant, input.mandate.denies))
+    .filter((description): description is string => description !== null)
+    .join("; ");
+  const policyCopy = directPolicy.length > 0
+    ? `${directPolicy} remain direct where no scoped deny applies`
+    : "saved grants currently provide no direct ordinary verbs";
+  return {
+    mode: "policy",
+    chip: `POLICY:${grantCount}`,
+    summary: `Policy mode: ${policyCopy}; uncovered ordinary mutations use per-call approval.${sessionCopy} ${hardEdges}`,
+    grantCount,
+    grantsShadowed: false
+  };
+}
+
+/** Bare `/mandate` report. Formatting is data-only so every surface stays testable. */
+export function formatMandateOverview(input: EffectiveAccessInput & { readonly filePath: string }): readonly string[] {
+  const access = describeEffectiveAccess(input);
+  const lines = [
+    `mandates — ${access.grantCount} saved grant(s) · ${input.mandate.denies.length} saved deny rule(s)`,
+    "Persistent mandates are advanced policy for safe mode; YOLO shadows saved grants only, while matching denies remain binding.",
+    `Effective access: ${access.summary}`,
+    `Storage: ${input.filePath}`,
+    "Saved grants:"
+  ];
+  if (input.mandate.grants.length === 0) {
+    lines.push("  (none)");
+  } else {
+    for (const grant of input.mandate.grants) {
+      const hardEdges = grant.verbs.filter((verb) => HARD_EDGE_VERBS.has(verb));
+      const ordinaryVerbs = grant.verbs.filter((verb) => !HARD_EDGE_VERBS.has(verb));
+      const hardEdgeCopy = hardEdges.length > 0 ? `; ${hardEdges.join("+")} still require explicit approval` : "";
+      const state = input.yolo
+        ? `shadowed by YOLO${hardEdgeCopy}`
+        : ordinaryVerbs.length > 0
+          ? `ordinary verbs active when scope matches and no deny applies${hardEdgeCopy}`
+          : `no direct ordinary verbs${hardEdgeCopy}`;
+      lines.push(`  ${savedGrantDescription(grant)} · grantedAt ${grant.grantedAt} · ${state}`);
+    }
+  }
+  lines.push("Saved denies:");
+  if (input.mandate.denies.length === 0) {
+    lines.push("  (none)");
+  } else {
+    for (const deny of input.mandate.denies) {
+      const where = deny.path ? `path ${deny.path}` : "all paths";
+      const note = deny.note ? ` · note ${deny.note}` : "";
+      lines.push(`  ${deny.verb} · ${where}${note} · binding in every mode when matched, including YOLO`);
+    }
+  }
+  lines.push(
+    "Examples:",
+    "  /mandate grant space work    — read+write+exec for this project",
+    "  /mandate grant machine work  — read+write+exec for this computer",
+    "  /mandate revoke              — clear all saved grants and denies"
+  );
+  return lines;
+}
+
+/** Dynamic, executable access drill rows for the slash menu. */
+export function buildAccessDrillMenuItems(
+  parentId: "/status" | "/yolo" | "/mandate",
+  input: EffectiveAccessInput
+): readonly MenuItem[] {
+  const access = describeEffectiveAccess(input);
+  const items: MenuItem[] = [{ id: parentId, label: access.chip, hint: access.summary }];
+  if (parentId === "/yolo") {
+    const onAccess = describeEffectiveAccess({ ...input, yolo: true });
+    const offAccess = describeEffectiveAccess({ ...input, yolo: false });
+    items.push(
+      { id: "/yolo on", label: "YOLO on", hint: onAccess.summary },
+      { id: "/yolo off", label: "YOLO off", hint: offAccess.summary }
+    );
+  } else if (parentId === "/mandate") {
+    const grantHintSuffix = input.yolo ? "; shadowed while YOLO is active" : "";
+    items.push(
+      { id: "/mandate grant space work", label: "grant project work", hint: `persist read+write+exec for this project${grantHintSuffix}` },
+      { id: "/mandate grant machine work", label: "grant machine work", hint: `persist read+write+exec for this computer${grantHintSuffix}` }
+    );
+    if (access.grantCount > 0 || input.mandate.denies.length > 0) {
+      const revokedAccess = describeEffectiveAccess({
+        ...input,
+        mandate: { grants: [], denies: [] }
+      });
+      items.push({ id: "/mandate revoke", label: "revoke saved grants and denies", hint: revokedAccess.summary });
+    }
+  }
+  return items;
+}
+
+/** Read a spawn-time YOLO snapshot, falling back for older or foreign snapshots. */
+export function resolveWorkerYolo(snapshot: unknown, fallback: boolean): boolean {
+  if (typeof snapshot !== "object" || snapshot === null) {
+    return fallback;
+  }
+  const value = (snapshot as Record<string, unknown>).yolo;
+  return typeof value === "boolean" ? value : fallback;
+}
+
 export interface SlashCommand {
   readonly name: string;
   readonly usage: string;
@@ -472,7 +668,7 @@ export interface SlashCommand {
 
 export const SLASH_COMMANDS: readonly SlashCommand[] = [
   { name: "/help", usage: "/help", description: "Show commands and hotkeys" },
-  { name: "/status", usage: "/status", description: "Harness status: session, model, Honcho, routes" },
+  { name: "/status", usage: "/status", description: "Harness status and effective access" },
   { name: "/model", usage: "/model [routeId|#] [modelIdOverride]", description: "Browse providers or connect a route" },
   { name: "/models", usage: "/models", description: "Print the exhaustive model catalog" },
   { name: "/sessions", usage: "/sessions", description: "List saved conversations (resumable)" },
@@ -484,7 +680,7 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = [
   { name: "/clone", usage: "/clone", description: "Duplicate the active branch for destructive experiments" },
   { name: "/skills", usage: "/skills [promote <id>]", description: "List discovered skills ([bridge] = ATTACH); promote a bridge skill to native" },
   { name: "/remember", usage: "/remember [global|space|role] <fact>", description: "Save a durable memory fact to a scope (default global; injected at boot)" },
-  { name: "/memory", usage: "/memory [status|doctor]", description: "Memory organ status / heal the index" },
+  { name: "/memory", usage: "/memory [status|doctor|migrate]", description: "Memory backend status, repair, or explicit Markdown → PostgreSQL migration" },
   { name: "/recall", usage: "/recall <query>", description: "Smart Connections — surface memory semantically related to a query (BM25)" },
   { name: "/role", usage: "/role [list | suit <thing> | park | off]", description: "Suit up for the day's work (roles emerge; garage lists parked suits)" },
   { name: "/lookahead", usage: "/lookahead [on|off]", description: "The scout/commit look-ahead engine (config-gated; scouts run ahead in dead time)" },
@@ -498,8 +694,8 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = [
   { name: "/logout", usage: "/logout <provider>", description: "How to disconnect a provider (guru holds no token file)" },
   { name: "/tools", usage: "/tools", description: "List live session tools" },
   { name: "/todo", usage: "/todo", description: "Show the agent task board (todo_list / todo_write)" },
-  { name: "/mandate", usage: "/mandate [grant space|machine <verbs> | list | revoke]", description: "Standing permission grants (this repo/computer is yours)" },
-  { name: "/yolo", usage: "/yolo [on|off]", description: "YOLO is the default; /yolo off engages safe mode (hard edges always hold)" },
+  { name: "/mandate", usage: "/mandate [grant space|machine <verbs> | list | revoke]", description: "Inspect effective access and persistent safe-mode policy" },
+  { name: "/yolo", usage: "/yolo [on|off]", description: "Inspect or toggle effective access (hard edges always hold)" },
   { name: "/context", usage: "/context", description: "Context window usage and session footprint (tokens / ctx%)" },
   { name: "/export", usage: "/export [path]", description: "Write the conversation transcript to a markdown file" },
   { name: "/copy", usage: "/copy [n]", description: "Copy the latest (or Nth-latest) assistant reply to the clipboard" },
@@ -797,16 +993,19 @@ export function resolveCompactRouteSelector(
   return routes.find((route) => route.routeId === routeId);
 }
 
-function banner(): string {
+export function banner(
+  accessInput: EffectiveAccessInput = { yolo: true, mandate: { grants: [], denies: [] } }
+): string {
   const info = getRuntimeInfo();
   const columns = process.stdout.columns ?? (Number(process.env.COLUMNS) || 80);
   const splash = renderSplash(paint, { version: info.version, themeName: paint.name, node: process.versions.node }, columns);
+  const access = describeEffectiveAccess(accessInput);
   return [
     "",
     splash.trimEnd(),
     "",
     paint.fg("muted", `  build ${resolveBuildStamp()} · agentic tools · streaming · resumable sessions`),
-    `  ${paint.fg("warning", "⚡ YOLO")} ${paint.fg("muted", "— the default. Guru does the job; it never pauses for permission. Only spend, destructive & secret/auth actions stop to ask. /yolo off for safe mode.")}`,
+    `  ${paint.fg(access.mode === "yolo" ? "warning" : "success", access.chip)} ${paint.fg("muted", `— ${access.summary}`)}`,
     paint.fg("muted", "  /help commands · /model connect a model · /resume continue a session · ctrl+d exit"),
     ""
   ].join("\n");
@@ -838,6 +1037,7 @@ function fmtTokens(value: number): string {
 export function buildStatusBar(state: GuruState, columns: number = process.stdout.columns ?? 80): string {
   const project = state.session?.repo ? basename(state.session.repo.repoRoot) : "no repo";
   const sep = paint.fg("muted", " · ");
+  const access = describeEffectiveAccess({ yolo: state.yolo, mandate: state.mandate, sessionApprovals: state.sessionApprovals });
 
   const leftParts: string[] = [`${paint.fg("accent2", GLYPHS.agent)} ${paint.fg("fgBright", project)}`];
   if (state.activeRole) {
@@ -847,14 +1047,10 @@ export function buildStatusBar(state: GuruState, columns: number = process.stdou
   if (state.busy) {
     chips.push(paint.fg("warning", "…run"));
   }
-  if (state.yolo) {
-    chips.push(paint.fg("warning", "⚡YOLO"));
-  }
+  const accessTone = access.mode === "yolo" ? "warning" : access.mode === "policy" ? "success" : "muted";
+  chips.push(paint.fg(accessTone, access.chip));
   if (state.lookahead.enabled) {
     chips.push(paint.fg("accent2", "⛃scout"));
-  }
-  if (state.mandate.grants.length > 0) {
-    chips.push(paint.fg("success", "⛨mandate"));
   }
   // Follow-up / steer queue depth (§5) — only when something is waiting.
   const queue = state.agentSession?.queueDepth() ?? 0;
@@ -893,7 +1089,7 @@ export function buildStatusBar(state: GuruState, columns: number = process.stdou
   // model, and drop accounting detail that would hard-wrap the pinned chrome.
   const compactChipLabels = [
     ...(state.busy ? ["…run"] : []),
-    ...(state.yolo ? ["⚡YOLO"] : []),
+    access.chip,
     ...(queue > 0 ? [`q:${queue}`] : [])
   ];
   const rightBudget = Math.max(8, Math.min(24, Math.floor(usable * 0.48)));
@@ -921,6 +1117,7 @@ function print(text: string): void {
 async function cmdStatus(state: GuruState): Promise<void> {
   const honchoTool = state.session?.tools.find((tool) => tool.id === "honcho_memory_status");
   const summary = summarizeReadiness(mapRoutesToProviders(state.routes, { lastCheckedAt: new Date().toISOString(), env: process.env }));
+  const access = describeEffectiveAccess({ yolo: state.yolo, mandate: state.mandate, sessionApprovals: state.sessionApprovals });
   print(paint.bold(paint.fg("fgBright", "Guru Harness status")));
   const rows: string[][] = [
     [paint.fg("muted", "runtime"), `${getRuntimeInfo().name} ${getRuntimeInfo().version}`],
@@ -929,12 +1126,7 @@ async function cmdStatus(state: GuruState): Promise<void> {
     [paint.fg("muted", "model"), state.connectedRoute ? `${state.connectedRoute.routeId} ${paint.fg("fgFaint", `[${state.connectedRoute.apiFamily ?? "?"}]`)}` : "not connected"],
     [paint.fg("muted", "routes"), `${state.routes.length} in catalog · ${summary.active} active · ${summary.readyUnverified} ready · ${summary.missingOrLogin} missing/login`],
     [paint.fg("muted", "usage"), `${state.usage.inputTokens} in / ${state.usage.outputTokens} out · ${state.usage.turns} turn(s)`],
-    [
-      paint.fg("muted", "approval"),
-      state.sessionApprovals.size > 0
-        ? `${badge(paint, "PER-CALL", "brand")} ${paint.fg("fgFaint", `${[...state.sessionApprovals].join("+")} approved this session`)}`
-        : `${badge(paint, "PER-CALL", "brand")} ${paint.fg("fgFaint", "each mutating call prompts (y/N/always)")}`
-    ]
+    [paint.fg("muted", "access"), `${badge(paint, access.chip, access.mode === "yolo" ? "warning" : access.mode === "policy" ? "success" : "brand")} ${paint.fg("fgFaint", access.summary)}`]
   ];
   for (const row of rows) {
     print(`  ${row[0]!.padEnd(paint.level === "none" ? 8 : 30)} ${row[1]!}`);
@@ -984,7 +1176,7 @@ function applyConnectedRoute(
   const keptMessages = state.history.filter((message) => message.role === "user" || message.role === "assistant").length;
   state.connectedRoute = route;
   state.modelIdOverride = override;
-  state.history = preserveHistoryOnModelSwitch(state.history, systemPrompt());
+  state.history = preserveHistoryOnModelSwitch(state.history, systemPrompt(state));
   resetTurnEngine(state);
   return { keptMessages };
 }
@@ -1444,7 +1636,7 @@ function injectBranchMemory(state: GuruState): void {
 }
 
 /** Point live state at a replayed session (resume / fork / clone) and inject branch memory. */
-function switchToSession(state: GuruState, session: ReconstructedSession, lineage: SessionLineage | null): void {
+async function switchToSession(state: GuruState, session: ReconstructedSession, lineage: SessionLineage | null): Promise<void> {
   state.conversationId = session.id;
   state.createdAt = session.createdAt;
   state.history = session.messages.map((message) => ({ role: message.role, content: message.content }));
@@ -1488,10 +1680,7 @@ function switchToSession(state: GuruState, session: ReconstructedSession, lineag
   // so facts remembered after that point are invisible to the model until the
   // first submitted message triggers the per-turn rebuild. Refresh + replace the
   // head now so a resumed session starts with current memory, not a stale snapshot.
-  refreshBootMemoryBlock();
-  if (state.history[0]?.role === "system") {
-    state.history[0] = { role: "system", content: systemPrompt() };
-  }
+  await refreshStateMemory(state);
 }
 
 /** Leaving a branch with new turns: fold it to a branch summary via the compaction summarizer. */
@@ -1581,7 +1770,7 @@ async function cmdResume(state: GuruState, selector: string): Promise<void> {
       routeNote = `, route ${record.routeId}`;
     }
   }
-  switchToSession(state, record, record.lineage ?? null);
+  await switchToSession(state, record, record.lineage ?? null);
   print(colorize(theme, "green", `Resumed: ${record.title}`) + dim(theme, ` (${record.messages.length} message(s)${routeNote})`));
 }
 
@@ -1589,7 +1778,7 @@ async function cmdNew(state: GuruState): Promise<void> {
   await maybeSummarizeBranch(state);
   state.conversationId = randomUUID();
   state.createdAt = new Date().toISOString();
-  state.history = [{ role: "system", content: systemPrompt() }];
+  state.history = [{ role: "system", content: systemPrompt(state) }];
   state.usage = { inputTokens: 0, outputTokens: 0, turns: 0, lastInputTokens: 0 };
   state.compaction.last = null;
   state.compaction.files = { readFiles: new Set(), modifiedFiles: new Set() };
@@ -1664,7 +1853,7 @@ async function cmdFork(state: GuruState, args: readonly string[]): Promise<void>
     print(colorize(theme, "red", "Fork failed — could not resolve the selected turn."));
     return;
   }
-  switchToSession(state, forked.session, forked.session.lineage ?? null);
+  await switchToSession(state, forked.session, forked.session.lineage ?? null);
   print(
     colorize(theme, "green", `Forked from turn ${requested} → branch ${forked.newId.slice(0, 8)}`) +
       dim(theme, ` (${forked.session.messages.length} message(s) carried over; original untouched)`)
@@ -1701,7 +1890,7 @@ async function cmdRewind(state: GuruState, args: readonly string[]): Promise<voi
     print(colorize(theme, "red", "Rewind failed — could not fork at the selected turn."));
     return;
   }
-  switchToSession(state, forked.session, forked.session.lineage ?? null);
+  await switchToSession(state, forked.session, forked.session.lineage ?? null);
   print(
     colorize(theme, "green", `Rewound ${rewindCount} turn(s) (back to turn ${targetTurn}) → branch ${forked.newId.slice(0, 8)}`) +
       dim(theme, ` (${forked.session.messages.length} message(s) carried over; original untouched)`)
@@ -1714,7 +1903,7 @@ async function cmdClone(state: GuruState): Promise<void> {
     print(dim(theme, "Nothing to clone yet."));
     return;
   }
-  switchToSession(state, cloned.session, cloned.session.lineage ?? null);
+  await switchToSession(state, cloned.session, cloned.session.lineage ?? null);
   print(
     colorize(theme, "green", `Cloned the active branch → ${cloned.newId.slice(0, 8)}`) +
       dim(theme, " (experiment freely; the original branch is intact)")
@@ -1775,132 +1964,28 @@ function cmdSkillPromote(state: GuruState, skillId: string): void {
   print(colorize(theme, "green", `Promoted ${skill.id} to native — bridge dropped, parity gap closed.`));
 }
 
-function cmdRemember(state: GuruState, args: readonly string[]): void {
-  // An optional leading scope keyword targets a namespace (§7); default global.
-  let scope: MemoryScope = "global";
-  let words = [...args];
-  const firstWord = (words[0] ?? "").toLowerCase();
-  if ((MEMORY_SCOPES as readonly string[]).includes(firstWord)) {
-    scope = firstWord as MemoryScope;
-    words = words.slice(1);
-  }
-  const textInput = words.join(" ").trim();
-  if (textInput.length === 0) {
-    print(dim(theme, "Usage: /remember [global|space|role] <fact to persist>"));
+function renderMemoryLine(line: MemoryCommandLine): void {
+  if (line.segments) {
+    print(line.segments.map((segment) => {
+      if (segment.tone === "muted") return dim(theme, segment.text);
+      if (segment.tone === "heading") return bold(theme, segment.text);
+      if (segment.tone === "info") return colorize(theme, "cyan", segment.text);
+      return segment.text;
+    }).join(""));
     return;
   }
-  let store = scopedMemory.storeFor(scope);
-  if (!store) {
-    print(dim(theme, `  no ${scope} scope active (${scope === "space" ? "no repo bound" : "no suit worn"}) — saving to global`));
-    scope = "global";
-    store = guruMemoryStore;
-  }
-  const firstSentence = textInput.split(/(?<=[.!?])\s+/u)[0] ?? textInput;
-  const title = (firstSentence.length > 80 ? `${firstSentence.slice(0, 77)}...` : firstSentence).trim();
-  const description = (textInput.length > 200 ? `${textInput.slice(0, 197)}...` : textInput).replace(/\s+/gu, " ").trim();
-  const result = store.remember({ title, description, body: textInput, type: "project", edit: "replace", confidence: 1 });
-  if (result.status === "blocked") {
-    print(colorize(theme, "yellow", result.summary));
-    for (const blocker of result.blockers) {
-      print(dim(theme, `  ${blocker}`));
-    }
-    return;
-  }
-  refreshBootMemoryBlock();
-  if (state.history[0]?.role === "system") {
-    state.history[0] = { role: "system", content: systemPrompt() };
-  }
-  const scopeNote = scope === "global" ? "" : ` (${scope} scope)`;
-  print(colorize(theme, "green", `${result.summary}${scopeNote} It will be in every future boot briefing.`));
+  if (line.tone === "muted") print(dim(theme, line.text));
+  else if (line.tone === "heading") print(bold(theme, line.text));
+  else if (line.tone === "success") print(colorize(theme, "green", line.text));
+  else if (line.tone === "warning") print(colorize(theme, "yellow", line.text));
+  else print(line.text);
 }
 
-function cmdMemory(args: readonly string[]): void {
-  const sub = (args[0] ?? "status").toLowerCase();
-  if (sub === "doctor") {
-    const report = guruMemoryStore.doctor();
-    print(colorize(theme, "green", report.summary));
-    for (const corrupt of report.corruptSkipped) {
-      print(dim(theme, `  corrupt (skipped): ${corrupt}`));
-    }
-    for (const link of report.danglingLinks) {
-      print(dim(theme, `  dangling link: ${link}`));
-    }
-    refreshBootMemoryBlock();
-    return;
-  }
-  // Headline counts the OPERATOR'S view across every ACTIVE scope, not just
-  // global — the per-scope breakdown below adds space/role, so showing only
-  // global here made the total look wrong (e.g. "memory — 5 fact(s)" next to
-  // "space 12 fact(s)" with no total).
-  const scopedFacts = scopedMemory.activeStores();
-  const totalFacts = scopedFacts.reduce((sum, { store }) => sum + store.list().length, 0);
-  print(bold(theme, `memory — ${totalFacts} fact(s) across ${scopedFacts.length} scope(s)`));
-  for (const { scope, store } of scopedFacts) {
-    const count = store.list().length;
-    print(dim(theme, `  ${scope.padEnd(6)} ${count} fact(s)  (${store.directory})`));
-  }
-  // The list preview sticks to global so the operator sees the *familiar* short
-  // list; use `/recall <query>` (or memory_search) to scan the other scopes.
-  const facts = guruMemoryStore.list();
-  for (const { fact } of facts.slice(0, 15)) {
-    print(`  ${colorize(theme, "cyan", fact.name.padEnd(34))} ${dim(theme, `${fact.type} · updated ${fact.updatedAt.slice(0, 10)}`)}`);
-  }
-  if (facts.length > 15) {
-    print(dim(theme, `  ...and ${facts.length - 15} more in global (memory_search)`));
-  }
-  if (totalFacts === 0) {
-    print(dim(theme, "  Nothing remembered yet — /remember [global|space|role] <fact> or the memory_remember tool."));
-  }
-  print(dim(theme, "  Obsidian-compatible vault: open a scope directory above as a vault to browse/graph it."));
-}
-
-/**
- * Smart Connections (§7, v0.25): surface memory — facts + learnings, across every
- * active scope — semantically related to a query, ranked by BM25. The same relevance
- * signal that re-ranks the injected memory each turn, exposed as an explicit lookup.
- */
-function cmdRecall(args: readonly string[]): void {
-  const query = args.join(" ").trim();
-  if (query.length === 0) {
-    print(dim(theme, "Usage: /recall <what you're looking for>"));
-    return;
-  }
-  const docs: { id: string; text: string }[] = [];
-  const meta = new Map<string, { label: string; kind: string; scope: MemoryScope }>();
-  for (const { scope, store } of scopedMemory.activeStores()) {
-    for (const { fact } of store.list()) {
-      if (fact.type === "learning") {
-        continue;
-      }
-      const id = `${scope}:${fact.name}`;
-      if (meta.has(id)) {
-        continue;
-      }
-      docs.push({ id, text: `${fact.title} ${fact.description}` });
-      meta.set(id, { label: `${fact.title} — ${fact.description}`, kind: "fact", scope });
-    }
-    for (const learning of loadLearnings(store)) {
-      const id = `${scope}:learning:${learning.id}`;
-      if (meta.has(id)) {
-        continue;
-      }
-      docs.push({ id, text: `${learning.statement} ${learning.subject} ${learning.tools.join(" ")}` });
-      meta.set(id, { label: `(${learning.level}) ${learning.statement}`, kind: "learning", scope });
-    }
-  }
-  const hits = queryRecall(buildRecallIndex(docs), query, 10);
-  if (hits.length === 0) {
-    print(dim(theme, `No memory related to "${query}" (searched ${docs.length} item(s)).`));
-    return;
-  }
-  print(bold(theme, `recall — ${hits.length} related to "${query}"`) + dim(theme, `  (BM25 over ${docs.length} item(s))`));
-  for (const hit of hits) {
-    const entry = meta.get(hit.id);
-    if (!entry) {
-      continue;
-    }
-    const tag = entry.scope === "global" ? "" : ` ·${entry.scope}`;
-    print(`  ${colorize(theme, "cyan", hit.score.toFixed(2).padStart(5))} ${dim(theme, `${entry.kind}${tag}`)}  ${entry.label}`);
+async function cmdMemorySession(state: GuruState, command: "/remember" | "/memory" | "/recall", args: readonly string[]): Promise<void> {
+  const result = await state.memory.runCommand(command, args, memoryToolContext(state));
+  for (const line of result.lines) renderMemoryLine(line);
+  if (result.contextChanged && state.history[0]?.role === "system") {
+    state.history[0] = { role: "system", content: systemPrompt(state) };
   }
 }
 
@@ -1937,7 +2022,7 @@ function suitUpSummary(state: GuruState, fromGarage: boolean): void {
   }
 }
 
-function cmdRoleSuit(state: GuruState, description: string): void {
+async function cmdRoleSuit(state: GuruState, description: string): Promise<void> {
   if (description.trim().length === 0) {
     print(dim(theme, "Usage: /role suit <what we're doing today>"));
     return;
@@ -2003,19 +2088,19 @@ function cmdRoleSuit(state: GuruState, description: string): void {
   }
   // Bind the role scope (§7): this suit's learnings now compound in its own
   // namespace. Self-heal legacy flat-store learnings into it on first wear.
-  scopedMemory.setRole(slug);
-  const roleStore = scopedMemory.role();
+  state.memory.bindRole(slug);
+  const roleStore = state.memory.localStoreFor("role");
   if (roleStore) {
     const moved = migrateRoleLearnings(guruMemoryStore, roleStore, slug);
     if (moved > 0) {
       print(dim(theme, `  ${moved} legacy learning(s) folded into the ${slug} role scope`));
     }
   }
-  refreshBootMemoryBlock();
+  await refreshStateMemory(state);
   state.toolsUsed = new Set<string>();
 }
 
-function cmdRolePark(state: GuruState): void {
+async function cmdRolePark(state: GuruState): Promise<void> {
   const role = state.activeRole;
   if (!role) {
     print(dim(theme, "Not suited — /role suit <thing> first."));
@@ -2059,6 +2144,7 @@ function cmdRolePark(state: GuruState): void {
   // The knowledge flywheel (§8): extract/gate/store/cite/decay BEFORE the boot
   // block refreshes so newly-learned facts are injectable next session.
   const flywheelTail = runFlywheelAtPark(
+    state.memory,
     role.slug,
     earned,
     state.toolsUsed,
@@ -2066,7 +2152,7 @@ function cmdRolePark(state: GuruState): void {
     state.usage.turns,
     state.sessionNumber
   );
-  refreshBootMemoryBlock();
+  await refreshStateMemory(state);
   print(
     colorize(theme, "green", `Parked ${role.label} in the garage.`) +
       dim(theme, `  receipt: ${receipt.stored} stored · ${receipt.rejected} rejected · ${receipt.gaps} gap(s) · ${receipt.verificationStatus}`)
@@ -2079,11 +2165,11 @@ function cmdRolePark(state: GuruState): void {
     print(dim(theme, `  +${earned.length} tool(s) verified-by-use this session`));
   }
   state.activeRole = null;
-  scopedMemory.setRole(null); // role scope closes with the suit
-  refreshBootMemoryBlock();
+  state.memory.bindRole(null); // role scope closes with the suit
+  await refreshStateMemory(state);
 }
 
-function cmdRole(state: GuruState, args: readonly string[]): void {
+async function cmdRole(state: GuruState, args: readonly string[]): Promise<void> {
   const sub = (args[0] ?? "list").toLowerCase();
   if (sub === "list") {
     const roles = listRoles(guruMemoryStore);
@@ -2099,18 +2185,18 @@ function cmdRole(state: GuruState, args: readonly string[]): void {
     return;
   }
   if (sub === "suit") {
-    cmdRoleSuit(state, args.slice(1).join(" "));
+    await cmdRoleSuit(state, args.slice(1).join(" "));
     return;
   }
   if (sub === "park") {
-    cmdRolePark(state);
+    await cmdRolePark(state);
     return;
   }
   if (sub === "off") {
     state.activeRole = null;
-    scopedMemory.setRole(null); // role scope closes with the suit
+    state.memory.bindRole(null); // role scope closes with the suit
     state.toolsUsed = new Set<string>(); // drop the suit's earned-tool accumulator (review 2026-07-08)
-    refreshBootMemoryBlock();
+    await refreshStateMemory(state);
     print(colorize(theme, "green", "Suit off — back to the naked default surface (unparked changes discarded)."));
     return;
   }
@@ -2128,23 +2214,21 @@ function cmdMandate(state: GuruState, args: readonly string[]): void {
   const sub = (args[0] ?? "list").toLowerCase();
 
   if (sub === "list") {
-    const grants = state.mandate.grants;
-    print(bold(theme, `mandates — ${grants.length} grant(s)`) + dim(theme, `  (${state.mandateStore.filePath})`));
-    for (const grant of grants) {
-      const where = grant.scope === "space" ? `space ${grant.path}` : "machine";
-      print(`  ${colorize(theme, "cyan", where.padEnd(40))} ${dim(theme, grant.verbs.join("+"))}`);
-    }
-    if (grants.length === 0) {
-      print(dim(theme, "  No standing grants. Each mutating tool call prompts per-call (y/N/always)."));
-      print(dim(theme, "  /mandate grant machine work   -> 'this computer is yours' (read+write+exec)"));
-    }
-    print(dim(theme, `  YOLO: ${state.yolo ? colorize(theme, "yellow", "ON") : "off"} - hard edges (destructive/spend) always prompt below YOLO`));
+    const lines = formatMandateOverview({
+      yolo: state.yolo,
+      mandate: state.mandate,
+      sessionApprovals: state.sessionApprovals,
+      filePath: state.mandateStore.filePath
+    });
+    lines.forEach((line, index) => print(index === 0 ? bold(theme, line) : dim(theme, line)));
     return;
   }
 
   if (sub === "revoke") {
     state.mandate = state.mandateStore.revokeAll();
-    print(colorize(theme, "green", "All standing mandates revoked. Per-call approval is back in force."));
+    const access = describeEffectiveAccess({ yolo: state.yolo, mandate: state.mandate, sessionApprovals: state.sessionApprovals });
+    print(colorize(theme, "green", "All saved mandates revoked."));
+    print(dim(theme, `  ${access.summary}`));
     return;
   }
 
@@ -2168,8 +2252,9 @@ function cmdMandate(state: GuruState, args: readonly string[]): void {
     const cwd = state.session?.repo?.repoRoot ?? process.cwd();
     state.mandate = state.mandateStore.grant(scope === "space" ? { scope, path: cwd, verbs: [...verbs] } : { scope, verbs: [...verbs] });
     const where = scope === "space" ? `this repo (${cwd})` : "this computer";
-    print(colorize(theme, "green", `Granted ${verbs.join("+")} for ${where}.`) + dim(theme, " Per-call prompts for these verbs now collapse into the grant."));
-    print(dim(theme, "  Hard edges (rm -rf, force-push, spend) still prompt below YOLO."));
+    const access = describeEffectiveAccess({ yolo: state.yolo, mandate: state.mandate, sessionApprovals: state.sessionApprovals });
+    print(colorize(theme, "green", `Saved ${verbs.join("+")} for ${where}.`));
+    print(dim(theme, `  ${access.summary}`));
     return;
   }
 
@@ -2182,17 +2267,22 @@ function cmdYolo(state: GuruState, args: readonly string[]): void {
   const arg = (args[0] ?? "").toLowerCase();
   if (arg === "off") {
     state.yolo = false;
-    print(colorize(theme, "green", "Safe mode ON — ordinary permission gates restored (per-call prompts + standing mandates)."));
-    print(dim(theme, "  This is the leash, not the default. /yolo on to return to YOLO (guru's baseline)."));
+    const access = describeEffectiveAccess({ yolo: state.yolo, mandate: state.mandate, sessionApprovals: state.sessionApprovals });
+    print(colorize(theme, "green", access.summary));
+    print(dim(theme, "  /yolo on returns to Guru's default YOLO mode."));
     return;
   }
-  if (arg === "on" || arg === "") {
+  if (arg === "on") {
     state.yolo = true;
-    print(colorize(theme, "yellow", "⚡ YOLO — the default. Ordinary permission gates lifted."));
-    print(dim(theme, "  Hard edges — destructive / spend / secrets-adjacent / ecosystem-auth — STILL prompt every time. /yolo off for safe mode."));
+    const access = describeEffectiveAccess({ yolo: state.yolo, mandate: state.mandate, sessionApprovals: state.sessionApprovals });
+    const offAccess = describeEffectiveAccess({ yolo: false, mandate: state.mandate, sessionApprovals: state.sessionApprovals });
+    print(colorize(theme, "yellow", access.summary));
+    print(dim(theme, `  /yolo off: ${offAccess.summary}`));
     return;
   }
-  print(dim(theme, `YOLO is ${state.yolo ? "ON (the default)" : "OFF (safe mode)"}. Use /yolo off for safe mode, /yolo on for YOLO.`));
+  const access = describeEffectiveAccess({ yolo: state.yolo, mandate: state.mandate, sessionApprovals: state.sessionApprovals });
+  print((access.mode === "yolo" ? colorize(theme, "yellow", access.summary) : colorize(theme, "green", access.summary)));
+  print(dim(theme, "  Usage: /yolo [on|off]"));
 }
 
 function cmdLookahead(state: GuruState, args: readonly string[]): void {
@@ -2224,7 +2314,7 @@ function cmdLookahead(state: GuruState, args: readonly string[]): void {
   print(dim(theme, "  When reality forks, a scout's pre-reasoned branch is promoted as a warm hint (never auto-executed). Enable via lookahead.enabled + populate lookahead.idempotentAllowlist in config."));
 }
 
-function cmdSettings(): void {
+function cmdSettings(state: GuruState): void {
   const configResult = loadHarnessConfig({});
   print(bold(theme, "Settings (read-only; names only)"));
   print(`  config      ${configResult.path} (${configResult.status}, ${configResult.verdict})`);
@@ -2239,6 +2329,9 @@ function cmdSettings(): void {
   print(
     `  retry       enabled=${configResult.config.retry.enabled} max=${configResult.config.retry.maxRetries} base=${configResult.config.retry.baseDelayMs}ms delayCap=${configResult.config.retry.provider.maxRetryDelayMs}ms`
   );
+  const memory = configResult.config.memory;
+  print(`  memory      ${describeMemoryStorage(configResult.config.memory.storage)}`);
+  print(`  honcho      ${memory.honcho.enabled ? "enabled" : "disabled"} · key ${memory.honcho.apiKeyEnvVar} · workspace ${memory.honcho.workspaceId}`);
   print(dim(theme, "  Edit guruharness.config.json to change settings."));
 }
 
@@ -2694,21 +2787,37 @@ function cmdTools(state: GuruState): void {
     print(dim(theme, "No session."));
     return;
   }
+  const effectiveAccess = describeEffectiveAccess({
+    yolo: state.yolo,
+    mandate: state.mandate,
+    sessionApprovals: state.sessionApprovals
+  });
+  const cwd = state.session.repo?.repoRoot ?? process.cwd();
   print(paint.bold(paint.fg("fgBright", "Session tools")) + paint.fg("muted", `  (${state.session.tools.length} registered)`));
   const rows = state.session.tools.map((tool) => {
     const modelFacing = activeChatToolIds(state).has(tool.id);
-    const gated = !READ_ONLY_TOOL_IDS.has(tool.id);
+    const access = getToolAccessMode(tool.id, state.yolo, state.mandate, state.sessionApprovals, cwd);
     return [
       modelFacing ? paint.fg("accent2", GLYPHS.agent) : " ",
       tool.id,
-      gated ? badge(paint, "GATED", "ghost") : paint.fg("success", "free"),
+      access === "free"
+        ? paint.fg("success", "free")
+        : access === "yolo"
+          ? badge(paint, "YOLO", "warning")
+          : access === "policy"
+            ? badge(paint, "POLICY", "success")
+            : access === "session"
+              ? badge(paint, "SESSION", "brand")
+              : access === "denied"
+                ? badge(paint, "DENY", "error")
+                : badge(paint, "ASK", "ghost"),
       paint.fg("fgFaint", tool.description.length > 60 ? `${tool.description.slice(0, 59)}…` : tool.description)
     ];
   });
   for (const line of renderTable(paint, [{ header: " " }, { header: "tool" }, { header: "access" }, { header: "description" }], rows)) {
     print(`  ${line}`);
   }
-  print(paint.fg("fgFaint", `  ${GLYPHS.agent} = offered to the model in chat turns · GATED = prompts per-call (y/N/always)`));
+  print(paint.fg("fgFaint", `  ${GLYPHS.agent} = offered to the model in chat turns · ${effectiveAccess.summary}`));
   const mcpStatuses = state.runtime.getSessionMcpStatuses(state.session.id);
   if (mcpStatuses.length > 0) {
     print("");
@@ -3991,7 +4100,6 @@ const MOVE_TO_GAP: Readonly<Record<NeverStuckMove, "build" | "attach" | "learn" 
 async function printLaunchBriefing(state: GuruState, baselineHealth: { readonly command: readonly string[]; readonly timeoutMs: number }): Promise<void> {
   const info = getRuntimeInfo();
   let skillsCount = "?";
-  let honcho = "unknown";
   if (state.session) {
     try {
       const skills = await state.runtime.executeTool(state.session.id, "skills.catalog.list", {});
@@ -4000,23 +4108,19 @@ async function printLaunchBriefing(state: GuruState, baselineHealth: { readonly 
     } catch {
       skillsCount = "?";
     }
-    try {
-      const status = await state.runtime.executeTool(state.session.id, "honcho_memory_status", {});
-      honcho = (status.output as { status?: string } | undefined)?.status ?? "unknown";
-    } catch {
-      honcho = "unavailable";
-    }
   }
+  const honcho = await state.memory.honchoStatus(memoryToolContext(state));
   const readiness = summarizeReadiness(mapRoutesToProviders(state.routes, { lastCheckedAt: new Date().toISOString(), env: process.env }));
   const cwd = state.session?.repo?.repoRoot ?? process.cwd();
   const registeredToolIds = new Set(state.sessionTools.map((tool) => tool.id));
+  const access = describeEffectiveAccess({ yolo: state.yolo, mandate: state.mandate, sessionApprovals: state.sessionApprovals });
 
   const hooks: BootRitualHooks = {
     kernelAssert: (): PhaseOutput => ({
       status: "ok",
       lines: [
         `I am guru harness ${info.version} · node ${process.versions.node}`,
-        `model: ${state.connectedRoute?.routeId ?? "none — /model to connect"} · access: ${state.yolo ? "YOLO (gates lifted)" : state.mandate.grants.length > 0 ? `${state.mandate.grants.length} standing mandate(s)` : "per-call approval"}`,
+        `model: ${state.connectedRoute?.routeId ?? "none — /model to connect"} · access: ${access.summary}`,
         `resolver: ${registeredToolIds.size > 0 ? "bound (never-stuck ready)" : "not bound"} · cwd: ${cwd}`
       ]
     }),
@@ -4035,13 +4139,7 @@ async function printLaunchBriefing(state: GuruState, baselineHealth: { readonly 
       return { status: "ok", lines: [`${manifests.length} suit(s) in the garage (typed query):`, ...lines] };
     },
     injectMemory: (): PhaseOutput => {
-      const injected = new Set(injectedLearningIds);
-      const learnings = loadLearnings(guruMemoryStore).filter((learning) => injected.has(learning.id));
-      const lines = [`${guruMemoryStore.list().length} fact(s) · honcho ${honcho} · ${injected.size} learning(s) injected (decay-ranked, with provenance)`];
-      for (const learning of learnings.slice(0, 4)) {
-        lines.push(`↳ (${learning.level}·cited ${learning.citations.length}×${learning.lastCitedSession !== null ? `·last #${learning.lastCitedSession}` : ""}) ${learning.statement}`);
-      }
-      return { status: "ok", lines };
+      return { status: "ok", lines: state.memory.briefingLines(honcho) };
     },
     declareWork: (): PhaseOutput => {
       const probe = { toolPresent: (id: string) => registeredToolIds.has(id), cmdPresent: commandOnPath };
@@ -4360,19 +4458,14 @@ async function chatTurn(state: GuruState, text: string, retried401 = false): Pro
     const intent = detectSuitIntent(submitted);
     if (intent) {
       print(dim(theme, `  heard "${submitted.trim().slice(0, 48)}" — suiting up (say /role off to stay naked)`));
-      cmdRoleSuit(state, intent);
+      await cmdRoleSuit(state, intent);
     }
   }
   // Smart Connections (§7): re-rank the injected memory by relevance to THIS turn
   // (BM25 over facts + a task-boost on learnings), so the model sees what matters
   // NOW — not just the newest/most-cited. No-op when memory is empty (block stays
   // "", system head unchanged), so the memory-less path is byte-identical.
-  if (scopedMemory.activeStores().some(({ store }) => store.list().length > 0)) {
-    refreshBootMemoryBlock(submitted);
-    if (state.history[0]?.role === "system") {
-      state.history[0] = { role: "system", content: systemPrompt() };
-    }
-  }
+  await refreshStateMemory(state, submitted);
   // Per-turn abort MUST exist before compaction — Esc during "compacting…" used to
   // be a silent no-op because turnAbortController was created only after compact.
   const turnAbort = new AbortController();
@@ -4649,6 +4742,9 @@ async function chatTurn(state: GuruState, text: string, retried401 = false): Pro
     print("");
     const toolNote = result.toolCallCount > 0 ? ` · ${result.toolCallCount} tool call(s)` : "";
     print(paint.fg("fgFaint", `${result.routeId} · ${Date.now() - startedAt}ms · ${result.usage?.inputTokens ?? "?"} in / ${result.usage?.outputTokens ?? "?"} out${toolNote}`));
+    // Honcho sync is explicitly configured and deliberately backgrounded: its
+    // asynchronous inference must never hold the terminal chat loop hostage.
+    state.memory.recordTurn(memoryToolContext(state), submitted, result.text);
   } catch (error) {
     // On-401 OAuth refresh + single retry (review 2026-07-08): a guru-native OAuth
     // token can expire between the pre-turn refresh and the request (or the pre-turn
@@ -4796,13 +4892,11 @@ async function handleLine(state: GuruState, line: string, rl: { close(): void })
       cmdSkills(state, slash.args);
       break;
     case "/remember":
-      cmdRemember(state, slash.args);
-      break;
     case "/memory":
-      cmdMemory(slash.args);
-      break;
     case "/recall":
-      cmdRecall(slash.args);
+      if (isMemorySlashCommand(slash.command)) {
+        await cmdMemorySession(state, slash.command, slash.args);
+      }
       break;
     case "/mandate":
       cmdMandate(state, slash.args);
@@ -4811,7 +4905,7 @@ async function handleLine(state: GuruState, line: string, rl: { close(): void })
       cmdYolo(state, slash.args);
       break;
     case "/role":
-      cmdRole(state, slash.args);
+      await cmdRole(state, slash.args);
       break;
     case "/lookahead":
       cmdLookahead(state, slash.args);
@@ -4826,7 +4920,7 @@ async function handleLine(state: GuruState, line: string, rl: { close(): void })
       await runGuruCompaction(state, "manual", slash.args.join(" "));
       break;
     case "/settings":
-      cmdSettings();
+      cmdSettings(state);
       break;
     case "/login":
       await cmdLogin(state, slash.args);
@@ -4857,14 +4951,14 @@ async function handleLine(state: GuruState, line: string, rl: { close(): void })
       break;
     case "/clear":
       process.stdout.write("\x1b[2J\x1b[H");
-      process.stdout.write(banner());
+      process.stdout.write(banner({ yolo: state.yolo, mandate: state.mandate, sessionApprovals: state.sessionApprovals }));
       break;
     case "/exit":
     case "/quit":
       // The daily ritual: fold an experiment branch, then an active suit parks itself.
       await maybeSummarizeBranch(state);
       if (state.activeRole) {
-        cmdRolePark(state);
+        await cmdRolePark(state);
       }
       rl.close();
       return;
@@ -4875,7 +4969,7 @@ async function handleLine(state: GuruState, line: string, rl: { close(): void })
       const template = state.promptTemplates.find((candidate) => candidate.name === templateName);
       if (template) {
         const expanded = expandTemplate(template, slash.args, {
-          context: bootMemoryBlock,
+          context: state.memory.contextBlock,
           ...(state.activeRole ? { suit: state.activeRole.label } : {}),
           ...(state.session?.repo ? { tree: repoTreePreview(state.session.repo.repoRoot) } : {})
         });
@@ -4965,11 +5059,12 @@ export async function runGuru(): Promise<void> {
     await runRpcMode();
     return;
   }
-  process.stdout.write(banner());
 
-  // Boot recall (push, not pull): load the memory index BEFORE the first system
-  // prompt is built so the session starts already knowing what it knows.
-  refreshBootMemoryBlock();
+  // The interactive surface reads its config before it creates the runtime
+  // session. Bootstrap first so a fresh project's writable .guru config is the
+  // config used for this very first launch, not merely for a later resume.
+  bootstrapProjectHarness({ projectRoot: process.cwd() });
+  process.stdout.write(banner());
 
   // Note: composerStateRef is the MODULE-SCOPE ref (line ~131) — not redeclared
   // here. The old local `let composerStateRef` shadowed it, so cmdTheme (which
@@ -5029,6 +5124,19 @@ export async function runGuru(): Promise<void> {
   const mandateStore = createMandateStore();
   const harnessConfigLoad = loadHarnessConfig({});
   const harnessConfig = harnessConfigLoad.config;
+  // Configure the one fact-memory backend before the first session prompt is
+  // assembled. Garage/flywheel state stays local; this selects Markdown vs the
+  // configured PostgreSQL fact store for /remember, /recall, and boot injection.
+  const extensions = initExtensions({
+    memoryConfig: harnessConfig.memory,
+    memoryDirectory: getGuruHomePaths().memoryDirectory
+  });
+  const memory = createMemorySessionService({
+    baseStore: guruMemoryStore,
+    configuredStore: extensions.memoryStore,
+    memoryConfig: harnessConfig.memory
+  });
+  await memory.refresh();
   // Surface invalid-config at boot instead of silently reverting to defaults
   // (review 2026-07-08): a single bad key used to wipe the operator's ENTIRE
   // config with no indication. Print a RED banner + the diagnostics so the
@@ -5065,13 +5173,14 @@ export async function runGuru(): Promise<void> {
   });
   const state: GuruState = {
     runtime,
+    memory,
     session: null,
     sessionTools: [],
     routes,
     availability,
     connectedRoute: null,
     modelIdOverride: null,
-    history: [{ role: "system", content: systemPrompt() }],
+    history: [{ role: "system", content: memory.composeSystemPrompt(baseSystemPrompt()) }],
     usage: { inputTokens: 0, outputTokens: 0, turns: 0, lastInputTokens: 0 },
     sessionApprovals: new Set<MandateVerb>(),
     mandateStore,
@@ -5128,8 +5237,8 @@ export async function runGuru(): Promise<void> {
     state.session = await runtime.startSession({ purpose: "chat" });
     state.sessionTools = runtime.getSessionTools(state.session.id);
     // Bind the space scope (§7): the session repo's .guru/memory travels with it.
-    scopedMemory.setRepoRoot(state.session.repo?.repoRoot ?? null);
-    refreshBootMemoryBlock();
+    state.memory.bindRepoRoot(state.session.repo?.repoRoot ?? null);
+    await refreshStateMemory(state);
     const sessionMs = Date.now() - sessionStartedAt;
     const slowNote = sessionMs >= 1_500 ? paint.fg("warning", ` · ${sessionMs}ms (slow disk/share?)`) : dim(theme, ` · ${sessionMs}ms`);
     print(
@@ -5164,9 +5273,9 @@ export async function runGuru(): Promise<void> {
     // policy are current per call; a worker can never exceed the parent's
     // mandate, and read-only scouts physically cannot mutate. Workers don't get
     // the spawn trio in v1 (recursion deferred; the session task cap backstops).
-    // Sibling isolation (§9): capture the mandate + session approvals at SPAWN time,
-    // so a later /mandate or approval change never reaches an already-spawned worker.
-    getSharedSwarmManager().setSnapshotProvider(() => ({ mandate: state.mandate, approvals: [...state.sessionApprovals] }));
+    // Sibling isolation (§9): capture the mandate, session approvals, and access mode
+    // at SPAWN time, so a later mode change never reaches an already-spawned worker.
+    getSharedSwarmManager().setSnapshotProvider(() => ({ mandate: state.mandate, approvals: [...state.sessionApprovals], yolo: state.yolo }));
     getSharedSwarmManager().setRunner(async (request) => {
       const route = state.connectedRoute;
       const session = state.session;
@@ -5174,9 +5283,10 @@ export async function runGuru(): Promise<void> {
         throw new Error("No connected model route for swarm workers.");
       }
       // Prefer the spawn-time snapshot over live state (sibling isolation).
-      const snapshot = request.mandateSnapshot as { mandate: MandateState; approvals: readonly MandateVerb[] } | undefined;
+      const snapshot = request.mandateSnapshot as { mandate: MandateState; approvals: readonly MandateVerb[]; yolo?: boolean } | undefined;
       const workerMandate = snapshot?.mandate ?? state.mandate;
       const workerApprovals = new Set<MandateVerb>(snapshot ? snapshot.approvals : state.sessionApprovals);
+      const workerYolo = resolveWorkerYolo(snapshot, state.yolo);
       const swarmToolIds = new Set(["spawn_agent", "get_task_output", "kill_task"]);
       const offered = state.sessionTools.filter((tool) => {
         if (swarmToolIds.has(tool.id)) {
@@ -5202,11 +5312,11 @@ export async function runGuru(): Promise<void> {
             }
             let decision = evaluateToolMandate(toolId, input, {
               cwd: session.repo?.repoRoot ?? process.cwd(),
-              // The SNAPSHOTTED mandate (frozen at spawn), not live state.
+              // The SNAPSHOTTED mandate and mode (frozen at spawn), not live state.
               state: workerMandate,
-              // YOLO NEVER cascades to workers (§9): a worker evaluates the mandate
-              // WITHOUT the parent's YOLO — hard edges + denies bind for workers.
-              yolo: false
+              // Normal workers inherit the parent's active mode. Read-only scouts
+              // above still cannot mutate, and input-specific hard edges remain explicit.
+              yolo: workerYolo
             });
             // Same PRESERVE, DON'T REPLACE backstop as the main turn — gutting
             // escalates to destructive (hard edge), so workers deny without a prompt.
@@ -5275,9 +5385,9 @@ export async function runGuru(): Promise<void> {
     const contHarness = (process.argv[continueIndex + 1] ?? "").toLowerCase();
     if (contHarness === "pi" || contHarness === "claude") {
       const cwd = state.session?.repo?.repoRoot ?? process.cwd();
-      const result = importExternalSession(contHarness as ForeignHarness, state.store, { cwd, systemPrompt: systemPrompt() });
+      const result = importExternalSession(contHarness as ForeignHarness, state.store, { cwd, systemPrompt: systemPrompt(state) });
       if (result.ok) {
-        switchToSession(state, result.session, null);
+        await switchToSession(state, result.session, null);
         print(colorize(theme, "green", `imported ${result.summary.imported} message(s) from ${result.summary.sourceLabel}`) + dim(theme, ` — ${result.summary.sourcePath}`));
         if (result.summary.redactedMessages > 0) {
           print(dim(theme, `  ${result.summary.redactedMessages} message(s) redacted for secret-shaped values (${result.summary.redactionKinds.join(", ")}) — presence-over-value`));
@@ -5294,8 +5404,8 @@ export async function runGuru(): Promise<void> {
   const roleArg = roleArgIndex >= 0 ? process.argv.slice(roleArgIndex + 1).filter((token) => !token.startsWith("--")).join(" ") : "";
   await printLaunchBriefing(state, harnessConfig.baselineHealth);
   if (roleArg.length > 0) {
-    cmdRoleSuit(state, roleArg);
-  } else if (listRoles(guruMemoryStore).length > 0 || guruMemoryStore.list().length === 0) {
+    await cmdRoleSuit(state, roleArg);
+  } else if (listRoles(guruMemoryStore).length > 0 || state.memory.canonicalFactCount === 0) {
     print(dim(theme, "what are we working on today?  /role suit <thing> — or just start chatting naked"));
   }
   print("");
@@ -5308,7 +5418,14 @@ export async function runGuru(): Promise<void> {
       id: command.name,
       label: command.name,
       hint: command.description,
-      drillable: command.name === "/model" || command.name === "/models" || command.name === "/resume" || command.name === "/sessions"
+      drillable:
+        command.name === "/model" ||
+        command.name === "/models" ||
+        command.name === "/resume" ||
+        command.name === "/sessions" ||
+        command.name === "/status" ||
+        command.name === "/yolo" ||
+        command.name === "/mandate"
     }));
     // Prompt templates ride the / menu alongside built-in commands.
     const templates = state.promptTemplates
@@ -5317,6 +5434,13 @@ export async function runGuru(): Promise<void> {
     return [...commands, ...templates];
   };
   const drillItems = (parentId: string): MenuItem[] => {
+    if (parentId === "/status" || parentId === "/yolo" || parentId === "/mandate") {
+      return [...buildAccessDrillMenuItems(parentId, {
+        yolo: state.yolo,
+        mandate: state.mandate,
+        sessionApprovals: state.sessionApprovals
+      })];
+    }
     if (parentId === "/model" || parentId === "/models") {
       return buildModelDrillMenuItems(state.routes, { ...(state.connectedRoute ? { connectedRouteId: state.connectedRoute.routeId } : {}) });
     }
@@ -5336,7 +5460,6 @@ export async function runGuru(): Promise<void> {
   };
   const composerModeLabel = (): string => {
     const chips: string[] = [];
-    if (state.yolo) chips.push("YOLO");
     if (state.lookahead.enabled) chips.push("scout");
     if (state.activeRole) chips.push(state.activeRole.label);
     return chips.length > 0 ? `▸ ${chips.join(" · ")}` : "";
@@ -5522,7 +5645,28 @@ export async function runGuru(): Promise<void> {
   print(dim(theme, "bye."));
 }
 
-const isDirectRun = process.argv[1]?.replace(/\\/gu, "/").endsWith("/guru.js") || process.argv[1]?.replace(/\\/gu, "/").endsWith("/guru.ts");
+const GURU_DIRECT_ENTRY_NAMES = new Set(["guru", "guru.js", "guru.ts", "guru.cmd", "guru.ps1"]);
+
+function entryPointName(value: string | undefined): string {
+  return value ? basename(value.replace(/\\/gu, "/")).toLowerCase() : "";
+}
+
+/**
+ * Detect a real guru process without auto-starting when this module is imported.
+ *
+ * npm's POSIX bin link invokes the package entrypoint through a path ending in
+ * /guru, while direct Node/tsx execution ends in guru.js/guru.ts. The
+ * module-name check keeps test runners and other importers from starting a TUI.
+ */
+export function isDirectGuruInvocation(
+  argvEntry = process.argv[1],
+  moduleEntry = fileURLToPath(import.meta.url)
+): boolean {
+  const moduleName = entryPointName(moduleEntry);
+  return (moduleName === "guru.js" || moduleName === "guru.ts") && GURU_DIRECT_ENTRY_NAMES.has(entryPointName(argvEntry));
+}
+
+const isDirectRun = isDirectGuruInvocation();
 if (isDirectRun) {
   runGuru().catch((error: unknown) => {
     console.error(error instanceof Error ? error.message : String(error));

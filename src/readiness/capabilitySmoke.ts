@@ -1,8 +1,9 @@
 import { getRuntimeInfo } from "../index.js";
 import { loadHarnessConfig } from "../config/loadConfig.js";
+import type { HonchoMemoryConfig } from "../config/schema.js";
 import { createHarnessRuntime, type HarnessRuntime } from "../runtime/session.js";
 import { HonchoConfigSchema, type HonchoStatus } from "../honcho/schemas.js";
-import { createInMemoryHonchoClient } from "../honcho/client.js";
+import { createHonchoClient } from "../honcho/client.js";
 import { defineProviderRoute } from "../providers/registry.js";
 import type { ProviderRouteDescriptor } from "../providers/schemas.js";
 import { createDirectProviderCatalog } from "../providers/catalog.js";
@@ -15,6 +16,7 @@ import { LifecycleEvents } from "../extensions/events.js";
 import { createHonchoTools } from "../tools/builtins/honchoTools.js";
 import { createReadinessTools } from "../readiness/commands.js";
 import { DEFAULT_PROVIDER_CLI_CONFIGS } from "../provider-cli/status.js";
+import { MemoryStoreStatusSchema, type MemoryStoreStatus } from "../memory/schemas.js";
 
 /**
  * capability-smoke
@@ -32,9 +34,6 @@ import { DEFAULT_PROVIDER_CLI_CONFIGS } from "../provider-cli/status.js";
 
 const READ_ONLY_TOOL_ID = "repo.context.resolve";
 const HANDOFF_DOC_PATH = "D:\\.projects\\guruharness\\handoffs\\controller-builder-document-handoff.md";
-
-/** Env var NAMES (never values) the Honcho runtime requires. Presence is reported, values never are. */
-const HONCHO_REQUIRED_ENV_NAMES = ["HONCHO_API_KEY"] as const;
 
 export type SmokeVerdict = "GREEN" | "YELLOW" | "RED";
 
@@ -107,6 +106,7 @@ export interface CapabilitySmokeReport {
   };
   readonly tools: { readonly count: number; readonly ids: readonly string[] };
   readonly readOnlyToolRun: ToolObservation;
+  readonly memory: MemoryStoreStatus;
   readonly honcho: HonchoStatus;
   readonly providerRouting: {
     readonly routeCount: number;
@@ -151,7 +151,18 @@ export async function runCapabilitySmoke(options: CapabilitySmokeOptions = {}): 
   const agentsChainRelativePaths = repo ? repo.agentsChain.map((agentsFile) => agentsFile.relativePath) : [];
 
   const readOnlyToolRun = await runtime.executeTool(session.id, READ_ONLY_TOOL_ID, { cwd });
-  const honcho = resolveHonchoReadiness();
+  const memoryStatusRun = await runtime.executeTool(session.id, "memory_status", {});
+  const memory =
+    memoryStatusRun.status === "succeeded"
+      ? MemoryStoreStatusSchema.parse(memoryStatusRun.output)
+      : MemoryStoreStatusSchema.parse({
+          provider: configResult.config.memory.storage.provider,
+          status: "error",
+          summary: "Memory status tool could not run.",
+          missingEnvNames: [],
+          location: "unavailable"
+        });
+  const honcho = await resolveHonchoReadiness(configResult.config.memory.honcho);
 
   // Real direct-first routing: the folded provider catalog + env-name readiness scan +
   // route planner. The seed route remains only as a fallback for an empty catalog.
@@ -182,6 +193,9 @@ export async function runCapabilitySmoke(options: CapabilitySmokeOptions = {}): 
   if (readOnlyToolRun.status !== "succeeded") {
     criticalFailures.push(`read-only tool ${READ_ONLY_TOOL_ID} did not succeed`);
   }
+  if (memoryStatusRun.status !== "succeeded") {
+    criticalFailures.push("memory status tool did not succeed");
+  }
   if (session.status !== "ready") {
     criticalFailures.push(`harness session status is ${session.status}`);
   }
@@ -193,8 +207,11 @@ export async function runCapabilitySmoke(options: CapabilitySmokeOptions = {}): 
   if (configResult.verdict === "YELLOW") {
     degradations.push("config using safe defaults (YELLOW)");
   }
-  if (honcho.status !== "ready") {
-    degradations.push(`Honcho readiness is ${honcho.status} (real in-memory client folded in; not write-enabled/networked yet)`);
+  if (memory.status !== "ready") {
+    degradations.push(`Memory storage readiness is ${memory.status}.`);
+  }
+  if (configResult.config.memory.honcho.enabled && honcho.status !== "ready") {
+    degradations.push(`Configured Honcho readiness is ${honcho.status}.`);
   }
   if (!selectedRoute) {
     degradations.push(`route planner could not select a route: ${routePlan.policyReason}`);
@@ -205,7 +222,7 @@ export async function runCapabilitySmoke(options: CapabilitySmokeOptions = {}): 
   const verdict: SmokeVerdict = criticalFailures.length > 0 ? "RED" : degradations.length > 0 ? "YELLOW" : "GREEN";
   const summary = `GuruHarness ${runtimeInfo.version} capability nucleus ${
     verdict === "RED" ? "failed a core probe" : "is runnable"
-  }: config ${configResult.verdict}, ${agentsChainRelativePaths.length} AGENTS.md in chain, ${toolIds.length} built-in tools, read-only tool ${readOnlyToolRun.status}, Honcho ${honcho.status}, ${routes.length} catalog route(s) (${catalogSource}), ${providerCli.configuredCount} provider-CLIs configured, extension-host ${
+  }: config ${configResult.verdict}, ${agentsChainRelativePaths.length} AGENTS.md in chain, ${toolIds.length} built-in tools, read-only tool ${readOnlyToolRun.status}, memory ${memory.provider}/${memory.status}, Honcho ${honcho.status}, ${routes.length} catalog route(s) (${catalogSource}), ${providerCli.configuredCount} provider-CLIs configured, extension-host ${
     extensionHost.available ? "hosting real tools" : "unavailable"
   } (Honcho status tool ${extensionHost.honchoStatusToolReachable ? "reachable" : "absent"}).`;
 
@@ -213,12 +230,13 @@ export async function runCapabilitySmoke(options: CapabilitySmokeOptions = {}): 
 
   const completionBlock: CapabilitySmokeCompletionBlock = {
     status: `${verdict} — capability nucleus ${verdict === "RED" ? "failed core probes" : "runnable"}`,
-    complete: `Ran capability-smoke: config load, repo/AGENTS context, ${toolIds.length} built-in tools, one read-only tool execution, Honcho readiness, direct-first route shape, provider-CLI inventory, extension-host hosting Honcho+readiness tools, completion block.`,
+    complete: `Ran capability-smoke: config load, repo/AGENTS context, ${toolIds.length} built-in tools, one read-only tool execution, configured memory status, Honcho readiness, direct-first route shape, provider-CLI inventory, extension-host hosting Honcho+readiness tools, completion block.`,
     tasks: [
       `config load -> ${configResult.verdict} (${configResult.status})`,
       `repo/AGENTS context -> ${repo ? `${agentsChainRelativePaths.length} AGENTS.md in chain` : "unresolved"}`,
       `built-in tools -> ${toolIds.length} registered`,
       `read-only tool ${READ_ONLY_TOOL_ID} -> ${readOnlyToolRun.status}`,
+      `memory storage -> ${memory.provider}/${memory.status}`,
       `Honcho readiness -> ${honcho.status}`,
       `direct-first route -> ${
         selectedRoute
@@ -237,7 +255,7 @@ export async function runCapabilitySmoke(options: CapabilitySmokeOptions = {}): 
     doc: HANDOFF_DOC_PATH,
     secrets: "none — env variable NAMES only, no values printed",
     constraints: "read-only tool execution; extends existing modules; provider-CLI live probing available via tool but not spawned in the smoke; no MCP/sidecar/self-improvement in this slice",
-    recap: `One CLI command proves the core capability nucleus is runnable: extension host live with real tools, Honcho readiness from a real client, provider-CLI runtime folded, and direct-first routing now selects from the real ${routes.length}-route provider catalog with env-name availability scanning.`,
+    recap: `One CLI command proves the core capability nucleus is runnable: extension host live with real tools, honest optional-Honcho readiness from the configured client, provider-CLI runtime folded, and direct-first routing now selects from the real ${routes.length}-route provider catalog with env-name availability scanning.`,
     next:
       verdict === "RED"
         ? "Resolve the failed core probe(s) before proceeding."
@@ -268,6 +286,7 @@ export async function runCapabilitySmoke(options: CapabilitySmokeOptions = {}): 
       },
       tools: { count: toolIds.length, ids: toolIds },
       readOnlyToolRun,
+      memory,
       honcho,
       providerRouting: {
         routeCount: routes.length,
@@ -301,16 +320,20 @@ export async function runCapabilitySmoke(options: CapabilitySmokeOptions = {}): 
   }
 }
 
-function resolveHonchoReadiness(): HonchoStatus {
-  // Real readiness from the folded-in in-memory Honcho client: it derives status from
-  // required-env-NAME presence (missing-env / read-only / ready) — never reads secret values.
-  const config = HonchoConfigSchema.parse({
-    workspaceId: "guruharness",
-    writeEnabled: false,
-    requiredEnvNames: [...HONCHO_REQUIRED_ENV_NAMES]
-  });
-
-  return createInMemoryHonchoClient({ config }).status();
+async function resolveHonchoReadiness(config: HonchoMemoryConfig): Promise<HonchoStatus> {
+  return createHonchoClient({
+    config: HonchoConfigSchema.parse({
+      enabled: config.enabled,
+      apiKeyEnvVar: config.apiKeyEnvVar,
+      workspaceId: config.workspaceId,
+      sessionId: config.sessionId,
+      userPeerId: config.userPeerId,
+      agentPeerId: config.agentPeerId,
+      ...(config.baseUrl ? { baseUrl: config.baseUrl } : {}),
+      timeoutMs: config.timeoutMs,
+      writeEnabled: config.enabled
+    })
+  }).status();
 }
 
 function buildSeedDirectFirstRoute(): ProviderRouteDescriptor {

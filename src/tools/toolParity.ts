@@ -93,8 +93,8 @@ export const TOOL_PARITY_ROWS: readonly ToolParityRow[] = [
     status: "native-equivalent",
     verdict: "GREEN",
     ownerModule: "src/honcho",
-    notes: "Honcho readiness client + honcho_memory_status tool live (env-NAME presence readiness; extension-host registered 2026-07-01).",
-    nextAction: "Maintained. Networked Honcho backend (beyond readiness + in-memory) remains a later phase."
+    notes: "Official Honcho SDK adapter is live; status is disabled until explicitly configured, then probes the real service without exposing credential values.",
+    nextAction: "Configure memory.honcho and HONCHO_API_KEY to enable real service sync."
   },
   {
     toolId: "honcho_remember",
@@ -104,8 +104,8 @@ export const TOOL_PARITY_ROWS: readonly ToolParityRow[] = [
     status: "native-equivalent",
     verdict: "GREEN",
     ownerModule: "src/honcho",
-    notes: "honcho_remember live with writeEnabled+userApproved dual gate + secret detection; durable L1 file memory (memory_remember) shipped 2026-07-04.",
-    nextAction: "Maintained. Point at a real Honcho backend when networked memory lands (L3 replay)."
+    notes: "honcho_remember writes through the official SDK when configured; default is explicitly disabled and secret-shaped values remain blocked.",
+    nextAction: "Configure memory.honcho to enable real service writes."
   },
   {
     toolId: "honcho_recall",
@@ -115,8 +115,8 @@ export const TOOL_PARITY_ROWS: readonly ToolParityRow[] = [
     status: "native-equivalent",
     verdict: "GREEN",
     ownerModule: "src/honcho",
-    notes: "honcho_recall live (terms/peer/limit/reasoning levels, in-memory client); L1 memory adds boot-injected recall + memory_search.",
-    nextAction: "Maintained. Swap in the networked client behind the same interface later."
+    notes: "honcho_recall queries the configured Honcho session through the official SDK; Markdown/PostgreSQL fact memory remains the deterministic canonical store.",
+    nextAction: "Maintained."
   },
   {
     toolId: "honcho_context",
@@ -126,8 +126,8 @@ export const TOOL_PARITY_ROWS: readonly ToolParityRow[] = [
     status: "native-equivalent",
     verdict: "GREEN",
     ownerModule: "src/honcho",
-    notes: "honcho_context live (compact snapshot, maxTokens); boot memory injection covers the always-on context path.",
-    nextAction: "Maintained. Networked backend later."
+    notes: "honcho_context derives a compact snapshot from the configured Honcho session; the TUI injects it only when memory.honcho.syncOnTurn is enabled.",
+    nextAction: "Maintained."
   },
   {
     toolId: "honcho_log_turn",
@@ -137,8 +137,8 @@ export const TOOL_PARITY_ROWS: readonly ToolParityRow[] = [
     status: "native-equivalent",
     verdict: "GREEN",
     ownerModule: "src/honcho",
-    notes: "honcho_log_turn live with the same dual write gate; session persistence events cover the timeline path.",
-    nextAction: "Maintained. Networked backend later."
+    notes: "honcho_log_turn records configured chat turns through the official SDK in the background, without blocking the terminal loop.",
+    nextAction: "Maintained."
   },
   {
     toolId: "mcp_bridge_status",
