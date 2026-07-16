@@ -13,7 +13,7 @@ function completeInput(overrides: Partial<HeadlessBootRitualInput> = {}): Headle
     phaseData: {
       kernel: {
         runtimeName: "guruharness",
-        runtimeVersion: "1.5.0",
+        runtimeVersion: "1.5.1",
         resolverReady: true
       },
       garage: {
@@ -174,7 +174,7 @@ describe("runHeadlessBootRitual", () => {
         ...completeInput().phaseData,
         kernel: {
           runtimeName: "guruharness",
-          runtimeVersion: "1.5.0",
+          runtimeVersion: "1.5.1",
           resolverReady: true,
           rawEnvironment: "RAW_ENV_SENTINEL"
         }
@@ -191,7 +191,7 @@ describe("runHeadlessBootRitual", () => {
         ...completeInput().phaseData,
         kernel: {
           runtimeName: "RAW_ENV_SENTINEL",
-          runtimeVersion: "1.5.0",
+          runtimeVersion: "1.5.1",
           resolverReady: true
         }
       }

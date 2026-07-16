@@ -167,7 +167,7 @@ describe("startHarnessApiServer", () => {
       boot: {
         sessionNumber: 17,
         phaseData: {
-          kernel: { runtimeName: "guruharness", runtimeVersion: "1.5.0", resolverReady: true },
+          kernel: { runtimeName: "guruharness", runtimeVersion: "1.5.1", resolverReady: true },
           garage: { manifestCount: 2, verifiedLayerCount: 2, staleLayerCount: 0 },
           memory: { provider: "markdown", status: "ready", injectedFactCount: 3 }
         },
@@ -212,7 +212,7 @@ describe("startHarnessApiServer", () => {
       boot: {
         sessionNumber: 18,
         phaseData: {
-          kernel: { runtimeName: "guruharness", runtimeVersion: "1.5.0", resolverReady: true },
+          kernel: { runtimeName: "guruharness", runtimeVersion: "1.5.1", resolverReady: true },
           garage: { manifestCount: 1, verifiedLayerCount: 1, staleLayerCount: 0 },
           memory: { provider: "markdown", status: "ready", injectedFactCount: 1 }
         },
