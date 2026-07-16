@@ -1,4 +1,13 @@
-import { PlannerPlanSchema, type PlannerModelRequest, type PlannerPlan } from "../planner/schemas.js";
+import { z } from "zod";
+
+import {
+  PlannerModelResultSchema,
+  PlannerPlanSchema,
+  PlannerTokenUsageSchema,
+  type PlannerModelRequest,
+  type PlannerModelResult,
+  type PlannerTokenUsage
+} from "../planner/schemas.js";
 import type { PlannerModel } from "../planner/runtime.js";
 import { OpenAiCompatiblePlannerModelConfigSchema, type OpenAiCompatiblePlannerModelConfig } from "./schemas.js";
 
@@ -22,7 +31,16 @@ interface ChatCompletionResponse {
       readonly content?: string | null;
     };
   }>;
+  readonly usage?: unknown;
 }
+
+const ChatCompletionUsageSchema = z
+  .object({
+    prompt_tokens: z.unknown(),
+    completion_tokens: z.unknown(),
+    total_tokens: z.unknown().optional()
+  })
+  .passthrough();
 
 const PLANNER_SYSTEM_PROMPT = [
   "You are the GuruHarness planner.",
@@ -37,7 +55,7 @@ export function createOpenAiCompatiblePlannerModel(options: CreateOpenAiCompatib
   const fetchImpl = options.fetch ?? fetch;
 
   return {
-    async createPlan(request: PlannerModelRequest): Promise<PlannerPlan> {
+    async createPlan(request: PlannerModelRequest): Promise<PlannerModelResult> {
       const apiKey = env[config.apiKeyEnvVar];
 
       if (!apiKey) {
@@ -101,12 +119,42 @@ function toPlannerPromptPayload(request: PlannerModelRequest) {
   };
 }
 
-function parsePlannerPlanResponse(responseText: string): PlannerPlan {
+function parsePlannerPlanResponse(responseText: string): PlannerModelResult {
   const responseJson = parseJson(responseText, "planner model response");
-  const content = extractMessageContent(responseJson);
-  const planJson = parseJson(stripJsonFence(content), "planner model message content");
+  const usage = extractTokenUsage(responseJson);
 
-  return PlannerPlanSchema.parse(planJson);
+  try {
+    const content = extractMessageContent(responseJson);
+    const planJson = parseJson(stripJsonFence(content), "planner model message content");
+    const plan = PlannerPlanSchema.parse(planJson);
+
+    return PlannerModelResultSchema.parse({ plan, ...(usage ? { usage } : {}) });
+  } catch (error) {
+    if (!usage) {
+      throw error;
+    }
+
+    throw Object.assign(new Error(formatError(error)), { usage });
+  }
+}
+
+function extractTokenUsage(responseJson: unknown): PlannerTokenUsage | undefined {
+  const rawUsage = (responseJson as ChatCompletionResponse).usage;
+  if (rawUsage === undefined) {
+    return undefined;
+  }
+
+  const usage = ChatCompletionUsageSchema.parse(rawUsage);
+  const inputTokens = usage.prompt_tokens;
+  const outputTokens = usage.completion_tokens;
+  const derivedTotal =
+    typeof inputTokens === "number" && typeof outputTokens === "number" ? inputTokens + outputTokens : Number.NaN;
+
+  return PlannerTokenUsageSchema.parse({
+    inputTokens,
+    outputTokens,
+    totalTokens: usage.total_tokens ?? derivedTotal
+  });
 }
 
 function extractMessageContent(responseJson: unknown): string {
@@ -135,4 +183,8 @@ function parseJson(value: string, label: string): unknown {
 
     throw new Error(`Invalid JSON in ${label}: ${message}`);
   }
+}
+
+function formatError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

@@ -1,5 +1,13 @@
 import { directAgentTurn, type AgentToolEvent, type AgentTurnResult } from "../model/agentTurn.js";
 import type { ChatTurnMessage } from "../model/directChat.js";
+import { runCompaction, type SummarizeRequest, type Summarizer } from "../compaction/engine.js";
+import type { CompactionConfig, CompactionState } from "../compaction/schemas.js";
+import {
+  effectiveKeepRecentTokens,
+  estimateChatHistoryTokens,
+  historyToCompactionEntries,
+  rebuildHistoryAfterCompaction
+} from "../compaction/sessionHistory.js";
 import type { ProviderRouteDescriptor } from "../providers/schemas.js";
 import type { HarnessRuntime } from "../runtime/session.js";
 import type { HarnessSession } from "../runtime/schemas.js";
@@ -30,10 +38,24 @@ import { slugifyRole, type RoleProfile } from "../roles/schema.js";
  */
 
 const DEFAULT_CONTEXT_WINDOW = 128_000;
+const COMPACTION_SUMMARIZER_SYSTEM_PROMPT =
+  "You summarize an agent-session transcript so the conversation can continue with less context. Produce a dense, factual summary: the operator's goals, decisions made, work completed (files, commands, outcomes), open threads, and any constraints stated. Never invent details. Never include credential values.";
 const REPO_ROOT_TOOLS = new Set(["read", "bash", "edit", "write", "grep", "glob", "ls", "repo.context.resolve"]);
 const WRITE_TOOLS = new Set(["bash", "edit", "write"]);
 
 export type TurnRunner = typeof directAgentTurn;
+
+type AgentSessionCompactionEndEvent =
+  | {
+      readonly compacted: true;
+      readonly summaryCount: number;
+      readonly beforeTokens: number;
+      readonly afterTokens: number;
+    }
+  | {
+      readonly compacted: false;
+      readonly reason: "nothing-to-compact" | "failed";
+    };
 
 export interface AgentSessionEvents {
   "turn.start": { readonly text: string };
@@ -42,6 +64,12 @@ export interface AgentSessionEvents {
   "steer.injected": { readonly text: string; readonly kind: "steer" | "follow_up" };
   "turn.stop": { readonly text: string; readonly toolCallCount: number; readonly durationMs: number };
   "done.packet": { readonly turns: number };
+  "compaction.start": {
+    readonly reason: "manual";
+    readonly beforeTokens: number;
+    readonly historyLength: number;
+  };
+  "compaction.end": AgentSessionCompactionEndEvent;
   /** A running turn was aborted by the operator (§17 S13). */
   aborted: { readonly atTurn: number };
 }
@@ -57,6 +85,20 @@ export interface AgentSessionStats {
   readonly historyLength: number;
 }
 
+export type AgentSessionCompactionNoChangeReason = "disabled" | "nothing-to-compact" | "busy";
+
+export type AgentSessionCompactionResult =
+  | {
+      readonly compacted: true;
+      readonly summaryCount: number;
+      readonly beforeTokens: number;
+      readonly afterTokens: number;
+    }
+  | {
+      readonly compacted: false;
+      readonly reason: AgentSessionCompactionNoChangeReason;
+    };
+
 export interface AgentSessionDeps {
   readonly runtime: HarnessRuntime;
   readonly route: ProviderRouteDescriptor;
@@ -70,6 +112,10 @@ export interface AgentSessionDeps {
   readonly modelIdOverride?: string | null;
   readonly retry?: RetryConfig;
   readonly systemPrompt?: string;
+  /** Manual compaction policy. Omitted or disabled preserves legacy no-compaction behavior. */
+  readonly compaction?: CompactionConfig;
+  /** Injectable summary lane for deterministic callers/tests. Defaults to a tool-free model turn. */
+  readonly summarize?: Summarizer;
   /** Tool ids offered to the model (default: all registered session tools). */
   readonly offeredToolIds?: ReadonlySet<string>;
   /** Garage/flywheel store (suitUp/park no-op without it). */
@@ -125,6 +171,8 @@ export class AgentSession {
   private usage = { turns: 0, inputTokens: 0, outputTokens: 0, lastInputTokens: 0 };
   /** The in-flight turn's abort controller (§17 S13); null when no turn is running. */
   private currentAbort: AbortController | null = null;
+  private compactionRunning = false;
+  private lastCompaction: CompactionState | null = null;
 
   constructor(deps: AgentSessionDeps) {
     this.deps = deps;
@@ -292,6 +340,9 @@ export class AgentSession {
    * The default driver (no fields) reproduces the v0.18.0 `prompt()` behavior.
    */
   async driveTurn(driver: TurnDriver = {}): Promise<AgentTurnResult> {
+    if (this.compactionRunning) {
+      throw new Error("AgentSession: compaction is already running — await it before starting a turn.");
+    }
     // Single-driver contract, enforced: overlapping turns would clobber
     // currentAbort (making the older turn un-abortable) and interleave
     // history pushes. Await the running turn or call abort() first.
@@ -377,6 +428,9 @@ export class AgentSession {
 
   /** SDK turn: the full lifecycle (steer drain → @-expand → push user → execute). */
   async prompt(text: string): Promise<AgentTurnResult> {
+    if (this.compactionRunning) {
+      throw new Error("AgentSession: compaction is already running — await it before prompting.");
+    }
     // Reject BEFORE the steer drain and user push so a concurrent prompt can
     // never leave a dangling user message in history (driveTurn re-checks too).
     if (this.currentAbort) {
@@ -425,6 +479,119 @@ export class AgentSession {
       }
     }
     return result;
+  }
+
+  private async summarizeCompaction(request: SummarizeRequest): Promise<string> {
+    const sections: string[] = [];
+    if (request.previousSummary && request.previousSummary.trim().length > 0) {
+      sections.push(`Previous summary (extend it — do not repeat verbatim):\n${request.previousSummary}`);
+    }
+    if (request.customInstructions && request.customInstructions.trim().length > 0) {
+      sections.push(`Operator focus instructions: ${request.customInstructions}`);
+    }
+    sections.push(`Transcript region to fold (${request.label}):\n${request.transcriptBlock}`);
+    sections.push("Reply with ONLY the summary text.");
+
+    const modelIdOverride = this.deps.modelIdOverride ?? "";
+    const result = await this.runTurn(
+      this.deps.route,
+      [
+        { role: "system", content: COMPACTION_SUMMARIZER_SYSTEM_PROMPT },
+        { role: "user", content: sections.join("\n\n") }
+      ],
+      {
+        tools: [],
+        executeTool: (toolId) => {
+          const timestamp = (this.deps.now ?? (() => new Date()))().toISOString();
+          return Promise.resolve({
+            toolId,
+            status: "failed" as const,
+            startedAt: timestamp,
+            endedAt: timestamp,
+            durationMs: 0,
+            error: "The compaction summarizer runs without tools."
+          });
+        },
+        approveTool: () => false,
+        maxTokens: request.maxTokens,
+        ...(this.deps.retry ? { retry: this.deps.retry } : {}),
+        ...(modelIdOverride.length > 0 ? { modelIdOverride } : {})
+      }
+    );
+    return result.text;
+  }
+
+  /** Fold older conversation context while preserving this history array's identity. */
+  async compact(instructions?: string): Promise<AgentSessionCompactionResult> {
+    const config = this.deps.compaction;
+    if (!config?.enabled) {
+      return { compacted: false, reason: "disabled" };
+    }
+    if (this.currentAbort || this.compactionRunning) {
+      return { compacted: false, reason: "busy" };
+    }
+
+    const adapted = historyToCompactionEntries(this.history);
+    const beforeTokens = estimateChatHistoryTokens(this.history);
+    const contextWindowTokens = this.deps.route.context?.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW;
+    const previousState = adapted.previousSummary === undefined ? null : this.lastCompaction;
+    let terminalEmitted = false;
+    const emitEnd = (payload: AgentSessionCompactionEndEvent): void => {
+      // Set before dispatch so a throwing subscriber cannot cause a duplicate
+      // terminal event through the failure path below.
+      terminalEmitted = true;
+      this.emit("compaction.end", payload);
+    };
+    this.compactionRunning = true;
+    try {
+      this.emit("compaction.start", {
+        reason: "manual",
+        beforeTokens,
+        historyLength: this.history.length
+      });
+      const result = await runCompaction({
+        entries: adapted.entries,
+        config: {
+          ...config,
+          keepRecentTokens: effectiveKeepRecentTokens(config, contextWindowTokens)
+        },
+        summarize: this.deps.summarize ?? ((request) => this.summarizeCompaction(request)),
+        now: this.deps.now ?? (() => new Date()),
+        reason: "manual",
+        ...(adapted.previousSummary !== undefined ? { previousSummary: adapted.previousSummary } : {}),
+        ...(previousState ? { previousDetails: previousState.details, previousCount: previousState.count } : {}),
+        ...(instructions !== undefined && instructions.trim().length > 0 ? { customInstructions: instructions } : {})
+      });
+
+      if (result === null || "cancelled" in result) {
+        emitEnd({ compacted: false, reason: "nothing-to-compact" });
+        return { compacted: false, reason: "nothing-to-compact" };
+      }
+
+      const rebuilt = rebuildHistoryAfterCompaction(adapted.head, result.summaryEntry, result.keptEntries);
+      const afterTokens = estimateChatHistoryTokens(rebuilt);
+      this.history.splice(0, this.history.length, ...rebuilt);
+      this.lastCompaction = result.state;
+      emitEnd({
+        compacted: true,
+        summaryCount: result.state.count,
+        beforeTokens,
+        afterTokens
+      });
+      return {
+        compacted: true,
+        summaryCount: result.state.count,
+        beforeTokens,
+        afterTokens
+      };
+    } catch (error) {
+      if (!terminalEmitted) {
+        emitEnd({ compacted: false, reason: "failed" });
+      }
+      throw error;
+    } finally {
+      this.compactionRunning = false;
+    }
   }
 
   // -- garage --------------------------------------------------------------

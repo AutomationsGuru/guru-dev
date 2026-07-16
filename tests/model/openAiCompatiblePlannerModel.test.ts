@@ -77,15 +77,64 @@ describe("createOpenAiCompatiblePlannerModel", () => {
     });
     const model = createOpenAiCompatiblePlannerModel({ config, env: { TEST_MODEL_KEY: "test-key" }, fetch: fetchImpl });
 
-    const plan = (await model.createPlan(request)) as PlannerPlan;
+    const result = (await model.createPlan(request)) as { readonly plan: PlannerPlan; readonly usage?: unknown };
 
-    expect(plan.steps[0]?.toolId).toBe("repo.context.resolve");
+    expect(result.plan.steps[0]?.toolId).toBe("repo.context.resolve");
+    expect(result).not.toHaveProperty("usage");
     expect(calls[0]?.url).toBe("https://models.example/v1/chat/completions");
     expect(calls[0]?.init.headers).toMatchObject({ Authorization: "Bearer test-key", "Content-Type": "application/json" });
     const body = JSON.parse(String(calls[0]?.init.body)) as { model?: string; response_format?: { type?: string }; messages?: unknown[] };
     expect(body.model).toBe("test-model");
     expect(body.response_format).toEqual({ type: "json_object" });
     expect(body.messages).toHaveLength(2);
+  });
+
+  it("should return validated input, output, and total token usage", async () => {
+    const fetchImpl = createJsonFetch([], {
+      choices: [
+        {
+          message: {
+            content: JSON.stringify({ objective: "No-op", summary: "No tools needed.", steps: [] })
+          }
+        }
+      ],
+      usage: { prompt_tokens: 11, completion_tokens: 7, total_tokens: 18 }
+    });
+    const model = createOpenAiCompatiblePlannerModel({ config, env: { TEST_MODEL_KEY: "test-key" }, fetch: fetchImpl });
+
+    await expect(model.createPlan(request)).resolves.toEqual({
+      plan: { objective: "No-op", summary: "No tools needed.", steps: [] },
+      usage: { inputTokens: 11, outputTokens: 7, totalTokens: 18 }
+    });
+  });
+
+  it.each([
+    ["negative input", { prompt_tokens: -1, completion_tokens: 2 }],
+    ["fractional output", { prompt_tokens: 1, completion_tokens: 1.5 }],
+    ["malformed total", { prompt_tokens: 1, completion_tokens: 2, total_tokens: "do-not-leak-usage" }],
+    ["inconsistent total", { prompt_tokens: 1, completion_tokens: 2, total_tokens: 4 }]
+  ])("should reject %s token usage without leaking response content", async (_label, usage) => {
+    const fetchImpl = createJsonFetch([], {
+      choices: [
+        {
+          message: {
+            content: JSON.stringify({ objective: "No-op", summary: "No tools needed.", steps: [] })
+          }
+        }
+      ],
+      usage
+    });
+    const model = createOpenAiCompatiblePlannerModel({ config, env: { TEST_MODEL_KEY: "test-key" }, fetch: fetchImpl });
+
+    let caught: unknown;
+    try {
+      await model.createPlan(request);
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    expect(String(caught)).not.toContain("do-not-leak-usage");
   });
 
   it("should parse fenced JSON content", async () => {
@@ -100,7 +149,7 @@ describe("createOpenAiCompatiblePlannerModel", () => {
     });
     const model = createOpenAiCompatiblePlannerModel({ config, env: { TEST_MODEL_KEY: "test-key" }, fetch: fetchImpl });
 
-    await expect(model.createPlan(request)).resolves.toMatchObject({ objective: "No-op", steps: [] });
+    await expect(model.createPlan(request)).resolves.toMatchObject({ plan: { objective: "No-op", steps: [] } });
   });
 
   it("should fail before network when the configured api key env var is missing", async () => {

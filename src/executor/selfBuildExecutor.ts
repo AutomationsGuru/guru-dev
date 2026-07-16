@@ -8,7 +8,7 @@ import { createInMemoryOperationalStore, type OperationalStore } from "../operat
 import type { OperationalImplementation, RecordedBlocker } from "../operational/schemas.js";
 import { createPlannerModelFromConfig, type PlannerModelFetch } from "../model/openAiCompatiblePlannerModel.js";
 import type { PlannerModel } from "../planner/runtime.js";
-import type { PlannerRunReport } from "../planner/schemas.js";
+import { PlannerTokenUsageSchema, type PlannerRunReport, type PlannerTokenUsage } from "../planner/schemas.js";
 import { runReviewGates, type CommandExecutor, type NativeReviewer, type ReviewGatesReport } from "../review/gates.js";
 import {
   buildSessionObservabilitySummary,
@@ -81,6 +81,7 @@ export interface PlannerFallbackAttempt {
   readonly status: PlannerRunReport["status"];
   readonly failureReason?: PlannerRunReport["failureReason"];
   readonly blockerCount: number;
+  readonly usage?: PlannerTokenUsage;
 }
 
 export interface PlannerFallbackAlarm {
@@ -97,6 +98,7 @@ export interface PlannerFallbackPlaybook {
   readonly exhausted: boolean;
   readonly alarms: readonly PlannerFallbackAlarm[];
   readonly recoveryNarrative: string;
+  readonly cumulativeUsage: PlannerTokenUsage;
   readonly attempts: readonly PlannerFallbackAttempt[];
 }
 
@@ -104,6 +106,7 @@ export interface SelfBuildExecutorReport {
   readonly verdict: "GREEN" | "YELLOW" | "RED";
   readonly session: HarnessSession;
   readonly planner: PlannerRunReport;
+  readonly plannerUsage: PlannerTokenUsage;
   readonly plannerFallback: PlannerFallbackPlaybook | null;
   readonly observability: SessionObservabilitySummary;
   readonly reviewGates: ReviewGatesReport | null;
@@ -617,7 +620,8 @@ function buildPlannerFallbackAttempt(
     retryIndex,
     status: report.status,
     ...(report.failureReason ? { failureReason: report.failureReason } : {}),
-    blockerCount: report.blockers.length
+    blockerCount: report.blockers.length,
+    ...(report.usage ? { usage: report.usage } : {})
   };
 }
 
@@ -628,6 +632,7 @@ function buildPlannerFallbackPlaybook(options: {
 }): PlannerFallbackPlaybook {
   const usedFallbackProvider = options.selectedProviderLabel?.startsWith("config-fallback-") ?? false;
   const retriedProvider = options.attempts.some((attempt) => attempt.retryIndex > 0);
+  const cumulativeUsage = sumPlannerUsage(options.attempts.map((attempt) => attempt.usage));
   const alarms: PlannerFallbackAlarm[] = [];
 
   if (retriedProvider) {
@@ -667,8 +672,22 @@ function buildPlannerFallbackPlaybook(options: {
       usedFallbackProvider,
       exhausted: options.exhausted
     }),
+    cumulativeUsage,
     attempts: [...options.attempts]
   };
+}
+
+function sumPlannerUsage(usages: readonly (PlannerTokenUsage | undefined)[]): PlannerTokenUsage {
+  const total = usages.reduce<PlannerTokenUsage>(
+    (sum, usage) => ({
+      inputTokens: sum.inputTokens + (usage?.inputTokens ?? 0),
+      outputTokens: sum.outputTokens + (usage?.outputTokens ?? 0),
+      totalTokens: sum.totalTokens + (usage?.totalTokens ?? 0)
+    }),
+    { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
+  );
+
+  return PlannerTokenUsageSchema.parse(total);
 }
 
 function buildPlannerFallbackRecoveryNarrative(options: {
@@ -908,6 +927,7 @@ async function buildBlockedReport(options: {
     verdict: "RED",
     session: options.session,
     planner: options.planner,
+    plannerUsage: options.plannerFallback?.cumulativeUsage ?? options.planner.usage ?? sumPlannerUsage([]),
     plannerFallback: options.plannerFallback ?? null,
     observability: buildSessionObservabilitySummary(options.session.id, []),
     reviewGates: options.reviewGates ?? null,
@@ -960,6 +980,7 @@ async function buildCompletedReport(options: {
     verdict,
     session: options.session,
     planner: options.planner,
+    plannerUsage: options.plannerMetadata.playbook.cumulativeUsage,
     plannerFallback: options.plannerMetadata.playbook,
     observability: buildSessionObservabilitySummary(options.session.id, []),
     reviewGates: options.reviewGates,

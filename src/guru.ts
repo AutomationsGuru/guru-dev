@@ -91,17 +91,27 @@ import { HARD_EDGE_VERBS, type MandateState, type MandateVerb } from "./mandates
 import { resolveApproval, type ApprovalChoice, type ApprovalRequest } from "./mandates/approval.js";
 import { applyPreservationGuard } from "./mandates/preservation.js";
 import {
-  estimateTranscriptTokens,
   runCompaction,
   shouldCompact,
-  SUMMARY_ENTRY_PREFIX,
   type BeforeCompactHook,
   type CompactHook,
   type CompactionConfig,
   type CompactionState,
-  type SummarizeRequest,
-  type TranscriptEntry
+  type SummarizeRequest
 } from "./compaction/index.js";
+import {
+  effectiveKeepRecentTokens,
+  estimateChatHistoryTokens,
+  historyToCompactionEntries,
+  rebuildHistoryAfterCompaction
+} from "./compaction/sessionHistory.js";
+export {
+  effectiveKeepRecentTokens,
+  estimateChatHistoryTokens,
+  historyToCompactionEntries,
+  rebuildHistoryAfterCompaction,
+  type CompactableHistory
+} from "./compaction/sessionHistory.js";
 import type { RetryConfig } from "./model/retryPolicy.js";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
@@ -420,6 +430,8 @@ export const GURU_CHAT_TOOL_IDS: ReadonlySet<string> = new Set([
   "web_fetch",
   "web_search",
   "ask_question",
+  "search_tool",
+  "use_tool",
   "mcp_bridge_status",
   "provider_cli_status",
   "provider_cli_run",
@@ -450,6 +462,7 @@ export const READ_ONLY_TOOL_IDS: ReadonlySet<string> = new Set([
   "resolve_capability_gap",
   "todo_list",
   "ask_question",
+  "search_tool",
   "mcp_bridge_status",
   "provider_cli_status",
   "pyautogui_status",
@@ -754,6 +767,17 @@ export async function withRuntimeCleanup<T>(
   } finally {
     await close();
   }
+}
+
+/** Queue a scheduled notification into the live engine without starting a model turn. */
+export function queueScheduledPrompt(
+  agentSession: Pick<AgentSession, "steer"> | null,
+  message: string
+): void {
+  if (!agentSession) {
+    throw new Error("No active agent session is available for scheduled delivery.");
+  }
+  agentSession.steer(message);
 }
 
 /**
@@ -1266,62 +1290,6 @@ function cmdModelConnect(
 }
 
 /** Persist the current conversation transcript durably (create on first turn, update after). */
-/**
- * Compaction wiring (Runtime Survival wave, ADR 2026-07-04-compaction-engine).
- *
- * The pure pieces below are exported for the deterministic acceptance suite; the
- * engine itself lives in src/compaction/. History adapter contract: index 0 is the
- * system head (never compacted); a system entry bearing SUMMARY_ENTRY_PREFIX is the
- * previous compaction summary (excluded from the compactable region — its text
- * feeds the next summary as iterative context, the summary algorithm).
- */
-
-export interface CompactableHistory {
-  readonly head: ChatTurnMessage;
-  readonly entries: readonly TranscriptEntry[];
-  readonly previousSummary: string | undefined;
-}
-
-export function historyToCompactionEntries(history: readonly ChatTurnMessage[]): CompactableHistory {
-  const head: ChatTurnMessage = history[0] ?? { role: "system", content: "" };
-  const entries: TranscriptEntry[] = [];
-  let previousSummary: string | undefined;
-  for (let index = 1; index < history.length; index += 1) {
-    const message = history[index];
-    if (!message) {
-      continue;
-    }
-    if (message.role === "system" && message.content.startsWith(SUMMARY_ENTRY_PREFIX)) {
-      const newline = message.content.indexOf("\n");
-      previousSummary = newline === -1 ? "" : message.content.slice(newline + 1);
-      continue;
-    }
-    entries.push({ id: `e${index}`, kind: message.role, content: message.content });
-  }
-  return { head, entries, previousSummary };
-}
-
-export function rebuildHistoryAfterCompaction(
-  head: ChatTurnMessage,
-  summaryEntry: TranscriptEntry,
-  keptEntries: readonly TranscriptEntry[]
-): ChatTurnMessage[] {
-  const kept: ChatTurnMessage[] = [];
-  for (const entry of keptEntries) {
-    // guru's flat history only carries these roles; toolCall/toolResult kinds
-    // belong to richer transcripts and cannot appear here by construction.
-    if (entry.kind === "system" || entry.kind === "user" || entry.kind === "assistant") {
-      kept.push({ role: entry.kind, content: entry.content });
-    }
-  }
-  return [head, { role: "system", content: summaryEntry.content }, ...kept];
-}
-
-export function estimateChatHistoryTokens(history: readonly ChatTurnMessage[]): number {
-  return estimateTranscriptTokens(
-    history.map((message, index) => ({ id: `e${index}`, kind: message.role, content: message.content }))
-  );
-}
 
 /**
  * What actually goes to the model: with compaction enabled the FULL (compacted)
@@ -1329,20 +1297,6 @@ export function estimateChatHistoryTokens(history: readonly ChatTurnMessage[]): 
  */
 export function sendableHistory(history: readonly ChatTurnMessage[], compactionEnabled: boolean): ChatTurnMessage[] {
   return compactionEnabled ? [...history] : history.slice(-13);
-}
-
-/**
- * Reconcile keepRecentTokens with the trigger threshold (adversarial review
- * 2026-07-04): a keep budget ≥ contextWindow − reserveTokens could never bring the
- * estimate back under the trigger — every turn would re-compact (thrash). Clamp to
- * half the threshold so a compaction always lands well below it.
- */
-export function effectiveKeepRecentTokens(config: CompactionConfig, contextWindowTokens: number): number {
-  const threshold = contextWindowTokens - config.reserveTokens;
-  if (threshold <= 0) {
-    return config.keepRecentTokens;
-  }
-  return config.keepRecentTokens >= threshold ? Math.max(1_000, Math.floor(threshold / 2)) : config.keepRecentTokens;
 }
 
 /**
@@ -5083,6 +5037,12 @@ export async function runGuru(): Promise<void> {
             queueMicrotask(() => composerStateRef.composer!.forceRefresh());
           }
         }, state);
+      },
+      schedule: async (message) => {
+        queueScheduledPrompt(guruStateRef.state?.agentSession ?? null, message);
+        if (composerStateRef.composer) {
+          queueMicrotask(() => composerStateRef.composer!.forceRefresh());
+        }
       }
     }
   });

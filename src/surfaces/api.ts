@@ -1,6 +1,8 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { type AddressInfo } from "node:net";
 
+import { runHeadlessBootRitual, type HeadlessBootRitualInput } from "../boot/headless.js";
+import type { BootReport } from "../boot/ritual.js";
 import { createDirectionAlignmentReport } from "../direction/hereThere.js";
 import { createSelfBuildState, applySelfBuildProgress, planNextSelfBuildTask } from "../kernel/selfBuildLoop.js";
 import { loadHarnessConfig } from "../config/loadConfig.js";
@@ -10,11 +12,15 @@ import { createHarnessRuntime, type HarnessRuntime } from "../runtime/session.js
 import { evaluateToolMandate } from "../mandates/evaluate.js";
 import { MandateStateSchema, type MandateState } from "../mandates/schema.js";
 import type { PersistedSessionEvent, PersistedSessionEventType, PersistedSessionListItem } from "../runtime/persistence.js";
-import { runSelfBuildExecutor } from "../executor/selfBuildExecutor.js";
+import { runSelfBuildExecutor, type RunSelfBuildExecutorOptions, type SelfBuildExecutorReport } from "../executor/selfBuildExecutor.js";
+import { runDevCycle, type DevCycleReport, type RunDevCycleInput } from "../selfbuild/runDevCycle.js";
+import { makeSmokeDeps } from "../selfbuild/smokeDeps.js";
 
 export interface ApiHealthReport {
   runtime: string;
   endpoints: string[];
+  /** Retained validated evidence from the one startup boot ritual. */
+  boot?: BootReport;
 }
 
 export interface ApiSelfBuildPlanRequest {
@@ -167,6 +173,10 @@ export interface ApiHandlers {
   readonly health?: () => Promise<ApiHealthReport>;
 }
 
+type ApiRunExecutor = (options: RunSelfBuildExecutorOptions) => Promise<SelfBuildExecutorReport>;
+type ApiRunCycle = (input: RunDevCycleInput) => Promise<DevCycleReport>;
+type ApiRunMandatePolicy = NonNullable<RunSelfBuildExecutorOptions["mandatePolicy"]>;
+
 export interface ApiServerOptions {
   readonly host?: string;
   readonly port?: number;
@@ -174,14 +184,23 @@ export interface ApiServerOptions {
   readonly runtime?: HarnessRuntime;
   /** Construct a server-owned runtime. Ignored when `runtime` is supplied. */
   readonly runtimeFactory?: () => HarnessRuntime;
+  /** Bounded boot inputs/test seams; the active API process cwd remains authoritative. */
+  readonly boot?: Omit<HeadlessBootRitualInput, "cwd" | "sessionNumber"> & {
+    readonly sessionNumber?: number;
+  };
   readonly allowRunSafetyOverrides?: boolean;
   /**
    * Mandate for headless tool execution (ADR 2026-07-05-composer-completion).
    * The api is a headless surface with no interactive approver, so its DEFAULT
    * is the read-only floor: mutating tools escalate → blocked. Supply grants
-   * here for trusted automation. Applies to /tool-run via the shared evaluator.
+   * here for trusted automation. Applies to /tool-run and the default /run
+   * executor through the shared evaluator.
    */
   readonly mandate?: MandateState;
+  /** Test/integration seam for the default /run handler. Ignored when handlers.run is supplied. */
+  readonly runExecutor?: ApiRunExecutor;
+  /** Test/integration seam for the P7 default /run cycle. Ignored when handlers.run is supplied. */
+  readonly runCycle?: ApiRunCycle;
 }
 
 /** The secure headless default: no grants, no YOLO → mutations are denied. */
@@ -215,12 +234,25 @@ const DEFAULT_PORT = 4100;
 export async function startHarnessApiServer(options: ApiServerOptions = {}): Promise<ApiServerHandle> {
   const host = options.host ?? DEFAULT_HOST;
   const port = options.port ?? DEFAULT_PORT;
+  const { sessionNumber = 0, ...bootOptions } = options.boot ?? {};
+  const bootReport = runHeadlessBootRitual({
+    ...bootOptions,
+    cwd: process.cwd(),
+    sessionNumber
+  });
+  const mandatePolicy = headlessMandatePolicy(options.mandate);
   // Headless surface: attach the mandate floor so /tool-run cannot run a
   // mutating tool without a grant (the REPL-only enforcement hole, closed).
   const ownsRuntime = options.runtime === undefined;
-  const runtime = options.runtime ?? options.runtimeFactory?.() ?? createHarnessRuntime({ mandatePolicy: headlessMandatePolicy(options.mandate) });
-  const defaultHandlers = createDefaultApiHandlers(runtime);
-  const handlers = {
+  const runtime = options.runtime ?? options.runtimeFactory?.() ?? createHarnessRuntime({ mandatePolicy });
+  const defaultHandlers = createDefaultApiHandlers(
+    runtime,
+    mandatePolicy,
+    options.runExecutor ?? runSelfBuildExecutor,
+    options.runCycle ?? runDevCycle
+  );
+  const selectedHealth = options.handlers?.health ?? defaultHandlers.health;
+  const handlers: Required<ApiHandlers> = {
     buildPlan: options.handlers?.buildPlan ?? defaultHandlers.buildPlan,
     directionCheck: options.handlers?.directionCheck ?? defaultHandlers.directionCheck,
     startSession: options.handlers?.startSession ?? defaultHandlers.startSession,
@@ -231,7 +263,10 @@ export async function startHarnessApiServer(options: ApiServerOptions = {}): Pro
     sessionList: options.handlers?.sessionList ?? defaultHandlers.sessionList,
     toolRun: options.handlers?.toolRun ?? defaultHandlers.toolRun,
     run: options.handlers?.run ?? defaultHandlers.run,
-    health: options.handlers?.health ?? defaultHandlers.health
+    health: async () => ({
+      ...await selectedHealth(),
+      boot: bootReport
+    })
   };
   const routeOptions = { allowRunSafetyOverrides: options.allowRunSafetyOverrides ?? false };
 
@@ -323,7 +358,12 @@ function directionResponse(configPath?: string, cwd?: string): unknown {
   return createDirectionAlignmentReport({ here: state.here, there: state.there, ...(nextTask ? { task: nextTask } : {}) });
 }
 
-function createDefaultApiHandlers(runtime: HarnessRuntime): Required<ApiHandlers> {
+function createDefaultApiHandlers(
+  runtime: HarnessRuntime,
+  mandatePolicy: ApiRunMandatePolicy,
+  runExecutor: ApiRunExecutor,
+  runCycle: ApiRunCycle
+): Required<ApiHandlers> {
   const sessions = new Map<string, HarnessSession>();
   const sessionEvents = new Map<string, ApiSessionTimelineEvent[]>();
 
@@ -343,7 +383,7 @@ function createDefaultApiHandlers(runtime: HarnessRuntime): Required<ApiHandlers
     sessionContinue: async (request) => defaultSessionContinuation(runtime, sessions, sessionEvents, request),
     sessionList: async (request) => defaultSessionList(runtime, request),
     toolRun: async (request) => defaultToolRun(runtime, sessions, sessionEvents, request),
-    run: defaultRun,
+    run: async (request) => defaultRun(request, mandatePolicy, runExecutor, runCycle),
     health: defaultHealth
   };
 }
@@ -514,8 +554,13 @@ async function defaultToolRun(
   return { session, observation };
 }
 
-async function defaultRun(request: ApiRunRequest): Promise<unknown> {
-  return runSelfBuildExecutor({
+async function defaultRun(
+  request: ApiRunRequest,
+  mandatePolicy: ApiRunMandatePolicy,
+  runExecutor: ApiRunExecutor,
+  runCycle: ApiRunCycle
+): Promise<DevCycleReport> {
+  const executorOptions: RunSelfBuildExecutorOptions = {
     ...(typeof request.configPath === "string" ? { configPath: request.configPath } : {}),
     ...(typeof request.cwd === "string" ? { cwd: request.cwd } : {}),
     ...(typeof request.targetPath === "string" ? { targetPath: request.targetPath } : {}),
@@ -542,6 +587,14 @@ async function defaultRun(request: ApiRunRequest): Promise<unknown> {
           }
         }
       : {})
+  };
+  const effectiveCwd = executorOptions.cwd ?? process.cwd();
+
+  return runCycle({
+    executorOptions,
+    mandatePolicy,
+    executor: runExecutor,
+    smoke: makeSmokeDeps({ cwd: effectiveCwd, timeoutMs: 30_000 })
   });
 }
 

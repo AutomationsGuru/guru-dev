@@ -155,7 +155,7 @@ export const TOOL_PARITY_ROWS: readonly ToolParityRow[] = [
     toolId: "mcp_list_tools",
     category: "mcp-bridge",
     requirementIds: ["FR-09", "FR-10", "TR-21", "TR-22"],
-    currentGuruHarnessToolIds: ["discoverMcpTools"],
+    currentGuruHarnessToolIds: ["discoverMcpTools", "search_tool"],
     status: "native-equivalent",
     verdict: "GREEN",
     ownerModule: "src/mcp/toolBridge.ts",
@@ -166,7 +166,7 @@ export const TOOL_PARITY_ROWS: readonly ToolParityRow[] = [
     toolId: "mcp_call_tool",
     category: "mcp-bridge",
     requirementIds: ["FR-09", "FR-10", "TR-21", "TR-22"],
-    currentGuruHarnessToolIds: ["mcp.<server>.<tool>"],
+    currentGuruHarnessToolIds: ["mcp.<server>.<tool>", "use_tool"],
     status: "native-equivalent",
     verdict: "GREEN",
     ownerModule: "src/mcp/toolBridge.ts",
@@ -310,11 +310,11 @@ export const TOOL_PARITY_ROWS: readonly ToolParityRow[] = [
     category: "base-tool",
     requirementIds: ["FR-08", "TR-19"],
     currentGuruHarnessToolIds: ["schedule"],
-    status: "native-equivalent",
-    verdict: "GREEN",
+    status: "partial-equivalent",
+    verdict: "YELLOW",
     ownerModule: "src/tools/builtins/scheduleTool.ts",
-    notes: "Added to bridge asynchronous timer and cron parity.",
-    nextAction: "Parity met."
+    notes: "Interactive Guru supports cancellable in-process one-shot notifications; headless runtimes stay fail-closed and recurring schedules are not implemented.",
+    nextAction: "Define durable recurring cron semantics for timezone, persistence, missed runs, restart, and cancellation before claiming full parity."
   },
   {
     toolId: "manage_task",

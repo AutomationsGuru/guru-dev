@@ -35,7 +35,7 @@ describe("history adapter", () => {
       { role: "assistant", content: "two" }
     ];
     const adapted = historyToCompactionEntries(history);
-    expect(adapted.head.content).toBe("SYSTEM-HEAD");
+    expect(adapted.head?.content).toBe("SYSTEM-HEAD");
     expect(adapted.previousSummary).toBeUndefined();
     expect(adapted.entries).toEqual([
       { id: "e1", kind: "user", content: "one" },

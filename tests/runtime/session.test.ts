@@ -15,7 +15,9 @@ import {
   type HarnessRuntime,
   type ToolDefinition
 } from "../../src/index.js";
+import { initExtensions } from "../../src/extensions/initExtensions.js";
 import { ensureGuruHome } from "../../src/home/paths.js";
+import { manageBackgroundTask, resetBackgroundTasks } from "../../src/tools/builtins/backgroundTaskRegistry.js";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const fakeMcpServer = resolve(repoRoot, "tests", "mcp", "fixtures", "fake-mcp-server.mjs");
@@ -131,6 +133,7 @@ describe("startHarnessSession", () => {
       "resolve_capability_gap",
       "review.gates.run",
       "schedule",
+      "search_tool",
       "service_readiness_report",
       "shell.command.run",
       "skill.document.load",
@@ -138,6 +141,7 @@ describe("startHarnessSession", () => {
       "spawn_agent",
       "todo_list",
       "todo_write",
+      "use_tool",
       "web_fetch",
       "web_search",
       "write"
@@ -229,6 +233,80 @@ describe("startHarnessSession", () => {
 });
 
 describe("createHarnessRuntime", () => {
+  afterEach(() => {
+    resetBackgroundTasks();
+  });
+
+  it("forwards interactive schedule delivery without enabling recurring or conditional modes", async () => {
+    const delivered: string[] = [];
+    const runtime = createHarnessRuntime({
+      interactiveCallbacks: {
+        schedule: async (message) => {
+          delivered.push(message);
+        }
+      }
+    });
+
+    try {
+      const session = await runtime.startSession({ cwd: repoRoot });
+      const scheduled = await runtime.executeTool(session.id, "schedule", {
+        Prompt: "check the worker",
+        DurationSeconds: "0.001"
+      });
+
+      expect(scheduled).toMatchObject({ status: "succeeded", output: { taskId: "task-1" } });
+      await vi.waitFor(() => expect(delivered).toEqual(["[scheduled] check the worker"]));
+
+      for (const input of [
+        { Prompt: "cron", CronExpression: "* * * * *" },
+        { Prompt: "repeat", DurationSeconds: "1", MaxIterations: "2" },
+        { Prompt: "conditional", DurationSeconds: "1", TimerCondition: "any" }
+      ]) {
+        const rejected = await runtime.executeTool(session.id, "schedule", input);
+        expect(rejected).toMatchObject({ status: "failed" });
+        expect(rejected.error).toMatch(/not supported|unsupported/iu);
+      }
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("keeps schedule fail-closed when no interactive delivery callback is configured", async () => {
+    const runtime = createHarnessRuntime();
+
+    try {
+      const session = await runtime.startSession({ cwd: repoRoot });
+      const observation = await runtime.executeTool(session.id, "schedule", {
+        Prompt: "never scheduled",
+        DurationSeconds: "1"
+      });
+
+      expect(observation).toMatchObject({ status: "failed" });
+      expect(observation.error).toMatch(/scheduler backend/iu);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("clears pending scheduled notifications when the runtime closes", async () => {
+    const runtime = createHarnessRuntime({
+      interactiveCallbacks: { schedule: async () => {} }
+    });
+    const session = await runtime.startSession({ cwd: repoRoot });
+
+    await runtime.executeTool(session.id, "schedule", {
+      Prompt: "must be cleared",
+      DurationSeconds: "60"
+    });
+    expect(await manageBackgroundTask("list")).toEqual([
+      expect.objectContaining({ kind: "scheduled", state: "running" })
+    ]);
+
+    await runtime.close();
+
+    expect(await manageBackgroundTask("list")).toEqual([]);
+  });
+
   it("should attach configured MCP tools to a new runtime session", async () => {
     const config = await writeMcpConfig([fakeMcpConfig()]);
     const runtime = createHarnessRuntime();
@@ -342,6 +420,82 @@ describe("createHarnessRuntime", () => {
       status: "succeeded",
       output: expect.objectContaining({ repoRoot })
     });
+  });
+
+  it("emits one ordered execute/result pair with the returned sanitized observation", async () => {
+    const runtime = createHarnessRuntime();
+    const session = await runtime.startSession({ cwd: repoRoot });
+    const host = initExtensions().host;
+    const sendMessage = vi.spyOn(host, "sendMessage");
+
+    try {
+      const succeeded = await runtime.executeTool(session.id, "repo.context.resolve", { cwd: repoRoot });
+      const failed = await runtime.executeTool(session.id, "not.registered", {});
+      const toolEvents = sendMessage.mock.calls.filter(([event]) => event === "tool:execute" || event === "tool:result");
+
+      expect(toolEvents).toEqual([
+        ["tool:execute", { toolId: "repo.context.resolve", input: { cwd: repoRoot } }],
+        ["tool:result", { toolId: "repo.context.resolve", output: succeeded }],
+        ["tool:execute", { toolId: "not.registered", input: {} }],
+        ["tool:result", { toolId: "not.registered", output: failed }]
+      ]);
+      expect(JSON.stringify(toolEvents[1]?.[1])).toBe(JSON.stringify({ toolId: "repo.context.resolve", output: succeeded }));
+      expect(JSON.stringify(toolEvents[3]?.[1])).toBe(JSON.stringify({ toolId: "not.registered", output: failed }));
+    } finally {
+      sendMessage.mockRestore();
+      await runtime.close();
+    }
+  });
+
+  it("does not emit false tool lifecycle events for missing-session or mandate-blocked calls", async () => {
+    const runtime = createHarnessRuntime({
+      mandatePolicy: () => ({ outcome: "deny", reason: "test denial", verbs: ["write"] })
+    });
+    const session = await runtime.startSession({ cwd: repoRoot });
+    const host = initExtensions().host;
+    const sendMessage = vi.spyOn(host, "sendMessage");
+
+    try {
+      const missing = await runtime.executeTool("missing-session", "repo.context.resolve", { cwd: repoRoot });
+      const blocked = await runtime.executeTool(session.id, "write", {
+        repoRoot,
+        path: "must-not-write.txt",
+        contents: "blocked",
+        dryRun: false
+      });
+
+      expect(missing.status).toBe("failed");
+      expect(blocked).toMatchObject({ status: "failed", error: expect.stringContaining("Blocked by mandate") });
+      expect(sendMessage.mock.calls.filter(([event]) => event === "tool:execute" || event === "tool:result")).toEqual([]);
+    } finally {
+      sendMessage.mockRestore();
+      await runtime.close();
+    }
+  });
+
+  it("returns the observation unchanged when a post-result listener throws", async () => {
+    const runtime = createHarnessRuntime();
+    const session = await runtime.startSession({ cwd: repoRoot });
+    const host = initExtensions().host;
+    const originalSendMessage = host.sendMessage.bind(host);
+    const sendMessage = vi.spyOn(host, "sendMessage").mockImplementation((event, payload) => {
+      if (event === "tool:result") {
+        throw new Error("broken result listener");
+      }
+      originalSendMessage(event as never, payload as never);
+    });
+
+    try {
+      const observation = await runtime.executeTool(session.id, "not.registered", {});
+      expect(observation).toMatchObject({
+        toolId: "not.registered",
+        status: "failed",
+        error: "Tool not registered: not.registered"
+      });
+    } finally {
+      sendMessage.mockRestore();
+      await runtime.close();
+    }
   });
 
   it("should return a failed observation for an unknown session", async () => {

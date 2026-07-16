@@ -47,7 +47,11 @@ class FlakyPlannerModel implements PlannerModel {
   readonly requests: PlannerModelRequest[] = [];
   private failuresRemaining: number;
 
-  constructor(failures: number, private readonly plan: unknown) {
+  constructor(
+    failures: number,
+    private readonly plan: unknown,
+    private readonly failureUsage?: { readonly inputTokens: number; readonly outputTokens: number; readonly totalTokens: number }
+  ) {
     this.failuresRemaining = failures;
   }
 
@@ -56,7 +60,7 @@ class FlakyPlannerModel implements PlannerModel {
 
     if (this.failuresRemaining > 0) {
       this.failuresRemaining -= 1;
-      throw new Error("transient planner failure");
+      throw Object.assign(new Error("transient planner failure"), this.failureUsage ? { usage: this.failureUsage } : {});
     }
 
     return this.plan;
@@ -199,12 +203,36 @@ describe("runSelfBuildExecutor", () => {
     });
 
     expect(report.planner.status).toBe("completed");
+    expect(report.plannerUsage).toEqual({ inputTokens: 0, outputTokens: 0, totalTokens: 0 });
     expect(fetchCalls[0]?.url).toBe("https://api.openai.com/v1/chat/completions");
     expect(fetchCalls[0]?.init.headers).toMatchObject({ Authorization: "Bearer test-key" });
   });
 
+  it("should expose one successful planner call's cumulative usage", async () => {
+    const model = new FixedPlannerModel({
+      plan: { objective: "Execute task.", summary: "No tools needed.", steps: [] },
+      usage: { inputTokens: 8, outputTokens: 3, totalTokens: 11 }
+    });
+
+    const report = await runSelfBuildExecutor({
+      cwd: repoRoot,
+      taskId: "self-build-executor",
+      allowDirtyWorkspace: true,
+      allowRiskyPaths: true,
+      plannerModel: model,
+      commandExecutor: createCommandExecutor([])
+    });
+
+    expect(report.plannerUsage).toEqual({ inputTokens: 8, outputTokens: 3, totalTokens: 11 });
+    expect(report.plannerFallback?.cumulativeUsage).toEqual({ inputTokens: 8, outputTokens: 3, totalTokens: 11 });
+    expect(report.plannerFallback?.attempts[0]?.usage).toEqual({ inputTokens: 8, outputTokens: 3, totalTokens: 11 });
+  });
+
   it("should record a blocker when the planner blocks", async () => {
-    const model = new FixedPlannerModel({ objective: "Invalid plan missing summary." });
+    const model = new FixedPlannerModel({
+      plan: { objective: "Invalid plan missing summary." },
+      usage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 }
+    });
 
     const report = await runSelfBuildExecutor({
       cwd: repoRoot,
@@ -222,13 +250,13 @@ describe("runSelfBuildExecutor", () => {
     });
     expect(report.blocker?.backlogItem.status).toBe("blocked");
     expect(report.summary).toContain("planner");
+    expect(report.plannerUsage).toEqual({ inputTokens: 5, outputTokens: 2, totalTokens: 7 });
   });
 
   it("should stop and record a blocker when a required review gate fails", async () => {
     const model = new FixedPlannerModel({
-      objective: "Execute task.",
-      summary: "No tools needed.",
-      steps: []
+      plan: { objective: "Execute task.", summary: "No tools needed.", steps: [] },
+      usage: { inputTokens: 2, outputTokens: 1, totalTokens: 3 }
     });
 
     const report = await runSelfBuildExecutor({
@@ -244,13 +272,13 @@ describe("runSelfBuildExecutor", () => {
     expect(report.gitPr).toBeNull();
     expect(report.blocker?.stateSnapshot.kind).toBe("risk");
     expect(report.donePacket.risks.some((risk) => risk.includes("test failed"))).toBe(true);
+    expect(report.plannerUsage.totalTokens).toBe(3);
   });
 
   it("should stop and record a blocker when git PR automation fails", async () => {
     const model = new FixedPlannerModel({
-      objective: "Execute task.",
-      summary: "No tools needed.",
-      steps: []
+      plan: { objective: "Execute task.", summary: "No tools needed.", steps: [] },
+      usage: { inputTokens: 4, outputTokens: 2, totalTokens: 6 }
     });
 
     const report = await runSelfBuildExecutor({
@@ -275,6 +303,7 @@ describe("runSelfBuildExecutor", () => {
     expect(report.gitPr?.verdict).toBe("RED");
     expect(report.implementation.status).toBe("blocked");
     expect(report.blocker?.backlogItem.title).toBe("Self-build executor blocked at git-pr");
+    expect(report.plannerUsage.totalTokens).toBe(6);
   });
 });
 
@@ -329,6 +358,7 @@ describe("runSelfBuildExecutor runtime hardening", () => {
     expect(report.planner.blockers.join("\n")).not.toContain("secrets/local.env");
     expect(report.blocker?.stateSnapshot.body).not.toContain("secrets/local.env");
     expect(report.donePacket.risks.join("\n")).not.toContain("secrets/local.env");
+    expect(report.plannerUsage).toEqual({ inputTokens: 0, outputTokens: 0, totalTokens: 0 });
   });
 
   it("should block risky git paths before git automation", async () => {
@@ -517,6 +547,7 @@ describe("runSelfBuildExecutor runtime hardening", () => {
     expect(report.verdict).toBe("RED");
     expect(report.planner.status).toBe("blocked");
     expect(report.summary).toContain("planner");
+    expect(report.plannerUsage).toEqual({ inputTokens: 0, outputTokens: 0, totalTokens: 0 });
   });
 
   it("should return an explicit continuity blocker when resumeSessionId is missing", async () => {
@@ -554,15 +585,23 @@ describe("runSelfBuildExecutor runtime hardening", () => {
         ok: true,
         status: 200,
         text: async () =>
-          JSON.stringify({
-            choices: [
-              {
-                message: {
-                  content: JSON.stringify({ objective: "Fallback model.", summary: "No tools needed.", steps: [] })
+          JSON.stringify(
+            url.startsWith("https://primary.example/")
+              ? {
+                  choices: [],
+                  usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 }
                 }
-              }
-            ]
-          })
+              : {
+                  choices: [
+                    {
+                      message: {
+                        content: JSON.stringify({ objective: "Fallback model.", summary: "No tools needed.", steps: [] })
+                      }
+                    }
+                  ],
+                  usage: { prompt_tokens: 7, completion_tokens: 4, total_tokens: 11 }
+                }
+          )
       };
     };
 
@@ -595,7 +634,7 @@ describe("runSelfBuildExecutor runtime hardening", () => {
         taskId: "self-build-executor",
         allowDirtyWorkspace: true,
         allowRiskyPaths: true,
-        env: { FALLBACK_API_KEY: "test-fallback-key" },
+        env: { PRIMARY_API_KEY: "test-primary-key", FALLBACK_API_KEY: "test-fallback-key" },
         fetch: fetchImpl,
         commandExecutor: createCommandExecutor([])
       });
@@ -611,27 +650,44 @@ describe("runSelfBuildExecutor runtime hardening", () => {
         alarms: [expect.objectContaining({ code: "provider-fallback-used", severity: "warning" })]
       });
       expect(report.plannerFallback?.attempts).toEqual([
-        expect.objectContaining({ providerLabel: "config-primary", status: "blocked", failureReason: "model-threw", blockerCount: 1 }),
-        expect.objectContaining({ providerLabel: "config-fallback-1", status: "completed", blockerCount: 0 })
+        expect.objectContaining({
+          providerLabel: "config-primary",
+          status: "blocked",
+          failureReason: "model-threw",
+          blockerCount: 1,
+          usage: { inputTokens: 3, outputTokens: 2, totalTokens: 5 }
+        }),
+        expect.objectContaining({
+          providerLabel: "config-fallback-1",
+          status: "completed",
+          blockerCount: 0,
+          usage: { inputTokens: 7, outputTokens: 4, totalTokens: 11 }
+        })
       ]);
+      expect(report.plannerFallback?.cumulativeUsage).toEqual({ inputTokens: 10, outputTokens: 6, totalTokens: 16 });
+      expect(report.plannerUsage).toEqual({ inputTokens: 10, outputTokens: 6, totalTokens: 16 });
       expect(report.implementation.metadata).toMatchObject({
         plannerFallback: expect.objectContaining({ recoveryNarrative: expect.stringContaining("fallback") })
       });
       expect(report.donePacket.risks.join("\n")).toContain("provider-fallback-used");
       expect(report.donePacket.nextSteps).toContain("Review planner fallback playbook alarms before the next long-running run.");
-      expect(fetchCalls).toHaveLength(1);
-      expect(fetchCalls[0]?.url).toBe("https://fallback.example/v1/chat/completions");
+      expect(fetchCalls).toHaveLength(2);
+      expect(fetchCalls[0]?.url).toBe("https://primary.example/v1/chat/completions");
+      expect(fetchCalls[1]?.url).toBe("https://fallback.example/v1/chat/completions");
     } finally {
       rmSync(tempRoot, { recursive: true, force: true });
     }
   });
 
   it("should report same-provider retry alarms when a planner recovers after a transient failure", async () => {
-    const model = new FlakyPlannerModel(1, {
-      objective: "Execute task.",
-      summary: "No tools needed.",
-      steps: []
-    });
+    const model = new FlakyPlannerModel(
+      1,
+      {
+        plan: { objective: "Execute task.", summary: "No tools needed.", steps: [] },
+        usage: { inputTokens: 6, outputTokens: 2, totalTokens: 8 }
+      },
+      { inputTokens: 2, outputTokens: 1, totalTokens: 3 }
+    );
 
     const report = await runSelfBuildExecutor({
       cwd: repoRoot,
@@ -652,9 +708,22 @@ describe("runSelfBuildExecutor runtime hardening", () => {
       alarms: [expect.objectContaining({ code: "provider-retry-used", severity: "info" })]
     });
     expect(report.plannerFallback?.attempts).toEqual([
-      expect.objectContaining({ providerLabel: "injected", retryIndex: 0, status: "blocked", failureReason: "model-threw" }),
-      expect.objectContaining({ providerLabel: "injected", retryIndex: 1, status: "completed" })
+      expect.objectContaining({
+        providerLabel: "injected",
+        retryIndex: 0,
+        status: "blocked",
+        failureReason: "model-threw",
+        usage: { inputTokens: 2, outputTokens: 1, totalTokens: 3 }
+      }),
+      expect.objectContaining({
+        providerLabel: "injected",
+        retryIndex: 1,
+        status: "completed",
+        usage: { inputTokens: 6, outputTokens: 2, totalTokens: 8 }
+      })
     ]);
+    expect(report.plannerFallback?.cumulativeUsage).toEqual({ inputTokens: 8, outputTokens: 3, totalTokens: 11 });
+    expect(report.plannerUsage).toEqual({ inputTokens: 8, outputTokens: 3, totalTokens: 11 });
     expect(report.donePacket.risks.join("\n")).toContain("provider-retry-used");
     expect(model.requests).toHaveLength(2);
   });
