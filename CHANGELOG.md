@@ -4,13 +4,6 @@ All notable changes to GuruHarness are documented here.
 
 ## [Unreleased]
 
-### Added
-
-- **RPC `operator.answer` (G708):** `AgentSession` answer-handler + pending-question map; `dispatchRpc` method and ready-list advertisement; shutdown calls `closeQuestions` to avoid deadlocks.
-- **ask_question session context:** runtime threads allocated `sessionId` into interactive `askQuestion` callbacks.
-- **Tool parity:** `service_health` **YELLOW** row (`service_readiness_report` partial — G636).
-
-
 ### Release discipline
 
 - Treat the current harness as pre-GA dogfood. Historical `1.x` labels are not
@@ -20,28 +13,44 @@ All notable changes to GuruHarness are documented here.
   Matthew make an explicit release/migration decision.
 - **Stay on `1.5.x` until Matthew is happy with how Guru works.** Patch numbers
   may climb without limit (`1.5.1` … `1.5.n` — even absurdly high is fine). The
-  current gated target is `1.5.1`. Do **not** create, tag, or publish `1.6.0` or
-  higher until Matthew explicitly accepts Guru as working well enough to advance.
-  CI (`scripts/verify-repo.ps1`) and the tag-triggered release workflow refuse
-  package versions outside `1.5.x`.
+  next gated patch target after **1.5.1** is **`1.5.2`**. Do **not** create, tag,
+  or publish `1.6.0` or higher until Matthew explicitly accepts Guru as working
+  well enough to advance. CI (`scripts/verify-repo.ps1`) and the tag-triggered
+  release workflow refuse package versions outside `1.5.x`.
+
+## [1.5.1] - 2026-07-16
+
+Dogfood patch release: fold post-1.5.0 product merges on `main` into an explicit
+package version (still **1.5.x** pre-GA). Does not authorize `1.6.0+`.
+
+### Added
+
+- **Home profile, project harness, memory backends, Honcho client** (PR #37).
+- **ACDE stack:** MCP meta-dispatch, RPC session graph, G26 schedule wiring,
+  G627 operator-question broker, G880 headless API boot (PR #39).
+- **G3/G532 sequential:** planner token-budget drawdown + RPC compaction events
+  on active graph session (PR #39).
+- **G987 sequential:** post-tool shell-hook lifecycle (`tool:result`) (PR #39).
+- **RPC `operator.answer` (G708):** `AgentSession` answer-handler + pending-question
+  map; RPC method + ready-list advertisement; shutdown `closeQuestions` (PR #42).
+- **ask_question session context:** runtime threads allocated `sessionId` into
+  interactive callbacks (PR #42).
+- **Tool parity `service_health` YELLOW** (G636) mapping to `service_readiness_report`
+  (PR #42).
 
 ### Changed
 
-- **Merged PR #37 (2026-07-15):** access-UX (U1–U4), memory/home/Honcho UX, path `/tools`, mandate-deny honesty — integrated on `guru-dev/main` @ `6c826c6` (product ancestry `49a1a871`; record `../handoffs/code-reviews/2026-07-15T0444Z-pr37-merged-integrated.md`). Not a npm release; stay on **1.5.x**. Residuals B5–B7 non-blocking.
-- **Workspace documentation:** ongoing **doc-control** + **gap-review** + **harness-matrix** + **guru-vs-matrix** schedulers (`handoffs/doc-control/STATE.md`, `../gaps/README.md` indexed pass **181** / guru-vs-matrix pass **74**, `../handoffs/harness-matrix/README.md` pass **77**; code-review recheck **`2349Z`** per `INDEX.md` pass **529**; PR #38 merged @ **`876e011`** · PR #39 **`0013Z`**; doc-control pass-**531**) — README **schedule** **YELLOW** row (**G815**); guru-vs **G1116**–**G1119** (pass **74**); no runtime behavior change.
-- **Tool parity manifest (gap-review G646):** `service_health` **YELLOW** row maps Pi `/service-health` partial to `service_readiness_report` — **23** GREEN / **4** YELLOW / **0** RED in `toolParity.ts` (gap-review pass **132** recount) (local builder pass; reviewer owns publish).
-- **Config template:** `guruharness.config.example.json` recommends `approvalPolicy.autoCommitPushPr: false` (gap **G253**); shipped repo `guruharness.config.json` unchanged until builder lane.
-- **Linux-first paired-build contracts:** Codex01 owns platform-neutral construction;
-  Windows owns quality coordination, candidate identity, and Windows validation;
-  code-review exchange path and package-install wave rules are explicit.
-- **Release line lock:** repository hygiene and the release publish workflow now
-  fail if `package.json` leaves the `1.5.x` dogfood line.
+- **Doc-control post-#37 hygiene** (PR #38): indexes, headers, example
+  `approvalPolicy.autoCommitPushPr: false`.
+- **Pipeline-gate mandate** (AGENTS): scheduled review/sync/merge lanes may approve
+  and merge when CI green and content is ready (PR #42 docs).
+- **Workspace docs / gap / harness-matrix** index refresh (ongoing schedulers).
 
 ### Fixed
 
-- **Linux npm launcher startup:** the guru binary now recognizes POSIX npm
-  symlink and Windows shim entrypoints instead of exiting silently when its
-  argv path ends in /guru rather than /guru.js.
+- Residual shared-worktree product delta rebased onto post-#39 main without
+  regressing ACDE/G3/G987 (PR #42).
+- Linux npm launcher POSIX symlink / Windows shim entrypoints (prior Unreleased).
 
 ## [1.5.0] - 2026-07-12
 
