@@ -31,14 +31,6 @@ export const BootPhaseResultSchema = z
   .strict();
 export type BootPhaseResult = z.infer<typeof BootPhaseResultSchema>;
 
-export const BootReportSchema = z
-  .object({
-    sessionNumber: z.number().int().nonnegative(),
-    phases: z.array(BootPhaseResultSchema).length(5)
-  })
-  .strict();
-export type BootReport = z.infer<typeof BootReportSchema>;
-
 export interface BootRitualHooks {
   /** Phase 1: identity + connected model + resolver-ready + cwd, out loud. */
   readonly kernelAssert: () => PhaseOutput;
@@ -61,6 +53,29 @@ const PHASE_SEQUENCE: readonly { readonly phase: BootPhase; readonly title: stri
   { phase: "health", title: "Baseline health", key: "baselineHealth" }
 ];
 
+export const BootReportSchema = z
+  .object({
+    sessionNumber: z.number().int().nonnegative(),
+    phases: z.array(BootPhaseResultSchema).length(PHASE_SEQUENCE.length)
+  })
+  .strict()
+  .superRefine((report, context) => {
+    report.phases.forEach((phase, index) => {
+      const expected = PHASE_SEQUENCE[index];
+      if (
+        expected &&
+        (phase.phase !== expected.phase || phase.ordinal !== index + 1 || phase.title !== expected.title)
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["phases", index],
+          message: `expected canonical phase ${index + 1}: ${expected.phase}`
+        });
+      }
+    });
+  });
+export type BootReport = z.infer<typeof BootReportSchema>;
+
 /**
  * Run the five phases IN ORDER. Non-skippable: a hook that throws degrades to a
  * `warn` phase and the ritual still completes all five. Returns the typed report.
@@ -71,8 +86,8 @@ export function runBootRitual(hooks: BootRitualHooks, sessionNumber: number): Bo
     let output: PhaseOutput;
     try {
       output = hooks[step.key]();
-    } catch (error) {
-      output = { status: "warn", lines: [`phase failed: ${error instanceof Error ? error.message : String(error)}`] };
+    } catch {
+      output = { status: "warn", lines: ["phase hook failed; continuing"] };
     }
     phases.push({
       phase: step.phase,

@@ -5,11 +5,18 @@ import { z } from "zod";
 import { AgentSession } from "../session/agentSession.js";
 import { onSecretSanitized } from "../safety/secretSafety.js";
 import { createHarnessRuntime, type HarnessRuntime } from "../runtime/session.js";
+import type { HarnessSession } from "../runtime/schemas.js";
 import { createDirectProviderCatalog } from "../providers/catalog.js";
 import { createMandateStore } from "../mandates/store.js";
 import { createFileMemoryStore } from "../memory/store.js";
 import { isChatCapableFamily, resolveRouteCredential } from "../model/directChat.js";
 import type { ProviderRouteDescriptor } from "../providers/schemas.js";
+import { loadHarnessConfig } from "../config/loadConfig.js";
+import {
+  createRpcSessionGraph,
+  type RpcForkSessionFactory,
+  type RpcSessionGraph
+} from "./rpcSessionGraph.js";
 
 /**
  * The RPC surface (RPC wave, ADR 2026-07-05-rpc-surface, THERE v2 §14 + §17
@@ -33,6 +40,8 @@ export type RpcEmit = (message: Record<string, unknown>) => void;
 
 export interface RpcContext {
   readonly session: AgentSession;
+  /** Optional graph keeps existing fixed-session dispatch callers compatible. */
+  readonly graph?: RpcSessionGraph;
   readonly emit: RpcEmit;
   readonly routes?: readonly ProviderRouteDescriptor[];
 }
@@ -59,37 +68,78 @@ export async function dispatchRpc(request: RpcRequest, ctx: RpcContext): Promise
   const params = request.params;
   const idField = request.id !== undefined ? { id: request.id } : {};
   try {
+    const session = ctx.graph?.activeSession ?? ctx.session;
     switch (request.method) {
       case "prompt": {
-        const result = await ctx.session.promptDrainingFollowUps(String(params.text ?? ""));
+        const runPrompt = (activeSession: AgentSession) => activeSession.promptDrainingFollowUps(String(params.text ?? ""));
+        const result = ctx.graph
+          ? await ctx.graph.withActiveTurn(runPrompt)
+          : await runPrompt(session);
         return { ...idField, ok: true, result: { text: result.text, toolCalls: result.toolCallCount } };
       }
       case "steer": {
-        ctx.session.steer(String(params.text ?? ""));
-        return { ...idField, ok: true, result: { queued: ctx.session.queueDepth() } };
+        session.steer(String(params.text ?? ""));
+        return { ...idField, ok: true, result: { queued: session.queueDepth() } };
       }
       case "follow_up": {
-        ctx.session.followUp(String(params.text ?? ""));
-        return { ...idField, ok: true, result: { queued: ctx.session.queueDepth() } };
+        session.followUp(String(params.text ?? ""));
+        return { ...idField, ok: true, result: { queued: session.queueDepth() } };
       }
       case "abort": {
         // §17 S13: really interrupt the running turn (trips the in-flight abort signal).
-        const aborted = ctx.session.abort();
+        const aborted = session.abort();
         return { ...idField, ok: true, result: { aborted } };
+      }
+      case "compaction": {
+        const instructions = typeof params.instructions === "string" ? params.instructions : undefined;
+        const result = await session.compact(instructions);
+        return { ...idField, ok: true, result };
       }
       case "state":
       case "stats":
-        return { ...idField, ok: true, result: ctx.session.stats() };
+        return { ...idField, ok: true, result: session.stats() };
       case "suit_up": {
-        const worn = ctx.session.suitUp(String(params.description ?? ""));
+        const worn = session.suitUp(String(params.description ?? ""));
         return { ...idField, ok: true, result: { created: worn.created, suit: worn.suit?.slug ?? null, skippedRed: worn.skippedRed } };
       }
       case "park": {
-        const receipt = ctx.session.park();
+        const receipt = session.park();
         return { ...idField, ok: true, result: receipt ?? { parked: false } };
       }
       case "models":
         return { ...idField, ok: true, result: (ctx.routes ?? []).map((route) => route.routeId) };
+      case "get_tree": {
+        if (!ctx.graph) {
+          throw new Error("RPC session graph: graph is unavailable.");
+        }
+        return { ...idField, ok: true, result: ctx.graph.tree() };
+      }
+      case "fork": {
+        if (!ctx.graph) {
+          throw new Error("RPC session graph: graph is unavailable.");
+        }
+        if (typeof params.throughHistoryIndex !== "number") {
+          throw new Error("RPC session graph: throughHistoryIndex must identify an existing user message.");
+        }
+        const parentSessionId = params.sessionId;
+        if (parentSessionId !== undefined && (typeof parentSessionId !== "string" || parentSessionId.trim().length === 0)) {
+          throw new Error("RPC session graph: sessionId must be a non-empty string.");
+        }
+        const result = await ctx.graph.fork({
+          ...(typeof parentSessionId === "string" ? { parentSessionId } : {}),
+          throughHistoryIndex: params.throughHistoryIndex
+        });
+        return { ...idField, ok: true, result };
+      }
+      case "switch_session": {
+        if (!ctx.graph) {
+          throw new Error("RPC session graph: graph is unavailable.");
+        }
+        if (typeof params.sessionId !== "string" || params.sessionId.trim().length === 0) {
+          throw new Error("RPC session graph: sessionId must be a non-empty string.");
+        }
+        return { ...idField, ok: true, result: ctx.graph.switchSession(params.sessionId) };
+      }
       default:
         return { ...idField, ok: false, error: `unknown method: ${request.method}` };
     }
@@ -108,6 +158,27 @@ export function wireRpcEvents(session: AgentSession, emit: RpcEmit): () => void 
     session.subscribe("done.packet", (p) => emit({ type: "event", event: "done.packet", turns: p.turns })),
     session.subscribe("steer.injected", (p) => emit({ type: "event", event: "steer.injected", kind: p.kind })),
     session.subscribe("aborted", (p) => emit({ type: "event", event: "aborted", atTurn: p.atTurn })),
+    session.subscribe("compaction.start", (p) => emit({
+      type: "event",
+      event: "compaction_start",
+      reason: p.reason,
+      beforeTokens: p.beforeTokens,
+      historyLength: p.historyLength
+    })),
+    session.subscribe("compaction.end", (p) => {
+      if (p.compacted) {
+        emit({
+          type: "event",
+          event: "compaction_end",
+          compacted: true,
+          summaryCount: p.summaryCount,
+          beforeTokens: p.beforeTokens,
+          afterTokens: p.afterTokens
+        });
+        return;
+      }
+      emit({ type: "event", event: "compaction_end", compacted: false, reason: p.reason });
+    }),
     // The secret_sanitized event carries pattern NAMES only, never a value (§17.9).
     onSecretSanitized((patterns) => emit({ type: "event", event: "secret_sanitized", patterns: [...patterns] }))
   ];
@@ -119,29 +190,76 @@ export function wireRpcEvents(session: AgentSession, emit: RpcEmit): () => void 
 export interface RunRpcOptions {
   /** Inject a session (tests); otherwise a session is bootstrapped from the catalog. */
   readonly session?: AgentSession;
+  /** Stable graph id for an injected root session. Defaults to `root`. */
+  readonly rootSessionId?: string;
+  /** Explicit branch factory for injected-session tests. */
+  readonly createForkSession?: RpcForkSessionFactory;
   /** Construct the runtime RPC will own when it bootstraps a session. Ignored for an injected session. */
   readonly createRuntime?: () => HarnessRuntime;
+  /** Active harness-config loader; injectable for deterministic bootstrap tests. */
+  readonly loadConfig?: typeof loadHarnessConfig;
   readonly routes?: readonly ProviderRouteDescriptor[];
   readonly input?: NodeJS.ReadableStream;
   readonly output?: NodeJS.WritableStream;
 }
 
-async function bootstrapSession(createRuntime: () => HarnessRuntime): Promise<{ session: AgentSession; routes: readonly ProviderRouteDescriptor[]; runtime: HarnessRuntime }> {
+function createAgentSession(
+  runtime: HarnessRuntime,
+  route: ProviderRouteDescriptor,
+  harness: HarnessSession,
+  compaction: ReturnType<typeof loadHarnessConfig>["config"]["compaction"]
+): AgentSession {
+  return new AgentSession({
+    runtime,
+    route,
+    session: harness,
+    sessionTools: runtime.getSessionTools(harness.id),
+    mandate: createMandateStore().load(),
+    memory: createFileMemoryStore(),
+    compaction,
+    now: () => new Date()
+  });
+}
+
+async function bootstrapSession(
+  createRuntime: () => HarnessRuntime,
+  loadConfig: typeof loadHarnessConfig
+): Promise<{
+  session: AgentSession;
+  rootSessionId: string;
+  createForkSession: RpcForkSessionFactory;
+  routes: readonly ProviderRouteDescriptor[];
+  runtime: HarnessRuntime;
+}> {
   const runtime = createRuntime();
   try {
-    const harness = await runtime.startSession({ purpose: "chat" });
+    const config = loadConfig().config;
     const routes = createDirectProviderCatalog();
     const route = routes.find((r) => isChatCapableFamily(r.apiFamily) && r.routeType === "direct-api" && resolveRouteCredential(r).usable) ?? routes[0];
-    const session = new AgentSession({
-      runtime,
-      route: route as ProviderRouteDescriptor,
-      session: harness,
-      sessionTools: runtime.getSessionTools(harness.id),
-      mandate: createMandateStore().load(),
-      memory: createFileMemoryStore(),
-      now: () => new Date()
-    });
-    return { session, routes, runtime };
+    const selectedRoute = route as ProviderRouteDescriptor;
+    const createForkSession: RpcForkSessionFactory = async () => {
+      const harness = await runtime.startSession({ purpose: "chat" });
+      try {
+        return {
+          sessionId: harness.id,
+          session: createAgentSession(runtime, selectedRoute, harness, config.compaction),
+          close: async () => {
+            await runtime.closeSession(harness.id);
+          }
+        };
+      } catch (error) {
+        await runtime.closeSession(harness.id);
+        throw error;
+      }
+    };
+    const root = await createForkSession();
+    return {
+      session: root.session,
+      rootSessionId: root.sessionId,
+      createForkSession,
+      routes,
+      runtime
+    };
   } catch (error) {
     await runtime.close();
     throw error;
@@ -155,18 +273,51 @@ export async function runRpcMode(options: RunRpcOptions = {}): Promise<void> {
     output.write(`${JSON.stringify(message)}\n`);
   };
   let session = options.session;
+  let rootSessionId = options.rootSessionId ?? "root";
+  let createForkSession = options.createForkSession;
   let routes = options.routes;
   let ownedRuntime: HarnessRuntime | undefined;
   if (!session) {
-    const boot = await bootstrapSession(options.createRuntime ?? createHarnessRuntime);
+    const boot = await bootstrapSession(
+      options.createRuntime ?? createHarnessRuntime,
+      options.loadConfig ?? loadHarnessConfig
+    );
     session = boot.session;
+    rootSessionId = boot.rootSessionId;
+    createForkSession = boot.createForkSession;
     routes = boot.routes;
     ownedRuntime = boot.runtime;
   }
-  const ctx: RpcContext = { session, emit, ...(routes ? { routes } : {}) };
-  const unwire = wireRpcEvents(session, emit);
+  const graph = createRpcSessionGraph({
+    rootSessionId,
+    rootSession: session,
+    ...(createForkSession ? { createForkSession } : {})
+  });
+  const ctx: RpcContext = { session, graph, emit, ...(routes ? { routes } : {}) };
+  let unwire = wireRpcEvents(session, emit);
+  const unsubscribeActiveSession = graph.subscribeActiveSession((_sessionId, activeSession) => {
+    unwire();
+    unwire = wireRpcEvents(activeSession, emit);
+  });
   try {
-    emit({ type: "event", event: "ready", methods: ["prompt", "steer", "follow_up", "abort", "state", "suit_up", "park", "models"] });
+    emit({
+      type: "event",
+      event: "ready",
+      methods: [
+        "prompt",
+        "steer",
+        "follow_up",
+        "abort",
+        "state",
+        "suit_up",
+        "park",
+        "models",
+        "compaction",
+        "get_tree",
+        "fork",
+        "switch_session"
+      ]
+    });
 
     const input = options.input ?? process.stdin;
     const decoder = new StringDecoder("utf8");
@@ -174,6 +325,7 @@ export async function runRpcMode(options: RunRpcOptions = {}): Promise<void> {
     // Prompts serialize (each may drain follow-ups); steer/follow_up/abort stay immediate
     // so they can land mid-turn without waiting behind a long prompt.
     let promptChain: Promise<void> = Promise.resolve();
+    const pendingDispatches = new Set<Promise<void>>();
     const dispatchLine = (request: RpcRequest): void => {
       if (request.method === "prompt") {
         // Chain prompts serially (each may drain follow-ups), but catch at each link
@@ -191,14 +343,24 @@ export async function runRpcMode(options: RunRpcOptions = {}): Promise<void> {
           });
         return;
       }
-      void dispatchRpc(request, ctx).then((response) => emit(response)).catch((error: unknown) => {
+      const pending = dispatchRpc(request, ctx).then((response) => emit(response)).catch((error: unknown) => {
         // eslint-disable-next-line no-console
         console.warn(`[rpc] ${request.method}: emit failed (${error instanceof Error ? error.message : String(error)}).`);
       });
+      pendingDispatches.add(pending);
+      void pending.finally(() => {
+        pendingDispatches.delete(pending);
+      });
     };
     await new Promise<void>((resolve) => {
+      let finishing = false;
       const finish = (): void => {
-        void promptChain.finally(() => resolve());
+        if (finishing) return;
+        finishing = true;
+        void promptChain.then(async () => {
+          await Promise.allSettled([...pendingDispatches]);
+          resolve();
+        });
       };
       input.on("data", (chunk: Buffer | string) => {
         for (const line of frameChunk(state, chunk, decoder)) {
@@ -220,6 +382,7 @@ export async function runRpcMode(options: RunRpcOptions = {}): Promise<void> {
       input.on("close", finish);
     });
   } finally {
+    unsubscribeActiveSession();
     unwire();
     await ownedRuntime?.close();
   }

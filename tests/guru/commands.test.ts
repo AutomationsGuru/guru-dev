@@ -12,6 +12,7 @@ import {
   isDirectGuruInvocation,
   injectRepoRoot,
   parseSlashCommand,
+  queueScheduledPrompt,
   readApprovalAnswer,
   resolveWorkerYolo,
   resolveRouteSelector,
@@ -471,6 +472,21 @@ describe("runtime cleanup", () => {
 
     await expect(withRuntimeCleanup(async () => Promise.reject(failure), close)).rejects.toBe(failure);
     expect(close).toHaveBeenCalledOnce();
+  });
+});
+
+describe("scheduled prompt delivery", () => {
+  it("queues the exact scheduled message as a steer without starting a turn", () => {
+    const steer = vi.fn();
+
+    queueScheduledPrompt({ steer }, "[scheduled] inspect the queue");
+
+    expect(steer).toHaveBeenCalledOnce();
+    expect(steer).toHaveBeenCalledWith("[scheduled] inspect the queue");
+  });
+
+  it("fails explicitly when no active Guru agent session can receive the notification", () => {
+    expect(() => queueScheduledPrompt(null, "[scheduled] nowhere")).toThrow(/active agent session/iu);
   });
 });
 

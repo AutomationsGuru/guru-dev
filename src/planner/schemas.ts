@@ -21,6 +21,34 @@ export const PlannerPlanSchema = z
   .strict();
 export type PlannerPlan = z.infer<typeof PlannerPlanSchema>;
 
+const PlannerTokenCountSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
+
+export const PlannerTokenUsageSchema = z
+  .object({
+    inputTokens: PlannerTokenCountSchema,
+    outputTokens: PlannerTokenCountSchema,
+    totalTokens: PlannerTokenCountSchema
+  })
+  .strict()
+  .superRefine((usage, context) => {
+    if (usage.totalTokens !== usage.inputTokens + usage.outputTokens) {
+      context.addIssue({
+        code: "custom",
+        path: ["totalTokens"],
+        message: "totalTokens must equal inputTokens plus outputTokens."
+      });
+    }
+  });
+export type PlannerTokenUsage = z.infer<typeof PlannerTokenUsageSchema>;
+
+export const PlannerModelResultSchema = z
+  .object({
+    plan: z.unknown(),
+    usage: PlannerTokenUsageSchema.optional()
+  })
+  .strict();
+export type PlannerModelResult = z.infer<typeof PlannerModelResultSchema>;
+
 export const PlannerModelRequestSchema = z
   .object({
     objective: z.string().trim().min(1),
@@ -81,6 +109,7 @@ export const PlannerRunReportSchema = z
     endedAt: z.string().datetime(),
     durationMs: z.number().nonnegative().max(86_400_000),
     plan: PlannerPlanSchema.nullable(),
+    usage: PlannerTokenUsageSchema.optional(),
     observations: z.array(PlannerStepObservationSchema),
     blockers: z.array(z.string()),
     nextActions: z.array(z.string())

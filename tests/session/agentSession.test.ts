@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { AgentSession, type AgentSessionDeps, type TurnRunner } from "../../src/session/agentSession.js";
+import type { SummarizeRequest } from "../../src/compaction/engine.js";
 import type { ChatTurnMessage } from "../../src/model/directChat.js";
 import { createFileMemoryStore } from "../../src/memory/store.js";
 import type { AgentTurnResult } from "../../src/model/agentTurn.js";
@@ -43,6 +44,22 @@ function makeSession(over: Partial<AgentSessionDeps> = {}): AgentSession {
     now: () => new Date(Date.UTC(2026, 6, 5)),
     ...over
   });
+}
+
+const ENABLED_COMPACTION = {
+  enabled: true,
+  reserveTokens: 1_000,
+  keepRecentTokens: 130,
+  summaryMaxTokens: 256
+} as const;
+
+function seedCompactableHistory(target: AgentSession): void {
+  for (let index = 0; index < 3; index += 1) {
+    target.history.push(
+      { role: "user", content: `question-${index}-${"q".repeat(220)}` },
+      { role: "assistant", content: `answer-${index}-${"a".repeat(220)}` }
+    );
+  }
 }
 
 describe("AgentSession — the turn engine", () => {
@@ -381,5 +398,379 @@ describe("AgentSession — usability-audit regressions (2026-07-09)", () => {
     const s2 = makeSession({ runTurn: stubRunner({ text: "" }) });
     await s2.prompt("hi");
     expect(s2.history.map((m) => m.role)).toEqual(["user"]);
+  });
+});
+
+describe("AgentSession — manual compaction", () => {
+  it("returns disabled without config and leaves the existing history array untouched", async () => {
+    const s = makeSession();
+    seedCompactableHistory(s);
+    const historyRef = s.history;
+    const before = structuredClone(s.history);
+
+    await expect(s.compact()).resolves.toEqual({ compacted: false, reason: "disabled" });
+    expect(s.history).toBe(historyRef);
+    expect(s.history).toEqual(before);
+  });
+
+  it("returns nothing-to-compact without calling the summarizer", async () => {
+    const requests: SummarizeRequest[] = [];
+    const s = makeSession({
+      compaction: ENABLED_COMPACTION,
+      summarize: async (request) => {
+        requests.push(request);
+        return "unused";
+      }
+    });
+    s.history.push({ role: "user", content: "short" });
+    const historyRef = s.history;
+    const before = structuredClone(s.history);
+
+    await expect(s.compact()).resolves.toEqual({ compacted: false, reason: "nothing-to-compact" });
+    expect(requests).toHaveLength(0);
+    expect(s.history).toBe(historyRef);
+    expect(s.history).toEqual(before);
+  });
+
+  it("emits one bounded start and one successful end for a real manual compaction", async () => {
+    const events: Array<{ readonly event: string; readonly payload: unknown }> = [];
+    const requests: SummarizeRequest[] = [];
+    const s = makeSession({
+      compaction: ENABLED_COMPACTION,
+      summarize: async (request) => {
+        requests.push(request);
+        return "PRIVATE_SUMMARY_TEXT";
+      }
+    });
+    seedCompactableHistory(s);
+    const historyLength = s.history.length;
+    s.subscribe("compaction.start", (payload) => events.push({ event: "start", payload }));
+    s.subscribe("compaction.end", (payload) => events.push({ event: "end", payload }));
+
+    const result = await s.compact("PRIVATE_OPERATOR_INSTRUCTION");
+
+    expect(result).toMatchObject({ compacted: true, summaryCount: 1 });
+    expect(requests).toHaveLength(1);
+    expect(events).toEqual([
+      {
+        event: "start",
+        payload: {
+          reason: "manual",
+          beforeTokens: expect.any(Number),
+          historyLength
+        }
+      },
+      {
+        event: "end",
+        payload: {
+          compacted: true,
+          summaryCount: 1,
+          beforeTokens: expect.any(Number),
+          afterTokens: expect.any(Number)
+        }
+      }
+    ]);
+    expect(JSON.stringify(events)).not.toContain("PRIVATE_OPERATOR_INSTRUCTION");
+    expect(JSON.stringify(events)).not.toContain("PRIVATE_SUMMARY_TEXT");
+    expect(JSON.stringify(events)).not.toContain("question-0-");
+  });
+
+  it("emits a bounded nothing-to-compact terminal event without invoking the summarizer", async () => {
+    const events: Array<{ readonly event: string; readonly payload: unknown }> = [];
+    const requests: SummarizeRequest[] = [];
+    const s = makeSession({
+      compaction: ENABLED_COMPACTION,
+      summarize: async (request) => {
+        requests.push(request);
+        return "unused";
+      }
+    });
+    s.history.push({ role: "user", content: "PRIVATE_SHORT_TRANSCRIPT" });
+    s.subscribe("compaction.start", (payload) => events.push({ event: "start", payload }));
+    s.subscribe("compaction.end", (payload) => events.push({ event: "end", payload }));
+
+    await expect(s.compact()).resolves.toEqual({ compacted: false, reason: "nothing-to-compact" });
+
+    expect(requests).toHaveLength(0);
+    expect(events).toEqual([
+      {
+        event: "start",
+        payload: {
+          reason: "manual",
+          beforeTokens: expect.any(Number),
+          historyLength: 1
+        }
+      },
+      { event: "end", payload: { compacted: false, reason: "nothing-to-compact" } }
+    ]);
+    expect(JSON.stringify(events)).not.toContain("PRIVATE_SHORT_TRANSCRIPT");
+  });
+
+  it("emits one redacted failed end, preserves history, and rethrows the original failure", async () => {
+    const events: Array<{ readonly event: string; readonly payload: unknown }> = [];
+    const expected = new Error("PRIVATE_PROVIDER_FAILURE_MESSAGE");
+    let summarizeCalls = 0;
+    const s = makeSession({
+      compaction: ENABLED_COMPACTION,
+      summarize: async () => {
+        summarizeCalls += 1;
+        throw expected;
+      }
+    });
+    seedCompactableHistory(s);
+    const before = structuredClone(s.history);
+    s.subscribe("compaction.start", (payload) => events.push({ event: "start", payload }));
+    s.subscribe("compaction.end", (payload) => events.push({ event: "end", payload }));
+
+    await expect(s.compact()).rejects.toBe(expected);
+
+    expect(summarizeCalls).toBe(1);
+    expect(s.history).toEqual(before);
+    expect(events.map(({ event }) => event)).toEqual(["start", "end"]);
+    expect(events[1]).toEqual({ event: "end", payload: { compacted: false, reason: "failed" } });
+    expect(JSON.stringify(events)).not.toContain("PRIVATE_PROVIDER_FAILURE_MESSAGE");
+    expect(JSON.stringify(events)).not.toContain("question-0-");
+  });
+
+  it("emits no lifecycle events for disabled or busy requests", async () => {
+    const disabledEvents: string[] = [];
+    const disabled = makeSession();
+    seedCompactableHistory(disabled);
+    disabled.subscribe("compaction.start", () => disabledEvents.push("start"));
+    disabled.subscribe("compaction.end", () => disabledEvents.push("end"));
+    await expect(disabled.compact()).resolves.toEqual({ compacted: false, reason: "disabled" });
+    expect(disabledEvents).toEqual([]);
+
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const busyEvents: string[] = [];
+    const busy = makeSession({
+      compaction: ENABLED_COMPACTION,
+      runTurn: (async () => {
+        await gate;
+        return {
+          text: "done",
+          modelId: "m",
+          routeId: "stub/model",
+          apiFamily: "openai-chat-completions",
+          toolCallCount: 0,
+          toolEvents: []
+        } satisfies AgentTurnResult;
+      }) as TurnRunner
+    });
+    busy.subscribe("compaction.start", () => busyEvents.push("start"));
+    busy.subscribe("compaction.end", () => busyEvents.push("end"));
+    const prompt = busy.prompt("in flight");
+    await expect(busy.compact()).resolves.toEqual({ compacted: false, reason: "busy" });
+    expect(busyEvents).toEqual([]);
+    release();
+    await prompt;
+  });
+
+  it("compacts in place, forwards custom instructions once, and the next prompt sees the rebuilt history", async () => {
+    const requests: SummarizeRequest[] = [];
+    const sentToNextPrompt: ChatTurnMessage[][] = [];
+    const runner: TurnRunner = (async (_route, messages) => {
+      sentToNextPrompt.push([...messages]);
+      return {
+        text: "next answer",
+        modelId: "m",
+        routeId: "stub/model",
+        apiFamily: "openai-chat-completions",
+        toolCallCount: 0,
+        toolEvents: []
+      };
+    }) as TurnRunner;
+    const s = makeSession({
+      systemPrompt: "SYSTEM",
+      compaction: ENABLED_COMPACTION,
+      summarize: async (request) => {
+        requests.push(request);
+        return "summary-one";
+      },
+      runTurn: runner
+    });
+    seedCompactableHistory(s);
+    const historyRef = s.history;
+    const statsBefore = s.stats();
+
+    const result = await s.compact("focus on unresolved work");
+
+    expect(result.compacted).toBe(true);
+    if (!result.compacted) throw new Error("expected compaction");
+    expect(result.summaryCount).toBe(1);
+    expect(result.beforeTokens).toBeGreaterThan(result.afterTokens);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.customInstructions).toBe("focus on unresolved work");
+    expect(s.history).toBe(historyRef);
+    expect(s.history[0]).toEqual({ role: "system", content: "SYSTEM" });
+    expect(s.history.some((message) => message.content.includes("summary-one"))).toBe(true);
+    expect(s.history.some((message) => message.content.includes("question-0-"))).toBe(false);
+    expect(s.stats()).toMatchObject({
+      turns: statsBefore.turns,
+      inputTokens: statsBefore.inputTokens,
+      outputTokens: statsBefore.outputTokens
+    });
+
+    await s.prompt("continue after compaction");
+    expect(sentToNextPrompt).toHaveLength(1);
+    expect(sentToNextPrompt[0]?.some((message) => message.content.includes("summary-one"))).toBe(true);
+    expect(sentToNextPrompt[0]?.some((message) => message.content.includes("question-0-"))).toBe(false);
+    expect(sentToNextPrompt[0]?.at(-1)?.content).toBe("continue after compaction");
+  });
+
+  it("compacts user-first history without dropping the first user message from the summary input", async () => {
+    const requests: SummarizeRequest[] = [];
+    const s = makeSession({
+      compaction: ENABLED_COMPACTION,
+      summarize: async (request) => {
+        requests.push(request);
+        return "user-first summary";
+      }
+    });
+    seedCompactableHistory(s);
+
+    const result = await s.compact();
+
+    expect(result.compacted).toBe(true);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.transcriptBlock).toContain("question-0-");
+    expect(s.history[0]?.role).toBe("system");
+    expect(s.history[0]?.content).toContain("user-first summary");
+  });
+
+  it("retains the previous summary and increments the count on a second compaction", async () => {
+    const requests: SummarizeRequest[] = [];
+    let summaryNumber = 0;
+    const s = makeSession({
+      compaction: ENABLED_COMPACTION,
+      summarize: async (request) => {
+        requests.push(request);
+        summaryNumber += 1;
+        return `summary-${summaryNumber}`;
+      }
+    });
+    seedCompactableHistory(s);
+    const first = await s.compact();
+    expect(first).toMatchObject({ compacted: true, summaryCount: 1 });
+    s.history.push(
+      { role: "user", content: `new-question-0-${"q".repeat(220)}` },
+      { role: "assistant", content: `new-answer-0-${"a".repeat(220)}` },
+      { role: "user", content: `new-question-1-${"q".repeat(220)}` },
+      { role: "assistant", content: `new-answer-1-${"a".repeat(220)}` }
+    );
+
+    const second = await s.compact();
+
+    expect(second).toMatchObject({ compacted: true, summaryCount: 2 });
+    expect(requests.at(-1)?.previousSummary).toBe("summary-1");
+    expect(s.history.filter((message) => message.content.includes("[compaction summary]"))).toHaveLength(1);
+    expect(s.history.some((message) => message.content.includes("summary-2"))).toBe(true);
+  });
+
+  it("throws summarizer failures and preserves history exactly", async () => {
+    const expected = new Error("summary route failed");
+    const s = makeSession({
+      compaction: ENABLED_COMPACTION,
+      summarize: async () => {
+        throw expected;
+      }
+    });
+    seedCompactableHistory(s);
+    const historyRef = s.history;
+    const before = structuredClone(s.history);
+
+    await expect(s.compact()).rejects.toBe(expected);
+    expect(s.history).toBe(historyRef);
+    expect(s.history).toEqual(before);
+    await expect(s.compact()).rejects.toBe(expected);
+  });
+
+  it("returns busy while a prompt is in flight without changing that turn's history", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const runner: TurnRunner = (async () => {
+      await gate;
+      return {
+        text: "done",
+        modelId: "m",
+        routeId: "stub/model",
+        apiFamily: "openai-chat-completions",
+        toolCallCount: 0,
+        toolEvents: []
+      };
+    }) as TurnRunner;
+    const s = makeSession({ compaction: ENABLED_COMPACTION, summarize: async () => "summary", runTurn: runner });
+    seedCompactableHistory(s);
+    const prompt = s.prompt("currently running");
+    const beforeCompactAttempt = structuredClone(s.history);
+
+    await expect(s.compact()).resolves.toEqual({ compacted: false, reason: "busy" });
+    expect(s.history).toEqual(beforeCompactAttempt);
+
+    release();
+    await prompt;
+  });
+
+  it("rejects prompts and a second compaction while the first compaction is running", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const s = makeSession({
+      compaction: ENABLED_COMPACTION,
+      summarize: async () => {
+        await gate;
+        return "summary";
+      }
+    });
+    seedCompactableHistory(s);
+    const before = structuredClone(s.history);
+    const first = s.compact();
+
+    await expect(s.compact()).resolves.toEqual({ compacted: false, reason: "busy" });
+    await expect(s.prompt("must not be appended")).rejects.toThrow(/compaction is already running/);
+    expect(s.history).toEqual(before);
+
+    release();
+    await expect(first).resolves.toMatchObject({ compacted: true, summaryCount: 1 });
+  });
+
+  it("uses a tool-free production summarizer without advancing ordinary turn usage", async () => {
+    const calls: Array<{ messages: readonly ChatTurnMessage[]; tools: readonly unknown[]; approved: boolean }> = [];
+    const runner: TurnRunner = (async (_route, messages, options) => {
+      calls.push({ messages: [...messages], tools: options.tools, approved: await options.approveTool("read", {}) });
+      return {
+        text: "model-produced summary",
+        modelId: "m",
+        routeId: "stub/model",
+        apiFamily: "openai-chat-completions",
+        usage: { inputTokens: 900, outputTokens: 100, lastRequestInputTokens: 900 },
+        toolCallCount: 0,
+        toolEvents: []
+      };
+    }) as TurnRunner;
+    const s = makeSession({ compaction: ENABLED_COMPACTION, runTurn: runner });
+    seedCompactableHistory(s);
+    const statsBefore = s.stats();
+
+    const result = await s.compact();
+
+    expect(result.compacted).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.tools).toEqual([]);
+    expect(calls[0]?.approved).toBe(false);
+    expect(calls[0]?.messages[0]?.role).toBe("system");
+    expect(s.stats()).toMatchObject({
+      turns: statsBefore.turns,
+      inputTokens: statsBefore.inputTokens,
+      outputTokens: statsBefore.outputTokens,
+      lastInputTokens: statsBefore.lastInputTokens
+    });
+    expect(s.history.some((message) => message.content.includes("model-produced summary"))).toBe(true);
   });
 });

@@ -4,15 +4,18 @@ import type { MandateDecision } from "../mandates/evaluate.js";
 import type { HarnessSession } from "../runtime/schemas.js";
 import {
   PlannerModelRequestSchema,
+  PlannerModelResultSchema,
   PlannerPlanSchema,
   PlannerRunOptionsSchema,
   PlannerRunReportSchema,
+  PlannerTokenUsageSchema,
   type PlannerFailureReason,
   type PlannerModelRequest,
   type PlannerPlan,
   type PlannerRunOptions,
   type PlannerRunReport,
-  type PlannerStepObservation
+  type PlannerStepObservation,
+  type PlannerTokenUsage
 } from "./schemas.js";
 
 export interface PlannerModel {
@@ -44,6 +47,7 @@ export async function runPlannerExecution(options: RunPlannerExecutionOptions): 
   const observations: PlannerStepObservation[] = [];
   const blockers: string[] = [];
   let plan: PlannerPlan | null = null;
+  let usage: PlannerTokenUsage | undefined;
 
   const request = PlannerModelRequestSchema.parse({
     objective: parsedOptions.objective,
@@ -56,26 +60,38 @@ export async function runPlannerExecution(options: RunPlannerExecutionOptions): 
   });
 
   try {
-    const rawPlan = await options.model.createPlan(request);
+    const modelResult = await options.model.createPlan(request);
+    const envelopeResult = PlannerModelResultSchema.safeParse(modelResult);
+    const rawPlan = envelopeResult.success ? envelopeResult.data.plan : modelResult;
+    usage = envelopeResult.success ? envelopeResult.data.usage : undefined;
     const planResult = PlannerPlanSchema.safeParse(rawPlan);
 
     if (!planResult.success) {
       blockers.push(`Planner model returned an invalid plan: ${planResult.error.issues.map(formatIssue).join("; ")}`);
 
-      return buildPlannerRunReport(options.session.id, parsedOptions.objective, startedAtDate, plan, observations, blockers, "invalid-plan");
+      return buildPlannerRunReport(options.session.id, parsedOptions.objective, startedAtDate, plan, observations, blockers, "invalid-plan", usage);
     }
 
     plan = planResult.data;
   } catch (error) {
     blockers.push(`Planner model failed: ${formatError(error)}`);
 
-    return buildPlannerRunReport(options.session.id, parsedOptions.objective, startedAtDate, plan, observations, blockers, "model-threw");
+    return buildPlannerRunReport(
+      options.session.id,
+      parsedOptions.objective,
+      startedAtDate,
+      plan,
+      observations,
+      blockers,
+      "model-threw",
+      extractPlannerErrorUsage(error)
+    );
   }
 
   if (plan.steps.length > parsedOptions.maxSteps) {
     blockers.push(`Planner produced ${plan.steps.length} step(s), exceeding maxSteps ${parsedOptions.maxSteps}.`);
 
-    return buildPlannerRunReport(options.session.id, parsedOptions.objective, startedAtDate, plan, observations, blockers, "invalid-plan");
+    return buildPlannerRunReport(options.session.id, parsedOptions.objective, startedAtDate, plan, observations, blockers, "invalid-plan", usage);
   }
 
   const cwd = options.session.repo?.repoRoot ?? process.cwd();
@@ -110,7 +126,8 @@ export async function runPlannerExecution(options: RunPlannerExecutionOptions): 
     plan,
     observations,
     blockers,
-    blockers.length > 0 ? "tool-failed" : undefined
+    blockers.length > 0 ? "tool-failed" : undefined,
+    usage
   );
 }
 
@@ -146,7 +163,8 @@ function buildPlannerRunReport(
   plan: PlannerPlan | null,
   observations: readonly PlannerStepObservation[],
   blockers: readonly string[],
-  failureReason?: PlannerFailureReason
+  failureReason?: PlannerFailureReason,
+  usage?: PlannerTokenUsage
 ): PlannerRunReport {
   const endedAtDate = new Date();
   const status = blockers.length === 0 ? "completed" : "blocked";
@@ -160,6 +178,7 @@ function buildPlannerRunReport(
     endedAt: endedAtDate.toISOString(),
     durationMs: Math.max(0, endedAtDate.getTime() - startedAtDate.getTime()),
     plan,
+    ...(usage ? { usage } : {}),
     observations,
     blockers: [...blockers],
     nextActions:
@@ -167,6 +186,15 @@ function buildPlannerRunReport(
         ? ["Inspect planner observations, then run validation and review gates before handoff."]
         : ["Resolve planner blocker(s), then rerun the planner with an updated objective or model output."]
   });
+}
+
+function extractPlannerErrorUsage(error: unknown): PlannerTokenUsage | undefined {
+  if (typeof error !== "object" || error === null || !("usage" in error)) {
+    return undefined;
+  }
+
+  const result = PlannerTokenUsageSchema.safeParse((error as { readonly usage?: unknown }).usage);
+  return result.success ? result.data : undefined;
 }
 
 function formatIssue(issue: { readonly path: readonly PropertyKey[]; readonly message: string }): string {

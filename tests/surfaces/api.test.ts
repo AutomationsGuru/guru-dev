@@ -3,6 +3,10 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { createHarnessRuntime, createInMemorySessionPersistenceStore } from "../../src/index.js";
+import { BootReportSchema, runBootRitual } from "../../src/boot/ritual.js";
+import type { RunSelfBuildExecutorOptions, SelfBuildExecutorReport } from "../../src/executor/selfBuildExecutor.js";
+import { MandateStateSchema } from "../../src/mandates/schema.js";
+import { runDevCycle, type DevCycleReport, type RunDevCycleInput } from "../../src/selfbuild/runDevCycle.js";
 import { startHarnessApiServer } from "../../src/surfaces/api.js";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -11,6 +15,35 @@ type JsonResponse = {
   readonly status: number;
   readonly body: unknown;
 };
+
+function fakeExecutorReport(): SelfBuildExecutorReport {
+  return {
+    verdict: "YELLOW",
+    session: {} as SelfBuildExecutorReport["session"],
+    planner: { status: "completed" } as SelfBuildExecutorReport["planner"],
+    plannerUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+    plannerFallback: null,
+    observability: {} as SelfBuildExecutorReport["observability"],
+    reviewGates: null,
+    gitPr: null,
+    implementation: {} as SelfBuildExecutorReport["implementation"],
+    blocker: null,
+    donePacket: {} as SelfBuildExecutorReport["donePacket"],
+    summary: "deterministic API executor fixture",
+    nextActions: []
+  };
+}
+
+function runGreenApiCycle(input: RunDevCycleInput): Promise<DevCycleReport> {
+  return runDevCycle({
+    ...input,
+    stages: {
+      test: async () => ({ verdict: "GREEN", evidence: "deterministic TEST" }),
+      smoke: async () => ({ verdict: "GREEN", evidence: "deterministic SMOKE" }),
+      ship: async () => ({ verdict: "GREEN", evidence: "deterministic SHIP" })
+    }
+  });
+}
 
 async function postJson(url: URL, path: string, body?: unknown): Promise<JsonResponse> {
   const target = `${path}`;
@@ -125,6 +158,100 @@ async function getJson(url: URL, path: string): Promise<JsonResponse> {
 describe("startHarnessApiServer", () => {
   // Session start + tool-run + inspect chains are integration-heavy; allow headroom under parallel CI load.
   const integrationTimeoutMs = 30_000;
+
+  it("runs the headless boot ritual once at startup and retains its strict report in health", async () => {
+    let ritualCalls = 0;
+    const server = await startHarnessApiServer({
+      port: 0,
+      host: "127.0.0.1",
+      boot: {
+        sessionNumber: 17,
+        phaseData: {
+          kernel: { runtimeName: "guruharness", runtimeVersion: "1.5.0", resolverReady: true },
+          garage: { manifestCount: 2, verifiedLayerCount: 2, staleLayerCount: 0 },
+          memory: { provider: "markdown", status: "ready", injectedFactCount: 3 }
+        },
+        workDeclaration: { availableCapabilityCount: 5, missingCapabilityCount: 0 },
+        baselineHealth: () => ({ verdict: "GREEN" as const, durationMs: 4 }),
+        ritualRunner: (hooks, sessionNumber) => {
+          ritualCalls += 1;
+          return runBootRitual(hooks, sessionNumber);
+        }
+      }
+    });
+
+    try {
+      const firstHealth = await getJson(new URL(server.url), "/health");
+      const secondHealth = await getJson(new URL(server.url), "/health");
+      const report = BootReportSchema.parse((firstHealth.body as { boot?: unknown }).boot);
+
+      expect(firstHealth.status).toBe(200);
+      expect(secondHealth.status).toBe(200);
+      expect(ritualCalls).toBe(1);
+      expect(report).toMatchObject({
+        sessionNumber: 17,
+        phases: [
+          { phase: "kernel", ordinal: 1 },
+          { phase: "garage", ordinal: 2 },
+          { phase: "memory", ordinal: 3 },
+          { phase: "work", ordinal: 4 },
+          { phase: "health", ordinal: 5, status: "ok" }
+        ]
+      });
+      expect((secondHealth.body as { boot?: unknown }).boot).toEqual(report);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("retains all five health phases and keeps serving when one boot hook warns", async () => {
+    let ritualCalls = 0;
+    const server = await startHarnessApiServer({
+      port: 0,
+      host: "127.0.0.1",
+      boot: {
+        sessionNumber: 18,
+        phaseData: {
+          kernel: { runtimeName: "guruharness", runtimeVersion: "1.5.0", resolverReady: true },
+          garage: { manifestCount: 1, verifiedLayerCount: 1, staleLayerCount: 0 },
+          memory: { provider: "markdown", status: "ready", injectedFactCount: 1 }
+        },
+        workDeclaration: { availableCapabilityCount: 2, missingCapabilityCount: 0 },
+        baselineHealth: () => ({ verdict: "GREEN" as const }),
+        ritualRunner: (hooks, sessionNumber) => {
+          ritualCalls += 1;
+          return runBootRitual(
+            {
+              ...hooks,
+              inspectGarage: () => {
+                throw new Error("synthetic garage hook failure");
+              }
+            },
+            sessionNumber
+          );
+        }
+      }
+    });
+
+    try {
+      const health = await getJson(new URL(server.url), "/health");
+      const report = BootReportSchema.parse((health.body as { boot?: unknown }).boot);
+
+      expect(health.status).toBe(200);
+      expect(ritualCalls).toBe(1);
+      expect(report.phases).toHaveLength(5);
+      expect(report.phases[1]).toMatchObject({
+        phase: "garage",
+        status: "warn",
+        lines: ["phase hook failed; continuing"]
+      });
+      expect(report.phases.slice(2).map((phase) => phase.phase)).toEqual(["memory", "work", "health"]);
+      expect(report.phases[4]).toMatchObject({ phase: "health", status: "ok" });
+    } finally {
+      await server.close();
+    }
+  });
+
   it("closes an internally constructed runtime with the HTTP server", async () => {
     const runtime = createHarnessRuntime();
     const closeRuntime = runtime.close.bind(runtime);
@@ -566,5 +693,282 @@ describe("startHarnessApiServer", () => {
     });
 
     await server.close();
+  });
+
+  it("routes the default /run through P7 with translated executor options and live smoke deps", async () => {
+    let cycleEntered = false;
+    let receivedCycleInput: RunDevCycleInput | undefined;
+    let receivedExecutorOptions: RunSelfBuildExecutorOptions | undefined;
+    const configPath = resolve(repoRoot, "guruharness.config.json");
+    const targetPath = resolve(repoRoot, "src");
+    const gitPath = resolve(repoRoot, "src/surfaces/api.ts");
+    const server = await startHarnessApiServer({
+      port: 0,
+      host: "127.0.0.1",
+      allowRunSafetyOverrides: true,
+      runExecutor: async (options) => {
+        if (!cycleEntered) {
+          throw new Error("legacy direct executor call bypassed P7");
+        }
+        receivedExecutorOptions = options;
+        return fakeExecutorReport();
+      },
+      runCycle: async (input) => {
+        receivedCycleInput = input;
+        cycleEntered = true;
+        try {
+          return await runGreenApiCycle(input);
+        } finally {
+          cycleEntered = false;
+        }
+      }
+    });
+
+    try {
+      const response = await postJson(new URL(server.url), "/run", {
+        configPath,
+        cwd: repoRoot,
+        targetPath,
+        taskId: "api-p7",
+        objective: "exercise the P7 API envelope",
+        projectSlug: "api-p7-project",
+        maxPlannerSteps: 7,
+        maxPlannerRetries: 3,
+        allowDirtyWorkspace: true,
+        allowRiskyPaths: true,
+        resumeSessionId: "resume-p7",
+        includeReviewGate: true,
+        git: { dryRun: true, baseBranch: "main", branchName: "api-p7", paths: [gitPath] }
+      });
+
+      expect(response).toMatchObject({
+        status: 200,
+        body: {
+          verdict: "YELLOW",
+          terminal: "done",
+          stages: [
+            { stage: "select", verdict: "GREEN" },
+            { stage: "build", verdict: "GREEN" },
+            { stage: "test", verdict: "GREEN" },
+            { stage: "smoke", verdict: "GREEN" },
+            { stage: "review", verdict: "YELLOW" },
+            { stage: "ship", verdict: "GREEN" },
+            { stage: "learn", verdict: "YELLOW" }
+          ],
+          executor: { planner: { status: "completed" }, summary: "deterministic API executor fixture" },
+          learned: { taskId: "api-p7", outcome: "shipped", confidence: "parked" },
+          ledger: [],
+          summary: expect.stringContaining("dev cycle completed")
+        }
+      });
+      expect(receivedCycleInput?.executorOptions).toMatchObject({
+        configPath,
+        cwd: repoRoot,
+        targetPath,
+        taskId: "api-p7",
+        objective: "exercise the P7 API envelope",
+        projectSlug: "api-p7-project",
+        maxPlannerSteps: 7,
+        maxPlannerRetries: 3,
+        allowDirtyWorkspace: true,
+        allowRiskyPaths: true,
+        resumeSessionId: "resume-p7",
+        includeReviewGate: true,
+        git: { enabled: true, dryRun: true, baseBranch: "main", branchName: "api-p7", paths: [gitPath] }
+      });
+      expect(receivedCycleInput?.executorOptions).not.toHaveProperty("mandatePolicy");
+      expect(receivedCycleInput?.executor).toEqual(expect.any(Function));
+      expect(receivedCycleInput?.mandatePolicy).toEqual(expect.any(Function));
+      expect(receivedCycleInput?.smoke).toMatchObject({ timeoutMs: 30_000 });
+      expect(receivedCycleInput?.smoke?.runSmoke).toEqual(expect.any(Function));
+      expect(receivedCycleInput?.smoke?.selfCall).toEqual(expect.any(Function));
+      expect(receivedExecutorOptions?.includeReviewGate).toBe(false);
+      expect(receivedExecutorOptions?.mandatePolicy).toBe(receivedCycleInput?.mandatePolicy);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("passes the server-owned read-only mandate to P7 and strips request-owned access fields", async () => {
+    let receivedCycleInput: RunDevCycleInput | undefined;
+    let receivedOptions: RunSelfBuildExecutorOptions | undefined;
+    const server = await startHarnessApiServer({
+      port: 0,
+      host: "127.0.0.1",
+      runExecutor: async (options) => {
+        receivedOptions = options;
+        return fakeExecutorReport();
+      },
+      runCycle: async (input) => {
+        receivedCycleInput = input;
+        return runGreenApiCycle(input);
+      }
+    });
+
+    try {
+      const response = await postJson(new URL(server.url), "/run", {
+        cwd: repoRoot,
+        mandate: {
+          grants: [{ scope: "machine", verbs: ["write", "exec"], grantedAt: "request-owned" }],
+          denies: []
+        },
+        grants: [{ scope: "machine", verbs: ["write", "exec"], grantedAt: "request-owned" }],
+        yolo: true
+      });
+
+      expect(response).toMatchObject({ status: 200, body: { terminal: "done", executor: { planner: { status: "completed" } } } });
+      expect(receivedCycleInput?.executorOptions).not.toHaveProperty("mandate");
+      expect(receivedCycleInput?.executorOptions).not.toHaveProperty("grants");
+      expect(receivedCycleInput?.executorOptions).not.toHaveProperty("yolo");
+      expect(receivedOptions).not.toHaveProperty("mandate");
+      expect(receivedOptions).not.toHaveProperty("grants");
+      expect(receivedOptions).not.toHaveProperty("yolo");
+
+      const policy = receivedCycleInput?.mandatePolicy;
+      expect(policy).toEqual(expect.any(Function));
+      if (!policy) {
+        throw new Error("default /run did not give P7 a mandate policy");
+      }
+
+      expect(policy("read", { path: "README.md" }, repoRoot)?.outcome).toBe("allow");
+      expect(policy("write", { path: "src/ordinary.ts" }, repoRoot)?.outcome).toBe("escalate");
+      expect(policy("bash", { command: "npm test" }, repoRoot)?.outcome).toBe("escalate");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("honors covering server grants while scoped denies and hard edges remain binding", async () => {
+    let receivedCycleInput: RunDevCycleInput | undefined;
+    const blockedDirectory = resolve(repoRoot, "blocked");
+    const mandate = MandateStateSchema.parse({
+      grants: [
+        {
+          scope: "space",
+          path: repoRoot,
+          verbs: ["read", "write", "exec", "destructive", "spend", "secret-edge", "auth-edge"],
+          grantedAt: "2026-07-15T00:00:00.000Z"
+        }
+      ],
+      denies: [{ verb: "write", path: blockedDirectory, note: "keep blocked subtree immutable" }]
+    });
+    const server = await startHarnessApiServer({
+      port: 0,
+      host: "127.0.0.1",
+      mandate,
+      runExecutor: async () => fakeExecutorReport(),
+      runCycle: async (input) => {
+        receivedCycleInput = input;
+        return runGreenApiCycle(input);
+      }
+    });
+
+    try {
+      const response = await postJson(new URL(server.url), "/run", { cwd: repoRoot });
+      expect(response.status).toBe(200);
+
+      const policy = receivedCycleInput?.mandatePolicy;
+      expect(policy).toEqual(expect.any(Function));
+      if (!policy) {
+        throw new Error("default /run did not give P7 the configured mandate policy");
+      }
+
+      expect(policy("write", { path: "src/allowed.ts" }, repoRoot)?.outcome).toBe("allow");
+      expect(policy("bash", { command: "npm test" }, repoRoot)?.outcome).toBe("allow");
+      expect(policy("write", { path: resolve(blockedDirectory, "denied.ts") }, repoRoot)?.outcome).toBe("deny");
+      expect(policy("bash", { command: "rm -rf build" }, repoRoot)?.outcome).toBe("escalate");
+      expect(policy("bash", { command: "terraform apply -auto-approve" }, repoRoot)?.outcome).toBe("escalate");
+      expect(policy("write", { path: "config/.env" }, repoRoot)?.outcome).toBe("escalate");
+      expect(policy("write", { path: ".aws/credentials" }, repoRoot)?.outcome).toBe("escalate");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("returns a blocked P7 report when TEST passes and a synthetic SMOKE failure cannot be repaired", async () => {
+    const server = await startHarnessApiServer({
+      port: 0,
+      host: "127.0.0.1",
+      runExecutor: async () => fakeExecutorReport(),
+      runCycle: (input) =>
+        runDevCycle({
+          ...input,
+          stages: {
+            test: async () => ({ verdict: "GREEN", evidence: "deterministic TEST" }),
+            smoke: async () => ({ verdict: "RED", evidence: "synthetic capability-smoke RED" }),
+            debug: async () => ({ verdict: "RED", evidence: "synthetic repair unavailable" })
+          }
+        })
+    });
+
+    try {
+      const response = await postJson(new URL(server.url), "/run", { cwd: repoRoot, taskId: "smoke-red" });
+
+      expect(response).toMatchObject({
+        status: 200,
+        body: {
+          verdict: "RED",
+          terminal: "blocked",
+          stages: [
+            { stage: "select", verdict: "GREEN" },
+            { stage: "build", verdict: "GREEN" },
+            { stage: "test", verdict: "GREEN" },
+            { stage: "smoke", verdict: "RED", evidence: "synthetic capability-smoke RED" },
+            { stage: "debug", verdict: "RED" }
+          ],
+          executor: { planner: { status: "completed" } },
+          learned: { taskId: "smoke-red", outcome: "blocked" },
+          summary: expect.stringContaining("dev cycle blocked")
+        }
+      });
+      expect((response.body as { stages: Array<{ stage: string }> }).stages.some((stage) => stage.stage === "review")).toBe(false);
+      expect((response.body as { stages: Array<{ stage: string }> }).stages.some((stage) => stage.stage === "ship")).toBe(false);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("keeps injected /run handlers unchanged and bypasses the default cycle", async () => {
+    let receivedRunRequest: unknown;
+    let executorCalls = 0;
+    let cycleCalls = 0;
+    const server = await startHarnessApiServer({
+      port: 0,
+      host: "127.0.0.1",
+      runExecutor: async () => {
+        executorCalls += 1;
+        return fakeExecutorReport();
+      },
+      runCycle: async () => {
+        cycleCalls += 1;
+        throw new Error("unexpected default cycle");
+      },
+      handlers: {
+        run: async (request) => {
+          receivedRunRequest = request;
+          return { route: "custom-run", request };
+        }
+      }
+    });
+
+    try {
+      const response = await postJson(new URL(server.url), "/run", {
+        cwd: repoRoot,
+        objective: "preserve custom handler",
+        mandate: { grants: [], denies: [] },
+        grants: [{ scope: "machine", verbs: ["write"], grantedAt: "request-owned" }],
+        yolo: true
+      });
+
+      expect(response).toMatchObject({ status: 200, body: { route: "custom-run" } });
+      expect(executorCalls).toBe(0);
+      expect(cycleCalls).toBe(0);
+      expect(receivedRunRequest).toMatchObject({ cwd: repoRoot, objective: "preserve custom handler" });
+      expect(receivedRunRequest).not.toHaveProperty("mandate");
+      expect(receivedRunRequest).not.toHaveProperty("grants");
+      expect(receivedRunRequest).not.toHaveProperty("yolo");
+    } finally {
+      await server.close();
+    }
   });
 });

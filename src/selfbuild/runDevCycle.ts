@@ -181,7 +181,11 @@ export async function runDevCycle(input: RunDevCycleInput = {}): Promise<DevCycl
       maxPlannerRetries: boundedRetries
     });
     executorReport = report;
-    return { repaired: report.planner.status === "completed", evidence: `re-plan ${report.planner.status}` };
+    return {
+      repaired: report.planner.status === "completed",
+      evidence: `re-plan ${report.planner.status}`,
+      tokens: report.plannerUsage.totalTokens
+    };
   };
 
   const defaults: Record<DevStage, StageRunner> = {
@@ -211,7 +215,11 @@ export async function runDevCycle(input: RunDevCycleInput = {}): Promise<DevCycl
       };
       executorReport = await runExecutor(options);
       const built = executorReport.planner.status === "completed";
-      return { verdict: built ? "GREEN" : "RED", evidence: `planner ${executorReport.planner.status}` };
+      return {
+        verdict: built ? "GREEN" : "RED",
+        evidence: `planner ${executorReport.planner.status}`,
+        tokens: executorReport.plannerUsage.totalTokens
+      };
     },
     test: async () => {
       const report = await runDiscoveredValidation(cwd, {

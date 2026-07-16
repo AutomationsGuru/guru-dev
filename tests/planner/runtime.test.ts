@@ -54,8 +54,56 @@ describe("runPlannerExecution", () => {
       status: "completed",
       blockers: []
     });
+    expect(report.usage).toBeUndefined();
     expect(report.observations.map((entry) => entry.step.id)).toEqual(["repo-context", "list-skills"]);
     expect(report.observations.every((entry) => entry.observation.status === "succeeded")).toBe(true);
+  });
+
+  it("should attach validated token usage from a planner result envelope", async () => {
+    const model = new RecordingPlannerModel({
+      plan: { objective: "No-op plan.", summary: "No tools needed.", steps: [] },
+      usage: { inputTokens: 13, outputTokens: 5, totalTokens: 18 }
+    });
+    const runtime = createHarnessRuntime({ plannerModel: model });
+    const session = await runtime.startSession({ cwd: repoRoot });
+
+    const report = await runtime.runPlanner(session.id, { objective: "No-op plan." });
+
+    expect(report.status).toBe("completed");
+    expect(report.usage).toEqual({ inputTokens: 13, outputTokens: 5, totalTokens: 18 });
+  });
+
+  it("should retain validated usage when an enveloped plan is invalid", async () => {
+    const model = new RecordingPlannerModel({
+      plan: { objective: "missing summary" },
+      usage: { inputTokens: 3, outputTokens: 2, totalTokens: 5 }
+    });
+    const runtime = createHarnessRuntime({ plannerModel: model });
+    const session = await runtime.startSession({ cwd: repoRoot });
+
+    const report = await runtime.runPlanner(session.id, { objective: "Run bad plan." });
+
+    expect(report.status).toBe("blocked");
+    expect(report.failureReason).toBe("invalid-plan");
+    expect(report.usage).toEqual({ inputTokens: 3, outputTokens: 2, totalTokens: 5 });
+  });
+
+  it("should retain validated usage from a planner error", async () => {
+    const model: PlannerModel = {
+      createPlan() {
+        throw Object.assign(new Error("transient planner failure"), {
+          usage: { inputTokens: 4, outputTokens: 1, totalTokens: 5 }
+        });
+      }
+    };
+    const runtime = createHarnessRuntime({ plannerModel: model });
+    const session = await runtime.startSession({ cwd: repoRoot });
+
+    const report = await runtime.runPlanner(session.id, { objective: "Retry later." });
+
+    expect(report.status).toBe("blocked");
+    expect(report.failureReason).toBe("model-threw");
+    expect(report.usage).toEqual({ inputTokens: 4, outputTokens: 1, totalTokens: 5 });
   });
 
   it("should block when the model returns an invalid plan", async () => {

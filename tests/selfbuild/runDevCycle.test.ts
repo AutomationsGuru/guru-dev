@@ -24,6 +24,7 @@ function fakeReport(over: Partial<SelfBuildExecutorReport> = {}): SelfBuildExecu
     verdict: "YELLOW",
     session: {} as SelfBuildExecutorReport["session"],
     planner: { status: "completed" } as SelfBuildExecutorReport["planner"],
+    plannerUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
     plannerFallback: null,
     observability: {} as SelfBuildExecutorReport["observability"],
     reviewGates: null,
@@ -106,6 +107,65 @@ describe("runDevCycle (P7 spine) — gate + budget injection", () => {
     expect(executor).not.toHaveBeenCalled();
     expect(report.terminal).toBe("blocked");
     expect(report.stages[0]!.evidence).toMatch(/wall-clock/u);
+  });
+
+  it("draws default BUILD planner usage from the token budget", async () => {
+    const report = await runDevCycle({
+      executor: async () => fakeReport({ plannerUsage: { inputTokens: 9, outputTokens: 3, totalTokens: 12 } }),
+      stages: greenGating
+    });
+
+    expect(report.budget.tokens).toBe(12);
+  });
+
+  it("adds default DEBUG re-plan usage to prior BUILD usage", async () => {
+    const executor = vi
+      .fn<SelfBuildExecutorFn>()
+      .mockResolvedValueOnce(fakeReport({ plannerUsage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 } }))
+      .mockResolvedValueOnce(fakeReport({ plannerUsage: { inputTokens: 3, outputTokens: 1, totalTokens: 4 } }));
+    let smokeRuns = 0;
+
+    const report = await runDevCycle({
+      executor,
+      smoke: { runSmoke: async () => ({ verdict: smokeRuns++ === 0 ? "RED" : "GREEN" }) },
+      stages: {
+        test: async () => ({ verdict: "GREEN", evidence: "test-stub" }),
+        review: async () => ({ verdict: "GREEN", evidence: "review-stub" }),
+        ship: async () => ({ verdict: "GREEN", evidence: "ship-stub" }),
+        learn: async () => ({ verdict: "GREEN", evidence: "learn-stub" })
+      }
+    });
+
+    expect(executor).toHaveBeenCalledTimes(2);
+    expect(report.budget.tokens).toBe(11);
+  });
+
+  it("records an executor retry/fallback total exactly once", async () => {
+    const cumulativeUsage = { inputTokens: 10, outputTokens: 6, totalTokens: 16 };
+    const report = await runDevCycle({
+      executor: async () =>
+        fakeReport({
+          plannerUsage: cumulativeUsage,
+          plannerFallback: { cumulativeUsage } as SelfBuildExecutorReport["plannerFallback"]
+        }),
+      stages: greenGating
+    });
+
+    expect(report.budget.tokens).toBe(16);
+  });
+
+  it("blocks before the next stage after BUILD reaches the token ceiling", async () => {
+    const testStage = vi.fn<StageRunner>(async () => ({ verdict: "GREEN", evidence: "should not run" }));
+    const report = await runDevCycle({
+      executor: async () => fakeReport({ plannerUsage: { inputTokens: 7, outputTokens: 3, totalTokens: 10 } }),
+      budget: { tokenBudget: 10 },
+      stages: { ...greenGating, test: testStage }
+    });
+
+    expect(testStage).not.toHaveBeenCalled();
+    expect(report.terminal).toBe("blocked");
+    expect(report.budget.tokens).toBe(10);
+    expect(report.stages.at(-1)).toMatchObject({ stage: "test", verdict: "RED", evidence: expect.stringContaining("token budget exhausted") });
   });
 });
 

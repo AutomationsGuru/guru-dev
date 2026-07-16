@@ -9,6 +9,7 @@ import { getGuruHomePaths } from "../home/paths.js";
 import { createDirectionAlignmentReport } from "../direction/hereThere.js";
 import { applySelfBuildProgress, createSelfBuildState, planNextSelfBuildTask, type SelfBuildTask } from "../kernel/selfBuildLoop.js";
 import { attachConfiguredMcpServers, type McpAttachment } from "../mcp/attach.js";
+import { createMcpMetaDispatchTools } from "../mcp/metaDispatch.js";
 import type { McpServerConfig, McpServerStatus } from "../mcp/schemas.js";
 import { createInMemoryOperationalStore, type OperationalStore } from "../operational/store.js";
 import { createBlockedPlannerRunReport, runPlannerExecution, type PlannerModel } from "../planner/runtime.js";
@@ -39,6 +40,7 @@ import {
 } from "../tools/builtins/operationalStoreTools.js";
 import { createRepoContextTool } from "../tools/builtins/repoContextTool.js";
 import { createBaseTools } from "../tools/builtins/baseToolFactory.js";
+import { resetBackgroundTasks, scheduleBackgroundNotification } from "../tools/builtins/backgroundTaskRegistry.js";
 import { createReviewGatesTool } from "../tools/builtins/reviewGatesTool.js";
 import { createListSkillsTool, createLoadSkillTool } from "../tools/builtins/skillLoaderTools.js";
 import { createShellExecTool } from "../tools/builtins/shellExecTool.js";
@@ -54,6 +56,8 @@ import {
   type StartHarnessSessionOptions
 } from "./schemas.js";
 
+export type { StartHarnessSessionOptions } from "./schemas.js";
+
 export interface HarnessRuntimeDependencies {
   readonly operationalStore?: OperationalStore;
   readonly sessionPersistenceStore?: SessionPersistenceStore;
@@ -61,6 +65,7 @@ export interface HarnessRuntimeDependencies {
   readonly plannerModel?: PlannerModel;
   readonly interactiveCallbacks?: {
     readonly askQuestion?: (questions: any) => Promise<string[][]>;
+    readonly schedule?: (message: string) => Promise<void>;
   };
   /**
    * Mandate enforcement policy (ADR 2026-07-05-composer-completion). When set,
@@ -225,6 +230,12 @@ export function createHarnessRuntime(dependencies: HarnessRuntimeDependencies = 
         ...(signal ? { signal } : {})
       });
       await safeRecordToolObservation(sessionPersistenceStore, sessionId, observation); // best-effort (review 2026-07-08)
+      try {
+        initExtensions().host.sendMessage("tool:result", { toolId, output: observation });
+      } catch {
+        // Post-observation extensions are best-effort and cannot change or
+        // repeat a tool result that already crossed the central sanitizer.
+      }
 
       return observation;
     },
@@ -277,6 +288,7 @@ export function createHarnessRuntime(dependencies: HarnessRuntimeDependencies = 
       }
 
       closed = true;
+      resetBackgroundTasks();
       const liveSessions = [...sessions.values()];
       sessions.clear();
       await Promise.allSettled(liveSessions.map((session) => session.mcpAttachment.closeAll()));
@@ -305,6 +317,7 @@ export async function startHarnessSession(options: StartHarnessSessionOptions = 
 }
 
 export function createDefaultHarnessToolRegistry(options: CreateDefaultHarnessToolRegistryOptions): ToolRegistry {
+  const scheduleDelivery = options.interactiveCallbacks?.schedule;
   return createToolRegistry([
     createRepoContextTool(),
     ...createBaseTools({
@@ -328,6 +341,30 @@ export function createDefaultHarnessToolRegistry(options: CreateDefaultHarnessTo
       // TUI/RPC can inject ask_question; otherwise the tool falls back to its own TTY prompt.
       ...(options.interactiveCallbacks?.askQuestion
         ? { askQuestion: { onAsk: options.interactiveCallbacks.askQuestion } }
+        : {}),
+      ...(scheduleDelivery
+        ? {
+            schedule: {
+              onSchedule: async (input) => {
+                if (input.CronExpression !== undefined) {
+                  throw new Error("Recurring cron schedules are not supported by the in-process scheduler.");
+                }
+                if (input.MaxIterations !== undefined) {
+                  throw new Error("MaxIterations is not supported by the one-shot in-process scheduler.");
+                }
+                if (input.TimerCondition !== undefined && input.TimerCondition !== "never") {
+                  throw new Error("Conditional timers are not supported; TimerCondition may only be 'never'.");
+                }
+
+                const delaySeconds = Number(input.DurationSeconds);
+                return scheduleBackgroundNotification(
+                  delaySeconds,
+                  input.Prompt,
+                  scheduleDelivery
+                );
+              }
+            }
+          }
         : {}),
       ...(options.commandExecutor ? { readDiagnostics: { executor: options.commandExecutor } } : {})
     }),
@@ -540,6 +577,9 @@ async function createSessionTooling(options: CreateSessionToolingOptions): Promi
 
   try {
     for (const tool of mcpAttachment.tools) {
+      registry.register(tool);
+    }
+    for (const tool of createMcpMetaDispatchTools(registry)) {
       registry.register(tool);
     }
     return { registry, mcpAttachment };

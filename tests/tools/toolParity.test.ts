@@ -62,6 +62,16 @@ describe("tool parity map", () => {
     });
   });
 
+  it("should report schedule as partial because only in-process one-shot delivery is supported", () => {
+    expect(findToolParityRow("schedule")).toMatchObject({
+      status: "partial-equivalent",
+      verdict: "YELLOW",
+      currentGuruHarnessToolIds: ["schedule"]
+    });
+    expect(findToolParityRow("schedule")?.notes).toMatch(/one-shot/iu);
+    expect(findToolParityRow("schedule")?.nextAction).toMatch(/durable|cron|recurring/iu);
+  });
+
   it("should mark desktop pyautogui tools GREEN", () => {
     for (const id of ["pyautogui_status", "pyautogui_screen", "pyautogui_mouse", "pyautogui_keyboard"]) {
       expect(findToolParityRow(id)).toMatchObject({ status: "native-equivalent", verdict: "GREEN" });
@@ -92,8 +102,7 @@ describe("tool parity map", () => {
   });
 
   it("should summarize RED/YELLOW/GREEN counts", () => {
-    // No RED rows remain; perplexity + repo stay YELLOW partials.
-    // 22 remote rows + schedule + manage_task from the 2026-07-10 wave.
-    expect(getToolParityVerdictCounts()).toEqual({ GREEN: 24, YELLOW: 2, RED: 0 });
+    // No RED rows remain; perplexity + repo + schedule stay YELLOW partials.
+    expect(getToolParityVerdictCounts()).toEqual({ GREEN: 23, YELLOW: 3, RED: 0 });
   });
 });

@@ -41,6 +41,9 @@ const TOOL_VERBS: Readonly<Record<string, readonly MandateVerb[]>> = {
   todo_list: [],
   // Operator Q&A — no mutation.
   ask_question: [],
+  // MCP meta-dispatch: discovery is read-only; dispatch is conservatively write-gated.
+  search_tool: [],
+  use_tool: ["write"],
   // MCP attach board — read-only snapshot.
   mcp_bridge_status: [],
   // Networked research (bounded).
@@ -77,6 +80,7 @@ export const MANDATE_READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   "honcho_context",
   "todo_list",
   "ask_question",
+  "search_tool",
   "mcp_bridge_status",
   "provider_cli_status",
   "pyautogui_status",

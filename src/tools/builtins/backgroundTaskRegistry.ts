@@ -2,8 +2,10 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 
 interface BackgroundTaskRecord {
   readonly id: string;
+  readonly kind: "process" | "scheduled";
   readonly command: readonly string[];
   readonly cwd: string;
+  readonly prompt?: string;
   state: "running" | "completed" | "failed" | "killed";
   exitCode: number | null;
   stdout: string;
@@ -11,6 +13,7 @@ interface BackgroundTaskRecord {
   readonly startedAt: string;
   endedAt?: string;
   process?: ChildProcessWithoutNullStreams | undefined;
+  timer?: ReturnType<typeof setTimeout> | undefined;
 }
 
 const tasks = new Map<string, BackgroundTaskRecord>();
@@ -26,8 +29,10 @@ function appendTail(current: string, chunk: string): string {
 function publicView(task: BackgroundTaskRecord) {
   return {
     id: task.id,
+    kind: task.kind,
     command: [...task.command],
     cwd: task.cwd,
+    ...(task.prompt !== undefined ? { prompt: task.prompt } : {}),
     state: task.state,
     exitCode: task.exitCode,
     stdout: task.stdout,
@@ -39,6 +44,10 @@ function publicView(task: BackgroundTaskRecord) {
 
 export function resetBackgroundTasks(): void {
   for (const task of tasks.values()) {
+    if (task.timer !== undefined) {
+      clearTimeout(task.timer);
+      delete task.timer;
+    }
     if (task.state === "running" && task.process && !task.process.killed) {
       task.process.kill("SIGTERM");
       task.state = "killed";
@@ -58,6 +67,7 @@ export function spawnBackgroundTask(command: readonly string[], cwd: string): st
   });
   const record: BackgroundTaskRecord = {
     id,
+    kind: "process",
     command,
     cwd,
     state: "running",
@@ -83,6 +93,65 @@ export function spawnBackgroundTask(command: readonly string[], cwd: string): st
   return id;
 }
 
+export function scheduleBackgroundNotification(
+  delaySeconds: number,
+  prompt: string,
+  deliver: (message: string) => Promise<void>
+): string {
+  if (!Number.isFinite(delaySeconds) || delaySeconds <= 0) {
+    throw new Error("DurationSeconds must be a positive finite number.");
+  }
+
+  const delayMs = delaySeconds * 1_000;
+  if (delayMs > 2_147_483_647) {
+    throw new Error("DurationSeconds exceeds the maximum in-process timer delay.");
+  }
+
+  const id = `task-${(counter += 1)}`;
+  const record: BackgroundTaskRecord = {
+    id,
+    kind: "scheduled",
+    command: ["schedule", prompt],
+    cwd: process.cwd(),
+    prompt,
+    state: "running",
+    exitCode: null,
+    stdout: "",
+    stderr: "",
+    startedAt: new Date().toISOString()
+  };
+
+  const timer = setTimeout(() => {
+    delete record.timer;
+    void deliver(`[scheduled] ${prompt}`).then(
+      () => {
+        if (record.state !== "running") {
+          return;
+        }
+        record.state = "completed";
+        record.exitCode = 0;
+        record.endedAt = new Date().toISOString();
+      },
+      (error: unknown) => {
+        if (record.state !== "running") {
+          return;
+        }
+        record.state = "failed";
+        record.exitCode = 1;
+        record.stderr = appendTail(
+          record.stderr,
+          `Scheduled delivery failed: ${error instanceof Error ? error.message : String(error)}`
+        );
+        record.endedAt = new Date().toISOString();
+      }
+    );
+  }, delayMs);
+  timer.unref();
+  record.timer = timer;
+  tasks.set(id, record);
+  return id;
+}
+
 export async function manageBackgroundTask(action: string, taskId?: string, input?: string): Promise<unknown> {
   switch (action) {
     case "list":
@@ -99,8 +168,14 @@ export async function manageBackgroundTask(action: string, taskId?: string, inpu
       if (!task) {
         throw new Error(`Unknown task id: ${taskId}`);
       }
-      if (task.state === "running" && task.process && !task.process.killed) {
-        task.process.kill("SIGTERM");
+      if (task.state === "running") {
+        if (task.timer !== undefined) {
+          clearTimeout(task.timer);
+          delete task.timer;
+        }
+        if (task.process && !task.process.killed) {
+          task.process.kill("SIGTERM");
+        }
         task.state = "killed";
         task.endedAt = new Date().toISOString();
       }
