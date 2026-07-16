@@ -4,6 +4,13 @@ All notable changes to GuruHarness are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **RPC `operator.answer` (G708):** `AgentSession` answer-handler + pending-question map; `dispatchRpc` method and ready-list advertisement; shutdown calls `closeQuestions` to avoid deadlocks.
+- **ask_question session context:** runtime threads allocated `sessionId` into interactive `askQuestion` callbacks.
+- **Tool parity:** `service_health` **YELLOW** row (`service_readiness_report` partial — G636).
+
+
 ### Release discipline
 
 - Treat the current harness as pre-GA dogfood. Historical `1.x` labels are not
@@ -53,11 +60,6 @@ grapheme-aware TUI, and the YOLO hard-edge fixes kept from the wave).
 - **CodeQL clean**: fixed the three alerts the wave introduced (polynomial ReDoS in the composer @-reference parser; shell-string hook execution -> execFile argv arrays, `.bat` hooks dropped in favor of `.ps1`; tainted cmd.exe token in gate spawn -> allowlist-constant shim names).
 
 ### Added
-
-- **RPC `operator.answer` (G708):** `AgentSession` answer-handler + pending-question map; `dispatchRpc` method and ready-list advertisement; shutdown calls `closeQuestions` to avoid deadlocks.
-- **ask_question session context:** runtime threads allocated `sessionId` into interactive `askQuestion` callbacks.
-- **Tool parity:** `service_health` **YELLOW** row (`service_readiness_report` partial — G636).
-
 
 - **`manage_task` backend:** in-memory background task registry (list/status/kill/send_input); resets on `/new`.
 - **`read_diagnostics` tool:** path-filtered TypeScript diagnostics from repo typecheck (Cursor ReadLints parity).
