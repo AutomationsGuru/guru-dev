@@ -117,7 +117,7 @@ function requiredEnvNamesForRoute(route: ProviderRouteDescriptor): readonly stri
 function setupHintsFor(route: ProviderRouteDescriptor, missingEnvVarNames: readonly string[], status: ProviderAvailabilityStatus): readonly string[] {
   if (status === "missing-key") return [`Set required env var name(s): ${missingEnvVarNames.join(", ")}.`];
   if (status === "needs-login") return [`Complete login or credential presence for ${route.providerId}; values must stay outside logs.`];
-  if (status === "router-offline") return ["Start or repair LiteLLM router before selecting router bridge aliases."];
+  if (status === "router-offline") return ["Router bridge offline — pick a direct-api route or start LiteLLM for litellm-router/* aliases (direct-first policy)."];
   if (status === "excluded-by-policy") return [route.exclusionReason ?? "Route is excluded by policy."];
   return [];
 }

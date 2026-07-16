@@ -37,6 +37,7 @@ export * from "./session/agentSession.js";
 export * from "./surfaces/api.js";
 export * from "./surfaces/rpc.js";
 export * from "./surfaces/tui.js";
+export * from "./surfaces/operatorQuestionBroker.js";
 export * from "./safety/policyGuard.js";
 export * from "./skills/loader.js";
 export * from "./skills/schemas.js";

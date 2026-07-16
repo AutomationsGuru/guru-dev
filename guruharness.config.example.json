@@ -93,5 +93,24 @@
     "forkWidth": 3,
     "leadDepth": 2,
     "scoutBudgetFraction": 0.25
+  },
+  "memory": {
+    "storage": {
+      "provider": "markdown",
+      "postgres": {
+        "connectionStringEnvVar": "GURU_MEMORY_DATABASE_URL",
+        "schema": "guru_memory",
+        "table": "facts",
+        "ssl": "prefer"
+      }
+    },
+    "honcho": {
+      "enabled": false,
+      "apiKeyEnvVar": "HONCHO_API_KEY",
+      "workspaceId": "guruharness",
+      "sessionId": "guru-memory",
+      "syncOnTurn": true,
+      "contextTokenBudget": 1200
+    }
   }
 }

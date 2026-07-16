@@ -123,6 +123,8 @@ export interface AgentSessionDeps {
   /** Injectable turn runner — defaults to directAgentTurn; tests pass a stub. */
   readonly runTurn?: TurnRunner;
   readonly now?: () => Date;
+  /** Operator question handler — called by operator.answer RPC to resolve agent questions. */
+  readonly answerHandler?: (questionId: string) => Promise<string> | string;
 }
 
 interface QueuedSteer {
@@ -171,6 +173,8 @@ export class AgentSession {
   private usage = { turns: 0, inputTokens: 0, outputTokens: 0, lastInputTokens: 0 };
   /** The in-flight turn's abort controller (§17 S13); null when no turn is running. */
   private currentAbort: AbortController | null = null;
+  /** Pending operator questions — resolved by operator.answer or rejected on close. */
+  private pendingQuestions = new Map<string, { resolve: (answer: string) => void; reject: (error: Error) => void }>();
   private compactionRunning = false;
   private lastCompaction: CompactionState | null = null;
 
@@ -661,6 +665,48 @@ export class AgentSession {
     const receipt = parkManifest(this.deps.memory, { ...base, layers, wornCount: this.activeSuit.wornCount, lastWornAt: stamp });
     this.activeSuit = null;
     return { stored: receipt.stored };
+  }
+
+  // -- operator questions (§G708) -------------------------------------------
+  /** Whether an answer handler is wired (operator.answer can be called). */
+  hasAnswerHandler(): boolean {
+    return !!this.deps.answerHandler;
+  }
+
+  /** Dispatch an answer to a pending agent question via the wired handler. */
+  async dispatchAnswer(questionId: string): Promise<string> {
+    if (!this.deps.answerHandler) throw new Error("No answer handler wired");
+    try {
+      const answer = await Promise.resolve(this.deps.answerHandler(questionId));
+      const pending = this.pendingQuestions.get(questionId);
+      if (pending) {
+        pending.resolve(answer);
+        this.pendingQuestions.delete(questionId);
+      }
+      return answer;
+    } catch (error) {
+      const pending = this.pendingQuestions.get(questionId);
+      if (pending) {
+        pending.reject(error instanceof Error ? error : new Error(String(error)));
+        this.pendingQuestions.delete(questionId);
+      }
+      throw error;
+    }
+  }
+
+  /** Register a pending operator question — the agent waits on the returned promise. */
+  waitForAnswer(questionId: string): Promise<string> {
+    return new Promise<string>((resolve, reject) => {
+      this.pendingQuestions.set(questionId, { resolve, reject });
+    });
+  }
+
+  /** Reject all pending questions so nothing deadlocks on close. */
+  closeQuestions(reason = "Session closed"): void {
+    for (const [id, pending] of this.pendingQuestions) {
+      pending.reject(new Error(reason));
+    }
+    this.pendingQuestions.clear();
   }
 
   // -- introspection -------------------------------------------------------

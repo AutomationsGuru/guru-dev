@@ -68,7 +68,7 @@ function deriveSetupHint(status: TuiProviderEntry["status"], requiredEnvNames: r
     case "needs-login":
       return "run provider login";
     case "router-offline":
-      return "start LiteLLM router (ctrl+k)";
+      return "direct-api route or start LiteLLM for bridge (ctrl+k)";
     default:
       return undefined;
   }

@@ -4,7 +4,7 @@
 
 ## Builder routing (v1.5.x — doc-control pass-359)
 
-Use **`SELF-BUILD-DEVELOPER-LOOP.md`** (§Phases / P7), **`SELF-BUILD-LOOP-HARDENING.md`**, and **`../../gaps/README.md`** — not the historical sections below. Residual holes called out in DEVELOPER-LOOP “Current state” (e.g. G8 API/TUI mandate, G52 persistence).
+Use **`SELF-BUILD-DEVELOPER-LOOP.md`** (§Phases / P7), **`SELF-BUILD-LOOP-HARDENING.md`**, and **`../../gaps/README.md`** — not the historical sections below. Residual holes called out in DEVELOPER-LOOP “Current state” (e.g. **G8**/**G739** API **`POST /run`** → **`defaultRun`** without **`mandatePolicy`**; **G632**/**G661** TUI **`run`** in **`surfaces/tui.ts`**; **G583** CLI **`guru run`** mandate only on **`--git-live`**; G52 persistence). Gap-review pass **136** (**G755**/**G757**).
 
 ## Historical snapshot (pre-P7 — provenance only)
 
@@ -19,7 +19,7 @@ An **unattended** `runDevCycle` orchestrator that WRAPS (not replaces) `runSelfB
 > **Status (pass-359):** **Partial** on `guru self-build-run` / `runDevCycle`; **not** on bare `guru run` / API `/run` / TUI `run`. See DEVELOPER-LOOP §P7 and `gaps/README.md`. Historical “not met” bullets below are pre-P7.
 
 - **P7 `runDevCycle` orchestrator does not exist** _(obsolete — shipped; see DEVELOPER-LOOP)_ — no 0→7 state machine, no `guru self-build --run` surface, no whole-cycle `--dry-run` no-op preview, no per-stage 0→7 events, no cross-task resume.
-- **Mandate/spend hard-edge is not injected into the executor runtime** — both `createHarnessRuntime` calls omit `mandatePolicy`; no surface (CLI, TUI, or API `/run`) supplies one, so an autonomous run has no per-tool spend gate.
+- **Mandate/spend hard-edge is not injected into the executor runtime** _(pre-P7 snapshot — **`runDevCycle`** / **`guru self-build-run`** now inject fail-closed policy; still true for bare **TUI `run`**, **API `/run`**, and non-live-git **`guru run`** — **`gaps/README.md`** **G661**/**G584**/**G582**)_ — historical wording assumed zero surfaces; do not use for P7 routing.
 - **No `SpendBudget` / token / wall-clock budget** bounding the loop or nested guru-calls; bounding is integer attempt/step counts only.
 - **No host-allowlist net-spend classifier** and **paid-tool attach carries no `spend` verb** (`resolve_capability_gap` → `[]`).
 - **No persisted approval ledger** in the done packet (`DonePacketSchema` has no ledger field) → "survives restart" unsatisfiable; executor default store is in-memory.
@@ -31,6 +31,8 @@ An **unattended** `runDevCycle` orchestrator that WRAPS (not replaces) `runSelfB
 
 ## Gap table
 
+> **Do not route (G312):** Rows below are a **pre-P7 snapshot** — **Blocks loop?** and **Net verified gap** overstate open work at **1.5.x** (gap-review **G312**, **G167**). Builder routing: **`SELF-BUILD-DEVELOPER-LOOP.md`** §Phases + **`../../gaps/README.md`** only.
+
 | Phase | Required | Already present | Net verified gap | Blocks loop? | Effort |
 |---|---|---|---|---|---|
 | **P3 — DEBUG-on-red bounded repair** | Parse RED gate output → structured failure note → re-BUILD → re-run only the failed gate, capped by `maxRepairAttempts` AND a token budget; give-up → blocker + RED packet + advance. | RED detection point (`selfBuildExecutor.ts:297`), gate raw stdout/stderr/exitCode (`gates.ts`), give-up sink (`buildBlockedReport`/`recordBlocker`), retry-loop shape to mirror (`runPlannerWithRetries:451`, provider rotation only). | No gate parser (`parseGateOutput`/`parseVitest`/`parseTsc` = 0), no repair sub-loop (RED unconditionally returns), no `maxRepairAttempts` knob (schema `.strict()`), no token/$ budget, give-up "advance" unimplementable (single-task executor). | **Yes** | L |
@@ -39,6 +41,30 @@ An **unattended** `runDevCycle` orchestrator that WRAPS (not replaces) `runSelfB
 | **P6 — Safety envelope** | Mandate/spend hard-edge enforced on the executor path; host-allowlist net classifier; paid-attach = spend; `SpendBudget` (ceiling+total, $0 denies all); VETO/STEER/BATCH/KILL + escalation circuit-breaker; persisted approval ledger in every packet; global token+wall-clock+iteration budget over loop + nested guru-calls; YOLO regression holds. | Real un-liftable hard-edge in `evaluateToolMandate` (`evaluate.ts:178-185`, hard-edge before YOLO), bash SPEND_PATTERNS, static pre-run `collectRunSafetyBlockers`, attempt caps (`plannerMaxRetries`, `maxIterations`). | Executor builds runtimes with no `mandatePolicy` (`:125-129`, `:469-474`) → hard-edge never fires on `guru run`; no host classifier; `resolve_capability_gap` → `[]`; no `SpendBudget`; no levers/circuit-breaker; no ledger field in `DonePacketSchema`; no token/wall-clock budget; `SelfBuildConfigSchema` `.strict()` blocks new knobs. | No (safety-correctness, load-bearing) | L |
 | **P7 — runDevCycle orchestrator + driver** | Single `runDevCycle(state)` wrapping `runSelfBuildExecutor`, driving 0→7 as pure `{verdict,evidence,nextStage}` transitions; `guru self-build --run` + `--dry-run` (prints gates, executes nothing); per-stage events; cross-task resume; mandate policy injected; global budget + KILL. | Single-pass executor to wrap, resume-by-session-id (`:156-159`), SELECT primitives, standalone `runSelfBuildLoop` reference (uncalled), native-reviewer seam (injection-ready), SMOKE/discoverGates modules, `AgentSession.driveTurn` + `capabilitySmoke`. | `runDevCycle` = 0; no `--run`/whole-cycle `--dry-run`; no live reviewer constructed; TEST/SMOKE never called by executor; no DEBUG loop; no SELECT-score/LEARN arc; **mandate policy never injected into the executor runtime from any surface**; no global budget/KILL/circuit-breaker; no 0→7 events, no ledger, no work-classification pause. | **Yes** | L |
 | **Acceptance + Safety** | 8 stages run unattended with git/gh/coderabbit absent + spend verb hard-stops even in YOLO + persisted ledger survives restart. | Hard-edge engine + per-call approval real (REPL/API-tool-run only), static pre-run guard, dry-run-default ship, done-packet contract, attempt caps. | Hard-edge NOT on the executor path (worst-case: autonomous run can spend/destruct with only static scan); no budget/ledger/levers; runDevCycle absent → test unrunnable end-to-end; discoverGates/smokeStage/makeNativeReviewer built but test-only (TEST/SMOKE/live-review/local-ship legs missing). | **Yes** | L |
+
+> **Row P4 (gap-review pass 160, G896):** **`scoreTask`** / **`selectNextTask`** ship in **`src/selfbuild/selectTask.ts`**; default CLI **`--loop`** history is in-process only — no **`outcomeStore.ts`** / **`task-outcomes.json`** (**G889**/**G52**).
+>
+> **Row P5 (gap-review pass 160, G895 / G879):** Executor **`selfBuildExecutor.ts` L361–393** fail-closes live automation on synthetic **`git push`** when **`mandatePolicy`** is set; **`prAutomation.ts`** still runs **`git add`/`commit`/`push`/`gh pr create`** via **`executeCommand`** without per-step mandate (**G877**). **`makeGatedGitDelivery`** on dev-cycle SHIP (**HARDENING [10]**). Historical “bypasses **`executeTool`** only” prose is incomplete at 1.5.x.
+>
+> **Row P7 (gap-review pass 161, G903 / G883):** **`runDevCycle`** + **`guru self-build-run`** ship (`cli.ts` L248–338; **`runDevCycle.ts`** injects **`failClosedMandatePolicy`**); **`--dry-run`** previews via **`buildDevCyclePlan`**. Residual: CLI omits **`ledger`**/**`recordFact`** (**G901**); bare **`guru run`** / API **`POST /run`** still weak (**G661**/**G739**). Table “**`runDevCycle` = 0**” is obsolete.
+>
+> **Row P6 (gap-review pass 162, G907 / G661):** **`guru run`** injects **`mandatePolicy`** only for **`--git-live`** push pre-check (`cli.ts` L208–215); default **`guru run`** (no live git) omits policy on **`runSelfBuildExecutor`**. **`guru self-build-run`** always uses **`runDevCycle`** fail-closed policy on the full cycle. Table “hard-edge never fires on **`guru run`**” is **mostly true** except live-git path.
+>
+> **Row Acceptance (gap-review pass 163, G916):** **`runDevCycle`** + **`guru self-build-run`** make end-to-end P7 runnable; **`POST /run`** still bare **`runSelfBuildExecutor`** without policy (**`api.ts`** **`defaultRun`**). “**runDevCycle absent**” in this row is obsolete; ledger/outcome persistence gaps remain (**G908**/**G913**).
+>
+> **Dry-run preview (gap-review pass 164, G918):** **`guru self-build-run --dry-run`** calls **`buildDevCyclePlan({ cwd, taskId })`** without **`hasSmoke`**/**`hasReviewer`**/**`hasGitDelivery`** — plan shows SMOKE/REVIEW "not wired → YELLOW" while live **`runDevCycle`** wires **`makeSmokeDeps`** + optional **`askModel`** (**G121**/**G323**).
+>
+> **Row P3 (gap-review pass 165, G926):** **`parseGateFailure`** + DEBUG stage in **`runDevCycle.ts`** (TEST RED → note → **`defaultRepair`** re-BUILD); **`DevCycleBudget`** bounds re-entries. Residual: no separate **`maxRepairAttempts`** schema knob; table “no gate parser” is obsolete. Re-run-only-failed-gate is via **`nextStage`** routing, not isolated gate replay.
+>
+> **Row P5 (gap-review pass 166, G941):** **`runShipStage`** (**`shipStage.ts`**) probes **`commandExists('git')`**/**`gh`** and writes durable **`.guru/change-records`** when git delivery unwired — table body “Ship never probes git” is obsolete. Residual: **`runGitPrAutomation`** still **`executeCommand`** without per-step **`mandatePolicy`** (**G877**/**G895**); dev-cycle SHIP uses **`makeGatedGitDelivery`** when wired (**HARDENING [10]**).
+>
+> **Dry-run vs live (gap-review pass 167, G946):** Live **`self-build-run`** wires **`makeSmokeDeps`** + optional **`askModel`**; **`--dry-run`** omits **`hasSmoke`**/**`hasReviewer`** on **`buildDevCyclePlan`** — preview understates wired legs (**G929**). **`DevCycleReport.ledger`** ships when **`input.ledger`** set; CLI never loads/saves ledger (**G948**).
+>
+> **Hooks + spend (gap-review pass 168, G954/G956):** **`tool:result`** lifecycle type exists; runtime emits **`tool:execute`** only — no **`tool-result`** shell hook (**G846**). **`canSpend`**/**`recordSpend`** on **`DevCycleBudget`** unused in **`runDevCycle`** (**G928**).
+> **Compaction RPC (gap-review pass 169, G959):** Engine + config ship; **`wireRpcEvents`** omits compaction stream — extension **`session_compact`** seams documented as future in **`compaction/engine.ts`** (**G532**).
+> **LEARN CLI (gap-review pass 170, G975):** **`runDevCycle`** **`recordFact`** optional; **`guru self-build-run`** does not wire LEARN persistence (**G964**/**G52**).
+> **SELECT scoring (gap-review pass 171, G982):** **`scoreTask`** uses priority/blockers only — no persisted outcome store; **`runDevCycleLoop`** does not fold **`learned`** into **`TaskOutcomeHistory`** (**G973**/**G889**).
+> **Dry-run honesty (gap-review pass 172, G985):** **`--dry-run`** omits **`hasSmoke`**/**`hasReviewer`** mirrors — preview may show SMOKE/REVIEW unwired while **`self-build-run`** wires **`makeSmokeDeps`** + **`askModel`** (**G970**/**D13**).
 
 ## Critical path
 

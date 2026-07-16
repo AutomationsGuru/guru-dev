@@ -401,6 +401,7 @@ describe("runRpcMode — request ordering", () => {
       "suit_up",
       "park",
       "models",
+      "operator.answer",
       "compaction",
       "get_tree",
       "fork",
@@ -729,5 +730,107 @@ describe("RPC events — engine stream + secret_sanitized (scenario 9)", () => {
     // The value is redacted from the output AND never present in the event.
     expect(JSON.stringify(cleaned)).not.toContain("sk-abcdefghijklmnop1234");
     expect(JSON.stringify(event)).not.toContain("sk-abcdefghijklmnop1234");
+  });
+});
+
+describe("operator.answer (§G708)", () => {
+  const ctx = (session: AgentSession, emit: RpcContext["emit"] = () => {}): RpcContext => ({ session, emit });
+
+  it("RED: operator.answer without wired handler returns error", async () => {
+    const s = makeSession();
+    const res = await dispatchRpc(RpcRequestSchema.parse({ id: 1, method: "operator.answer", params: { questionId: "q1" } }), ctx(s));
+    expect(res).toMatchObject({ id: 1, ok: false, error: "No answer handler wired" });
+  });
+
+  it("RED: operator.answer with empty questionId returns error", async () => {
+    const s = makeSession(undefined, undefined, { answerHandler: async () => "ok" });
+    const res = await dispatchRpc(RpcRequestSchema.parse({ method: "operator.answer", params: { questionId: "" } }), ctx(s));
+    expect(res).toMatchObject({ ok: false, error: "questionId required" });
+  });
+
+  it("GREEN: operator.answer with handler resolves and echoes questionId", async () => {
+    const s = makeSession(undefined, undefined, { answerHandler: async (qid) => `answer for ${qid}` });
+    const res = await dispatchRpc(RpcRequestSchema.parse({ id: 1, method: "operator.answer", params: { questionId: "q1" } }), ctx(s));
+    expect(res).toMatchObject({ id: 1, ok: true, result: { questionId: "q1", answer: "answer for q1" } });
+  });
+
+  it("GREEN: operator.answer surfaces handler error", async () => {
+    const s = makeSession(undefined, undefined, { answerHandler: async () => { throw new Error("handler exploded"); } });
+    const res = await dispatchRpc(RpcRequestSchema.parse({ id: 1, method: "operator.answer", params: { questionId: "q1" } }), ctx(s));
+    expect(res).toMatchObject({ id: 1, ok: false, error: "handler exploded" });
+  });
+
+  it("GREEN: ready methods include operator.answer", async () => {
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const emitted: Record<string, unknown>[] = [];
+    output.on("data", (chunk: Buffer) => {
+      for (const line of chunk.toString().split("\n").filter(Boolean)) {
+        emitted.push(JSON.parse(line));
+      }
+    });
+    const s = makeSession();
+    const mode = runRpcMode({ session: s, input, output, createRuntime: () => ({ executeTool: async () => ({ toolId: "read", status: "succeeded", startedAt: "t", endedAt: "t", durationMs: 0 }), close: async () => {} }) as never });
+    // Small tick for the ready event to flush
+    await new Promise((r) => setTimeout(r, 20));
+    input.end();
+    await mode;
+    const ready = emitted.find((m) => m.event === "ready");
+    expect(ready).toBeDefined();
+    expect(ready?.methods).toContain("operator.answer");
+  });
+
+  it("GREEN: operator.answer dispatches immediately, not queued behind slow prompt", async () => {
+    // A runner that blocks until explicitly released
+    let releasePrompt!: () => void;
+    const blockRunner: TurnRunner = (async () => {
+      await new Promise<void>((r) => { releasePrompt = r; });
+      const result: AgentTurnResult = { text: "done", modelId: "m", routeId: "stub/model", apiFamily: "openai-chat-completions", toolCallCount: 0, toolEvents: [] };
+      return result;
+    }) as TurnRunner;
+
+    let answerCalled = false;
+    const s = makeSession(blockRunner, undefined, { answerHandler: async (qid) => {
+      answerCalled = true;
+      return `answer for ${qid}`;
+    }});
+
+    // Start a prompt — it will block on the release
+    const promptPromise = dispatchRpc(RpcRequestSchema.parse({ id: 1, method: "prompt", params: { text: "go" } }), ctx(s));
+
+    // Give the prompt a tick to enter its blocked state
+    await new Promise((r) => setTimeout(r, 20));
+
+    // operator.answer must NOT be queued behind the blocked prompt
+    const answerRes = await dispatchRpc(RpcRequestSchema.parse({ id: 2, method: "operator.answer", params: { questionId: "q1" } }), ctx(s));
+
+    expect(answerCalled).toBe(true);
+    expect(answerRes).toMatchObject({ id: 2, ok: true, result: { questionId: "q1", answer: "answer for q1" } });
+
+    // Release the prompt and let it finish
+    releasePrompt();
+    await promptPromise;
+  });
+
+  it("FAILURE: operator.answer for unknown questionId returns error", async () => {
+    const s = makeSession(undefined, undefined, { answerHandler: (qid) => {
+      if (qid === "known") return "ok";
+      throw new Error(`Unknown questionId: ${qid}`);
+    }});
+    const res = await dispatchRpc(RpcRequestSchema.parse({ method: "operator.answer", params: { questionId: "unknown" } }), ctx(s));
+    expect(res).toMatchObject({ ok: false, error: "Unknown questionId: unknown" });
+  });
+
+  it("FAILURE: close with pending questions exits cleanly (no deadlock)", async () => {
+    const s = makeSession();
+    const p1 = s.waitForAnswer("q1");
+    const p2 = s.waitForAnswer("q2");
+
+    s.closeQuestions("Session ended");
+
+    await expect(p1).rejects.toThrow("Session ended");
+    await expect(p2).rejects.toThrow("Session ended");
+    // Map must be empty after closeQuestions
+    // (no direct accessor; verified by the rejects above)
   });
 });

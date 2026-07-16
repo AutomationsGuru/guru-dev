@@ -1,3 +1,9 @@
+/**
+ * Chat memory slash commands + boot injection. Honcho turn logging: when
+ * `memory.honcho.syncOnTurn` is enabled, `recordTurn` calls `honcho_log_turn`
+ * via the runtime tool registry (background, non-blocking) — not via
+ * `GURU_CHAT_TOOL_IDS` model surface. See `main/README.md` Memory + gaps **G663**.
+ */
 import type { MemoryConfig, MemoryStorageConfig } from "../config/schema.js";
 import type { Learning } from "../garage/flywheel.js";
 import { loadLearnings } from "../garage/flywheelStore.js";
