@@ -4,6 +4,13 @@ All notable changes to GuruHarness are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **RPC `operator.answer` (G708):** `AgentSession` answer-handler + pending-question map; `dispatchRpc` method and ready-list advertisement; shutdown calls `closeQuestions` to avoid deadlocks.
+- **ask_question session context:** runtime threads allocated `sessionId` into interactive `askQuestion` callbacks.
+- **Tool parity:** `service_health` **YELLOW** row (`service_readiness_report` partial — G636).
+
+
 ### Release discipline
 
 - Treat the current harness as pre-GA dogfood. Historical `1.x` labels are not
@@ -21,7 +28,8 @@ All notable changes to GuruHarness are documented here.
 ### Changed
 
 - **Merged PR #37 (2026-07-15):** access-UX (U1–U4), memory/home/Honcho UX, path `/tools`, mandate-deny honesty — integrated on `guru-dev/main` @ `6c826c6` (product ancestry `49a1a871`; record `../handoffs/code-reviews/2026-07-15T0444Z-pr37-merged-integrated.md`). Not a npm release; stay on **1.5.x**. Residuals B5–B7 non-blocking.
-- **Workspace documentation:** ongoing **doc-control** + **gap-review** + **harness-matrix** schedulers (`handoffs/doc-control/STATE.md`, `../gaps/README.md` indexed pass **69**, `../handoffs/harness-matrix/README.md` pass **03**; code-review idle `0830Z`) — README/AGENTS/planning cross-links only; no runtime behavior change.
+- **Workspace documentation:** ongoing **doc-control** + **gap-review** + **harness-matrix** + **guru-vs-matrix** schedulers (`handoffs/doc-control/STATE.md`, `../gaps/README.md` indexed pass **181** / guru-vs-matrix pass **74**, `../handoffs/harness-matrix/README.md` pass **77**; code-review recheck **`2349Z`** per `INDEX.md` pass **529**; PR #38 merged @ **`876e011`** · PR #39 **`0013Z`**; doc-control pass-**531**) — README **schedule** **YELLOW** row (**G815**); guru-vs **G1116**–**G1119** (pass **74**); no runtime behavior change.
+- **Tool parity manifest (gap-review G646):** `service_health` **YELLOW** row maps Pi `/service-health` partial to `service_readiness_report` — **23** GREEN / **4** YELLOW / **0** RED in `toolParity.ts` (gap-review pass **132** recount) (local builder pass; reviewer owns publish).
 - **Config template:** `guruharness.config.example.json` recommends `approvalPolicy.autoCommitPushPr: false` (gap **G253**); shipped repo `guruharness.config.json` unchanged until builder lane.
 - **Linux-first paired-build contracts:** Codex01 owns platform-neutral construction;
   Windows owns quality coordination, candidate identity, and Windows validation;

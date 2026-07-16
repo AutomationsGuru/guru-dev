@@ -1,3 +1,8 @@
+/**
+ * Dev3 wave-0 parity manifest (FR/TR ids). Live registry may expose additional tools
+ * (e.g. swarm trio `spawn_agent` / `get_task_output` / `kill_task`) omitted here until
+ * requirement rows exist — gap **G487** / **G762** / guru-vs-matrix pass **37**.
+ */
 import { z } from "zod";
 
 import { VerdictSchema } from "../core/types.js";
@@ -326,6 +331,17 @@ export const TOOL_PARITY_ROWS: readonly ToolParityRow[] = [
     ownerModule: "src/tools/builtins/manageTaskTool.ts",
     notes: "Added to bridge background task management parity.",
     nextAction: "Parity met."
+  },
+  {
+    toolId: "service_health",
+    category: "base-tool",
+    requirementIds: ["FR-09", "TR-20", "TR-36"],
+    currentGuruHarnessToolIds: ["service_readiness_report"],
+    status: "partial-equivalent",
+    verdict: "YELLOW",
+    ownerModule: "src/readiness/commands.ts",
+    notes: "Pi /service-health + g2-17 port probe vs service_readiness_report (runtime/Honcho/provider-CLI only; no local-service port inventory — G636).",
+    nextAction: "Extend buildReadinessReport with config-driven port rows or document bridge-only."
   }
 ];
 

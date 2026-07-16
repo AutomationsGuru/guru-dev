@@ -106,6 +106,17 @@ export async function dispatchRpc(request: RpcRequest, ctx: RpcContext): Promise
         const receipt = session.park();
         return { ...idField, ok: true, result: receipt ?? { parked: false } };
       }
+      case "operator.answer": {
+        const questionId = String(params.questionId ?? "");
+        if (questionId.length === 0) return { ...idField, ok: false, error: "questionId required" };
+        if (!session.hasAnswerHandler()) return { ...idField, ok: false, error: "No answer handler wired" };
+        try {
+          const answer = await session.dispatchAnswer(questionId);
+          return { ...idField, ok: true, result: { questionId, answer } };
+        } catch (error) {
+          return { ...idField, ok: false, error: error instanceof Error ? error.message : String(error) };
+        }
+      }
       case "models":
         return { ...idField, ok: true, result: (ctx.routes ?? []).map((route) => route.routeId) };
       case "get_tree": {
@@ -312,6 +323,7 @@ export async function runRpcMode(options: RunRpcOptions = {}): Promise<void> {
         "suit_up",
         "park",
         "models",
+        "operator.answer",
         "compaction",
         "get_tree",
         "fork",
@@ -382,6 +394,11 @@ export async function runRpcMode(options: RunRpcOptions = {}): Promise<void> {
       input.on("close", finish);
     });
   } finally {
+    try {
+      ctx.session.closeQuestions();
+    } catch {
+      // best-effort — never block shutdown
+    }
     unsubscribeActiveSession();
     unwire();
     await ownedRuntime?.close();

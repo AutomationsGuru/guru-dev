@@ -11,4 +11,6 @@ Vitest suites for the GuruHarness product tree. Product README badge reflects fu
 
 Run from `main/`: `npm test` or focused `npx vitest run tests/<area>`.
 
+**Linux filesystem:** prefer a user-owned **native ext4** (or local disk) clone for full `npm test` / vitest — SMB/CIFS mounts (e.g. workspace on network share) may block or skew results; see `../AGENTS.md` local developer install. Re-verify README test badge (**D3**) on next clean Linux native run.
+
 **Lane:** doc-control index only — do not treat as a separate product boundary (governed by `../AGENTS.md`).

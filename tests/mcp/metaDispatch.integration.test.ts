@@ -236,6 +236,6 @@ describe("G1005 MCP meta-dispatch registration integration", () => {
   it("names meta tools in existing parity rows without changing verdict totals", () => {
     expect(findToolParityRow("mcp_list_tools")?.currentGuruHarnessToolIds).toContain("search_tool");
     expect(findToolParityRow("mcp_call_tool")?.currentGuruHarnessToolIds).toContain("use_tool");
-    expect(getToolParityVerdictCounts()).toEqual({ GREEN: 23, YELLOW: 3, RED: 0 });
+    expect(getToolParityVerdictCounts()).toEqual({ GREEN: 23, YELLOW: 4, RED: 0 });
   });
 });

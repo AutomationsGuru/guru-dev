@@ -64,7 +64,7 @@ export interface HarnessRuntimeDependencies {
   readonly commandExecutor?: CommandExecutor;
   readonly plannerModel?: PlannerModel;
   readonly interactiveCallbacks?: {
-    readonly askQuestion?: (questions: any) => Promise<string[][]>;
+    readonly askQuestion?: (questions: any, context: { sessionId: string }) => Promise<string[][]>;
     readonly schedule?: (message: string) => Promise<void>;
   };
   /**
@@ -131,6 +131,8 @@ interface CreateDefaultHarnessToolRegistryOptions {
   readonly commandExecutor?: CommandExecutor;
   readonly bashOptimizer?: BashOptimizerConfig;
   readonly interactiveCallbacks?: HarnessRuntimeDependencies["interactiveCallbacks"];
+  /** Allocated session ID — threaded so the ask_question onAsk wrapper can include it in the context. */
+  readonly sessionId?: string;
 }
 
 const DEFAULT_RUNTIME_STARTED_BY = "guruharness-runtime";
@@ -339,8 +341,11 @@ export function createDefaultHarnessToolRegistry(options: CreateDefaultHarnessTo
       },
       read: { secretAllowList: options.runtimeHardening.secretAllowList },
       // TUI/RPC can inject ask_question; otherwise the tool falls back to its own TTY prompt.
+      // When a sessionId is allocated, wrap the callback so it receives the typed context.
       ...(options.interactiveCallbacks?.askQuestion
-        ? { askQuestion: { onAsk: options.interactiveCallbacks.askQuestion } }
+        ? { askQuestion: { onAsk: options.sessionId
+            ? (questions: any) => options.interactiveCallbacks!.askQuestion!(questions, { sessionId: options.sessionId! })
+            : (questions: any) => options.interactiveCallbacks!.askQuestion!(questions, { sessionId: "" }) } }
         : {}),
       ...(scheduleDelivery
         ? {
@@ -438,6 +443,7 @@ async function rebuildHarnessSession(
     memoryDirectory: homePaths.memoryDirectory,
     bashOptimizer: configResult.config.bashOptimizer,
     mcpServers: configResult.config.mcpServers,
+    sessionId: session.id,
     ...(dependencies.commandExecutor ? { commandExecutor: dependencies.commandExecutor } : {}),
     ...(dependencies.interactiveCallbacks ? { interactiveCallbacks: dependencies.interactiveCallbacks } : {})
   });
@@ -493,6 +499,9 @@ async function buildHarnessSession(
     there: state.there,
     ...(task ? { task } : {})
   });
+  // Allocate the session ID before tooling so the ask_question onAsk wrapper
+  // can include it in the typed context on every callback invocation.
+  const sessionId = randomUUID();
   const catalog = discoverSessionSkills(configResult.config.skillDirectories, configCwd, blockers);
   const loadedSkills = loadSessionSkills(parsedOptions.skillIds, configResult.config.skillDirectories, configCwd, blockers);
   const { registry, mcpAttachment } = await createSessionTooling({
@@ -503,6 +512,7 @@ async function buildHarnessSession(
     memoryDirectory: homePaths.memoryDirectory,
     bashOptimizer: configResult.config.bashOptimizer,
     mcpServers: configResult.config.mcpServers,
+    sessionId,
     ...(dependencies.commandExecutor ? { commandExecutor: dependencies.commandExecutor } : {}),
     ...(dependencies.interactiveCallbacks ? { interactiveCallbacks: dependencies.interactiveCallbacks } : {})
   });
@@ -527,7 +537,7 @@ async function buildHarnessSession(
   }
 
   const session = HarnessSessionSchema.parse({
-    id: randomUUID(),
+    id: sessionId,
     runtimeName: configResult.config.runtimeName,
     status: blockers.length === 0 ? "ready" : "blocked",
     startedAt: new Date().toISOString(),

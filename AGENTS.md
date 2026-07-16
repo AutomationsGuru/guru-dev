@@ -24,13 +24,14 @@ This AGENTS.md is the DOX contract for `\\STORAGE\projects\guruharness\main` —
 - Secrets: presence-over-value; never print keys; vault/env only.
 - **Code-review exchange:** `../handoffs/code-reviews/` is the canonical builder/reviewer handoff folder (`INDEX.md` for navigation). Builders address the newest applicable verdict without editing verdict files; any red or changes-required verdict blocks merge, GitHub main promotion, and npm publishing until cleared for the candidate SHA.
 - Review process: peer agent + CI (`repo-hygiene`, CodeQL). CodeRabbit is retired — see `../handoffs/REVIEW-PROCESS.md`.
-- **Builder vs reviewer (Matthew 2026-07-09):** builder agents **code only** — implement, fix, update local files and place evidence in `../handoffs/code-reviews/`. Do **not** commit, push, open PRs, or drive GitHub Actions. The code-reviewer lane owns verdicts, documentation cleanup, commits, pushes, PR handling, and gated release publication.
+- **Builder vs reviewer (Matthew 2026-07-09):** builder agents **code only** — implement, fix, update local files and place evidence in `../handoffs/code-reviews/`. Do **not** commit, push, open PRs, or drive GitHub Actions unless the pipeline-gate mandate below applies. The code-reviewer lane owns verdicts, documentation cleanup, commits, pushes, PR handling, and gated release publication.
+- **Pipeline gate (Matthew 2026-07-16):** scheduled review/sync/merge/unblock lanes and the code-reviewer path **act as the human** for GitHub: when CI is green and content is approved, **approve, merge, close non-candidates, rebase/fix-merge only when necessary to keep the pipeline moving**. Do not leave green candidates stuck waiting for Matthew. Still stay **1.5.x** and do not npm-publish without release gates.
 
 # Work Guidance
 
 - Cold context: `../handoffs/ASSESSMENT-2026-07-11-lane-fork-and-roadmap.md` then `CHECKPOINT-2026-07-11-linux-reliability-wave.md` / this tree's `README.md` / `CHANGELOG.md`.
-- Workspace **doc-control:** `../handoffs/doc-control/STATE.md` · lane index `../handoffs/doc-control/README.md` · planning `planning/README.md` · doc-vs-built gaps `../gaps/README.md` (indexed pass **69**) · harness matrix `../handoffs/harness-matrix/README.md` (pass **03**).
-- **Post-merge (PR #37):** integrated `0444Z` on `main` @ `6c826c6` (access-UX ancestry `49a1a871`) — code-review idle `0830Z`; see `../handoffs/code-reviews/INDEX.md`. No open product PRs; npm publish still gated on 1.5.x release discipline.
+- Workspace **doc-control:** `../handoffs/doc-control/STATE.md` · lane index `../handoffs/doc-control/README.md` · planning `planning/README.md` · doc-vs-built gaps `../gaps/README.md` (indexed pass **181**; guru-vs-matrix pass **74**, scheduler `019f64f0454b`) · harness matrix `../handoffs/harness-matrix/README.md` (pass **77**); doc-control pass-**531**.
+- **Post-merge:** PR #37 @ `6c826c6` · PR #38 @ **`876e011`** · PR #39 **MERGED** → `main` @ **`516d1c7`** (`0222Z-pr39-merged-integrated`); snapshot #40/#41 closed. See `../handoffs/code-reviews/INDEX.md`. npm publish still gated on 1.5.x release discipline.
 - Primary surfaces: `src/guru.ts`, `src/tui/*`, `src/session/agentSession.ts`, `src/model/agentTurn.ts`, `src/memory/` (L1/L2 facts + scopes; session wiring `src/guru/memorySessionService.ts`).
 - Linux runs the primary typecheck, build, full/focused tests, and PTY/TUI checks. Windows repeats the relevant automated checks on the exact candidate, runs `npm run dev:sync`, and performs Windows Terminal/daily-driver validation before claiming cross-platform green.
 - Windows monitors Linux progress, the controlling code-review handoff, candidate parity, and coordinated npm release installation; it routes quality failures to Linux unless evidence proves they are Windows-specific.
@@ -48,4 +49,4 @@ This AGENTS.md is the DOX contract for `\\STORAGE\projects\guruharness\main` —
 - `skills\README.md` — bundled skill packages index
 - `tests\README.md` — vitest layout and fixture paths (doc index)
 
-(`src/` has no child `AGENTS.md`; governed by this contract. Module headers: `src/memory/` doc-control pass-370. Workspace: `../handoffs/README.md` · doc-vs-built gaps `../gaps/README.md`.)
+(`src/` has no child `AGENTS.md`; governed by this contract. Module headers: `src/memory/` doc-control pass-370. Workspace: `../handoffs/README.md` · doc-vs-built gaps `../gaps/README.md` (pass **181** / guru-vs **74** / matrix **77**).)

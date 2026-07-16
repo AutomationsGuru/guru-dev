@@ -78,6 +78,8 @@ describe("runTuiCommand", () => {
         paths: ["src", "tests"]
       }
     });
+    // G156 / G609: TUI `run` must eventually pass mandatePolicy like `guru run` (live git) and self-build paths.
+    expect(events.run).not.toHaveProperty("mandatePolicy");
   });
 
   it("supports help and exit commands", async () => {

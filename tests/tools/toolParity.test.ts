@@ -42,7 +42,8 @@ describe("tool parity map", () => {
         "pyautogui_mouse",
         "pyautogui_keyboard",
         "repo_route_lookup",
-        "ask_question"
+        "ask_question",
+        "service_health"
       ])
     );
   });
@@ -70,6 +71,14 @@ describe("tool parity map", () => {
     });
     expect(findToolParityRow("schedule")?.notes).toMatch(/one-shot/iu);
     expect(findToolParityRow("schedule")?.nextAction).toMatch(/durable|cron|recurring/iu);
+  });
+
+  it("should keep service_health as partial equivalent (G636)", () => {
+    expect(findToolParityRow("service_health")).toMatchObject({
+      status: "partial-equivalent",
+      verdict: "YELLOW",
+      currentGuruHarnessToolIds: ["service_readiness_report"]
+    });
   });
 
   it("should mark desktop pyautogui tools GREEN", () => {
@@ -103,6 +112,6 @@ describe("tool parity map", () => {
 
   it("should summarize RED/YELLOW/GREEN counts", () => {
     // No RED rows remain; perplexity + repo + schedule stay YELLOW partials.
-    expect(getToolParityVerdictCounts()).toEqual({ GREEN: 23, YELLOW: 3, RED: 0 });
+    expect(getToolParityVerdictCounts()).toEqual({ GREEN: 23, YELLOW: 4, RED: 0 });
   });
 });
