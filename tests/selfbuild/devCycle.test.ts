@@ -57,6 +57,55 @@ describe("DevCycleBudget (P7 spine) — every model loop is triply bounded + spe
   it("config is strict — unknown budget knobs are rejected", () => {
     expect(() => RunDevCycleConfigSchema.parse({ maxAttempts: 3 })).toThrow();
   });
+
+  it("hydrates attempts, tokens, spend, and elapsed time from a validated resume seed", () => {
+    let now = 10_000;
+    const clock: Clock = { now: () => now };
+    const b = new DevCycleBudget(
+      cfg({ maxIterations: 5, tokenBudget: 10_000, wallClockMs: 2_000, spend: { ceilingUsd: 10, spentUsd: 0 } }),
+      clock,
+      { attempts: 2, tokens: 3_000, spentUsd: 4, elapsedMs: 1_000 }
+    );
+
+    expect(b.snapshot()).toMatchObject({ attempts: 2, tokens: 3_000, spentUsd: 4, elapsedMs: 1_000 });
+    now = 10_999;
+    expect(b.exhaustedReason()).toBeNull();
+    now = 11_000;
+    expect(b.exhaustedReason()).toMatch(/wall-clock/u);
+  });
+
+  it("does not grant a fresh attempt budget when a resumed seed is already exhausted", () => {
+    const b = new DevCycleBudget(cfg({ maxIterations: 2 }), undefined, {
+      attempts: 2,
+      tokens: 0,
+      spentUsd: 0,
+      elapsedMs: 0
+    });
+
+    expect(b.exhaustedReason()).toMatch(/attempt cap reached \(2\/2\)/u);
+  });
+
+  it("rejects invalid or unknown resume-seed fields", () => {
+    expect(
+      () =>
+        new DevCycleBudget(cfg(), undefined, {
+          attempts: -1,
+          tokens: 0,
+          spentUsd: 0,
+          elapsedMs: 0
+        })
+    ).toThrow();
+    expect(
+      () =>
+        new DevCycleBudget(cfg(), undefined, {
+          attempts: 0,
+          tokens: 0,
+          spentUsd: 0,
+          elapsedMs: 0,
+          resetBudget: true
+        } as never)
+    ).toThrow();
+  });
 });
 
 describe("nextStage (P7 spine) — pure 0→7 routing", () => {

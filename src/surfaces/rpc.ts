@@ -129,6 +129,40 @@ export async function dispatchRpc(request: RpcRequest, ctx: RpcContext): Promise
       }
       case "models":
         return { ...idField, ok: true, result: (ctx.routes ?? []).map((route) => route.routeId) };
+      case "get_available_models":
+        return {
+          ...idField,
+          ok: true,
+          result: (ctx.routes ?? []).map((route) => ({
+            providerId: route.providerId,
+            routeId: route.routeId,
+            modelId: route.modelId,
+            apiFamily: route.apiFamily ?? null,
+            chatCapable: isChatCapableFamily(route.apiFamily),
+            usable: resolveRouteCredential(route).usable,
+            active: route.routeId === session.activeRoute.routeId
+          }))
+        };
+      case "set_model": {
+        const routeId = params.routeId;
+        if (routeId === undefined || routeId === "") {
+          return { ...idField, ok: false, error: "set_model: routeId is required." };
+        }
+        if (typeof routeId !== "string") {
+          return { ...idField, ok: false, error: "set_model: routeId must be a string." };
+        }
+        const route = (ctx.routes ?? []).find((candidate) => candidate.routeId === routeId);
+        if (!route) {
+          return { ...idField, ok: false, error: `set_model: unknown route '${routeId}'.` };
+        }
+        if (!isChatCapableFamily(route.apiFamily)) {
+          return { ...idField, ok: false, error: `set_model: route '${routeId}' is not chat-capable.` };
+        }
+        if (!resolveRouteCredential(route).usable) {
+          return { ...idField, ok: false, error: `set_model: route '${routeId}' is not usable with the current credential resolution.` };
+        }
+        return { ...idField, ok: true, result: session.switchRoute(route) };
+      }
       case "get_tree": {
         if (!ctx.graph) {
           throw new Error("RPC session graph: graph is unavailable.");
@@ -377,31 +411,34 @@ export async function runRpcMode(options: RunRpcOptions = {}): Promise<void> {
         "compaction",
         "get_tree",
         "fork",
-        "switch_session"
+        "switch_session",
+        "get_available_models",
+        "set_model"
       ]
     });
 
     const input = options.input ?? process.stdin;
     const decoder = new StringDecoder("utf8");
     const state = { buffer: "" };
-    // Prompts serialize (each may drain follow-ups); steer/follow_up/abort stay immediate
-    // so they can land mid-turn without waiting behind a long prompt.
-    let promptChain: Promise<void> = Promise.resolve();
+    // Prompts serialize (each may drain follow-ups), and set_model observes that
+    // same accepted-input order so a later switch cannot change an earlier turn.
+    // steer/follow_up/abort stay immediate so they can land mid-turn.
+    let orderedChain: Promise<void> = Promise.resolve();
     const pendingDispatches = new Set<Promise<void>>();
     const dispatchLine = (request: RpcRequest): void => {
-      if (request.method === "prompt") {
-        // Chain prompts serially (each may drain follow-ups), but catch at each link
+      if (request.method === "prompt" || request.method === "set_model") {
+        // Chain route-sensitive requests serially, but catch at each link
         // (review 2026-07-08): the old chain had no .catch, so a single emit failure
         // (broken pipe, closed sink) rejected the shared promise and EVERY subsequent
         // prompt was silently swallowed for the rest of the session. Reset the chain
         // on failure so one bad write can't permanently kill the prompt stream.
-        promptChain = promptChain
+        orderedChain = orderedChain
           .then(async () => {
             emit(await dispatchRpc(request, ctx));
           })
           .catch((error: unknown) => {
             // eslint-disable-next-line no-console
-            console.warn(`[rpc] prompt chain: emit failed (${error instanceof Error ? error.message : String(error)}). Continuing.`);
+            console.warn(`[rpc] ordered ${request.method}: emit failed (${error instanceof Error ? error.message : String(error)}). Continuing.`);
           });
         return;
       }
@@ -422,7 +459,7 @@ export async function runRpcMode(options: RunRpcOptions = {}): Promise<void> {
         // A prompt may itself be waiting on ask_question/waitForAnswer. Close
         // those waiters before awaiting the prompt chain or EOF can deadlock.
         closePendingQuestions();
-        void promptChain.then(async () => {
+        void orderedChain.then(async () => {
           await Promise.allSettled([...pendingDispatches]);
           resolve();
         });

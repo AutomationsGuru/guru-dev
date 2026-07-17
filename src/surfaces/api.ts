@@ -16,6 +16,35 @@ import { runSelfBuildExecutor, type RunSelfBuildExecutorOptions, type SelfBuildE
 import { runDevCycle, type DevCycleReport, type RunDevCycleInput } from "../selfbuild/runDevCycle.js";
 import { makeSmokeDeps } from "../selfbuild/smokeDeps.js";
 
+/**
+ * G853 live SSE event streams.
+ *
+ * Lane A owns `./apiEventStream.js` (the bounded SSE hub): monotonic server-local
+ * DECIMAL ids (strings), a fixed-size in-memory replay window (`replayLimit`),
+ * session/global subscriber filtering, SSE frame encoding (`event:`/`id:`/`data:`
+ * plus `ready`/`reset` control events and `:` comment heartbeats), per-subscriber
+ * serialized writes with bounded-lag eviction over a transport-neutral sink, and
+ * idempotent subscriber/hub cleanup.
+ *
+ * Lane B (this module) consumes ONLY these documented exports and adds the thin
+ * HTTP transport adapter bridging `ServerResponse` to the hub `ApiEventStreamSink`:
+ *   createApiEventStreamHub(options?: ApiEventStreamHubOptions): ApiEventStreamHub
+ *   ApiEventStreamHub.publish(event: ApiSessionTimelineEvent): ApiEventStreamRecord
+ *   ApiEventStreamHub.subscribe(options: { sink; sessionId?; lastEventId? }): ApiEventStreamSubscription
+ *   ApiEventStreamHub.close(): void   // idempotent
+ *
+ * Per stream connection Lane B owns: committing `text/event-stream; charset=utf-8`
+ * (only after the missing-session JSON 404 is ruled out), the sink write/onDrain/
+ * close adapter over `ServerResponse`, and detaching the subscription on client
+ * disconnect. The hub owns ready/reset/replay ordering, `Last-Event-ID` cursor
+ * logic, heartbeats, and backpressure/bounded-lag eviction.
+ */
+import {
+  createApiEventStreamHub,
+  type ApiEventStreamHub,
+  type ApiEventStreamHubOptions
+} from "./apiEventStream.js";
+
 export interface ApiHealthReport {
   runtime: string;
   endpoints: string[];
@@ -201,6 +230,12 @@ export interface ApiServerOptions {
   readonly runExecutor?: ApiRunExecutor;
   /** Test/integration seam for the P7 default /run cycle. Ignored when handlers.run is supplied. */
   readonly runCycle?: ApiRunCycle;
+  /**
+   * G853 SSE hub tuning. Omit for the hub's conservative production defaults.
+   * Tests inject a small `replayLimit` (bounded replay/reset behavior) and a short
+   * `heartbeatIntervalMs` (comment heartbeats) through the hub seam.
+   */
+  readonly eventStream?: ApiEventStreamHubOptions;
 }
 
 /** The secure headless default: no grants, no YOLO → mutations are denied. */
@@ -245,30 +280,38 @@ export async function startHarnessApiServer(options: ApiServerOptions = {}): Pro
   // mutating tool without a grant (the REPL-only enforcement hole, closed).
   const ownsRuntime = options.runtime === undefined;
   const runtime = options.runtime ?? options.runtimeFactory?.() ?? createHarnessRuntime({ mandatePolicy });
-  const defaultHandlers = createDefaultApiHandlers(
+  // G853: one bounded SSE hub per server. Always created so the stream endpoints
+  // exist; only the default session lifecycle publishes into it.
+  const eventStream = createApiEventStreamHub(options.eventStream);
+  const defaultContext = createDefaultApiHandlers(
     runtime,
     mandatePolicy,
     options.runExecutor ?? runSelfBuildExecutor,
-    options.runCycle ?? runDevCycle
+    options.runCycle ?? runDevCycle,
+    eventStream
   );
-  const selectedHealth = options.handlers?.health ?? defaultHandlers.health;
+  const selectedHealth = options.handlers?.health ?? defaultContext.handlers.health;
   const handlers: Required<ApiHandlers> = {
-    buildPlan: options.handlers?.buildPlan ?? defaultHandlers.buildPlan,
-    directionCheck: options.handlers?.directionCheck ?? defaultHandlers.directionCheck,
-    startSession: options.handlers?.startSession ?? defaultHandlers.startSession,
-    sessionStatus: options.handlers?.sessionStatus ?? defaultHandlers.sessionStatus,
-    sessionEvents: options.handlers?.sessionEvents ?? defaultHandlers.sessionEvents,
-    sessionInspect: options.handlers?.sessionInspect ?? defaultHandlers.sessionInspect,
-    sessionContinue: options.handlers?.sessionContinue ?? defaultHandlers.sessionContinue,
-    sessionList: options.handlers?.sessionList ?? defaultHandlers.sessionList,
-    toolRun: options.handlers?.toolRun ?? defaultHandlers.toolRun,
-    run: options.handlers?.run ?? defaultHandlers.run,
+    buildPlan: options.handlers?.buildPlan ?? defaultContext.handlers.buildPlan,
+    directionCheck: options.handlers?.directionCheck ?? defaultContext.handlers.directionCheck,
+    startSession: options.handlers?.startSession ?? defaultContext.handlers.startSession,
+    sessionStatus: options.handlers?.sessionStatus ?? defaultContext.handlers.sessionStatus,
+    sessionEvents: options.handlers?.sessionEvents ?? defaultContext.handlers.sessionEvents,
+    sessionInspect: options.handlers?.sessionInspect ?? defaultContext.handlers.sessionInspect,
+    sessionContinue: options.handlers?.sessionContinue ?? defaultContext.handlers.sessionContinue,
+    sessionList: options.handlers?.sessionList ?? defaultContext.handlers.sessionList,
+    toolRun: options.handlers?.toolRun ?? defaultContext.handlers.toolRun,
+    run: options.handlers?.run ?? defaultContext.handlers.run,
     health: async () => ({
       ...await selectedHealth(),
       boot: bootReport
     })
   };
-  const routeOptions = { allowRunSafetyOverrides: options.allowRunSafetyOverrides ?? false };
+  const routeOptions = {
+    allowRunSafetyOverrides: options.allowRunSafetyOverrides ?? false,
+    eventStream,
+    hasSession: defaultContext.hasSession
+  };
 
   const server = createServer(async (request, response) => {
     await routeRequest(request, response, handlers, routeOptions);
@@ -303,6 +346,9 @@ export async function startHarnessApiServer(options: ApiServerOptions = {}): Pro
     server,
     async close() {
       try {
+        // G853: stop heartbeats and end SSE subscribers first so open event-stream
+        // clients never keep server.close() (and this handle) pending.
+        eventStream.close();
         await new Promise<void>((resolve, reject) => {
         // Drop keep-alive clients so close() does not hang the next test.
           server.closeAllConnections?.();
@@ -358,33 +404,47 @@ function directionResponse(configPath?: string, cwd?: string): unknown {
   return createDirectionAlignmentReport({ here: state.here, there: state.there, ...(nextTask ? { task: nextTask } : {}) });
 }
 
+interface DefaultApiContext {
+  readonly handlers: Required<ApiHandlers>;
+  /**
+   * Parity with the JSON `/sessions/:sessionId/events` 404: true when the default
+   * session lifecycle has recorded at least one timeline event for the session.
+   * Used to return the existing sanitized JSON 404 before SSE headers commit.
+   */
+  readonly hasSession: (sessionId: string) => boolean;
+}
+
 function createDefaultApiHandlers(
   runtime: HarnessRuntime,
   mandatePolicy: ApiRunMandatePolicy,
   runExecutor: ApiRunExecutor,
-  runCycle: ApiRunCycle
-): Required<ApiHandlers> {
+  runCycle: ApiRunCycle,
+  eventStream: ApiEventStreamHub
+): DefaultApiContext {
   const sessions = new Map<string, HarnessSession>();
   const sessionEvents = new Map<string, ApiSessionTimelineEvent[]>();
 
   return {
-    buildPlan: async (request) => buildPlanResponse(request.configPath, request.cwd),
-    directionCheck: async (request) => directionResponse(request.configPath, request.cwd),
-    startSession: async (request) => {
-      const session = await runtime.startSession(request);
-      sessions.set(session.id, session);
-      appendSessionEvent(sessionEvents, createSessionStartedEvent(session));
+    handlers: {
+      buildPlan: async (request) => buildPlanResponse(request.configPath, request.cwd),
+      directionCheck: async (request) => directionResponse(request.configPath, request.cwd),
+      startSession: async (request) => {
+        const session = await runtime.startSession(request);
+        sessions.set(session.id, session);
+        appendSessionEvent(sessionEvents, createSessionStartedEvent(session), eventStream);
 
-      return session;
+        return session;
+      },
+      sessionStatus: async (request) => defaultSessionStatus(runtime, sessions, sessionEvents, eventStream, request),
+      sessionEvents: async (request) => defaultSessionEvents(sessionEvents, request),
+      sessionInspect: async (request) => defaultSessionInspection(runtime, sessions, sessionEvents, eventStream, request),
+      sessionContinue: async (request) => defaultSessionContinuation(runtime, sessions, sessionEvents, eventStream, request),
+      sessionList: async (request) => defaultSessionList(runtime, request),
+      toolRun: async (request) => defaultToolRun(runtime, sessions, sessionEvents, eventStream, request),
+      run: async (request) => defaultRun(request, mandatePolicy, runExecutor, runCycle),
+      health: defaultHealth
     },
-    sessionStatus: async (request) => defaultSessionStatus(runtime, sessions, sessionEvents, request),
-    sessionEvents: async (request) => defaultSessionEvents(sessionEvents, request),
-    sessionInspect: async (request) => defaultSessionInspection(runtime, sessions, sessionEvents, request),
-    sessionContinue: async (request) => defaultSessionContinuation(runtime, sessions, sessionEvents, request),
-    sessionList: async (request) => defaultSessionList(runtime, request),
-    toolRun: async (request) => defaultToolRun(runtime, sessions, sessionEvents, request),
-    run: async (request) => defaultRun(request, mandatePolicy, runExecutor, runCycle),
-    health: defaultHealth
+    hasSession: (sessionId) => sessionEvents.has(sessionId)
   };
 }
 
@@ -392,6 +452,7 @@ async function defaultSessionStatus(
   runtime: HarnessRuntime,
   sessions: Map<string, HarnessSession>,
   sessionEvents: Map<string, ApiSessionTimelineEvent[]>,
+  eventStream: ApiEventStreamHub,
   request: ApiSessionStatusRequest
 ): Promise<unknown> {
   if (!request.sessionId) {
@@ -407,7 +468,7 @@ async function defaultSessionStatus(
 
   sessions.set(session.id, session);
   if (!localSession) {
-    appendSessionEvent(sessionEvents, createSessionResumedEvent(session, request.sessionId));
+    appendSessionEvent(sessionEvents, createSessionResumedEvent(session, request.sessionId), eventStream);
   }
 
   return { route: "session-status", session };
@@ -447,6 +508,7 @@ async function defaultSessionInspection(
   runtime: HarnessRuntime,
   sessions: Map<string, HarnessSession>,
   sessionEvents: Map<string, ApiSessionTimelineEvent[]>,
+  eventStream: ApiEventStreamHub,
   request: ApiSessionInspectionRequest
 ): Promise<ApiSessionInspectionReport> {
   if (!request.sessionId) {
@@ -462,7 +524,7 @@ async function defaultSessionInspection(
 
   sessions.set(session.id, session);
   if (!localSession) {
-    appendSessionEvent(sessionEvents, createSessionResumedEvent(session, request.sessionId));
+    appendSessionEvent(sessionEvents, createSessionResumedEvent(session, request.sessionId), eventStream);
   }
 
   const persistedEvents = await runtime.listSessionEvents(session.id);
@@ -484,6 +546,7 @@ async function defaultSessionContinuation(
   runtime: HarnessRuntime,
   sessions: Map<string, HarnessSession>,
   sessionEvents: Map<string, ApiSessionTimelineEvent[]>,
+  eventStream: ApiEventStreamHub,
   request: ApiSessionContinuationRequest
 ): Promise<ApiSessionContinuationReport> {
   if (!request.sessionId) {
@@ -499,7 +562,7 @@ async function defaultSessionContinuation(
 
   sessions.set(session.id, session);
   if (!localSession) {
-    appendSessionEvent(sessionEvents, createSessionResumedEvent(session, request.sessionId));
+    appendSessionEvent(sessionEvents, createSessionResumedEvent(session, request.sessionId), eventStream);
   }
 
   const persistedEvents = await runtime.listSessionEvents(session.id);
@@ -519,6 +582,7 @@ async function defaultToolRun(
   runtime: HarnessRuntime,
   sessions: Map<string, HarnessSession>,
   sessionEvents: Map<string, ApiSessionTimelineEvent[]>,
+  eventStream: ApiEventStreamHub,
   request: ApiToolRunRequest
 ): Promise<unknown> {
   if (!request.toolId) {
@@ -543,13 +607,13 @@ async function defaultToolRun(
 
   sessions.set(session.id, session);
   if (request.sessionId && !localSession) {
-    appendSessionEvent(sessionEvents, createSessionResumedEvent(session, request.sessionId));
+    appendSessionEvent(sessionEvents, createSessionResumedEvent(session, request.sessionId), eventStream);
   } else if (!request.sessionId) {
-    appendSessionEvent(sessionEvents, createSessionStartedEvent(session));
+    appendSessionEvent(sessionEvents, createSessionStartedEvent(session), eventStream);
   }
 
   const observation = await runtime.executeTool(session.id, request.toolId, request.input ?? {});
-  appendSessionEvent(sessionEvents, createToolObservationEvent(session.id, request.toolId, observation.status, observation.error));
+  appendSessionEvent(sessionEvents, createToolObservationEvent(session.id, request.toolId, observation.status, observation.error), eventStream);
 
   return { session, observation };
 }
@@ -603,15 +667,21 @@ const RUNTIME_NAME = "GuruHarness";
 async function defaultHealth(): Promise<ApiHealthReport> {
   return {
     runtime: RUNTIME_NAME,
-    endpoints: ["GET /", "GET /health", "GET /self-build-plan", "GET /direction-check", "POST /session-start", "GET /sessions", "GET /sessions/:sessionId", "GET /sessions/:sessionId/events", "GET /sessions/:sessionId/inspect", "GET /sessions/:sessionId/continue", "POST /tool-run", "POST /run"]
+    endpoints: ["GET /", "GET /health", "GET /self-build-plan", "GET /direction-check", "POST /session-start", "GET /sessions", "GET /events", "GET /sessions/:sessionId", "GET /sessions/:sessionId/events", "GET /sessions/:sessionId/events/stream", "GET /sessions/:sessionId/inspect", "GET /sessions/:sessionId/continue", "POST /tool-run", "POST /run"]
   };
+}
+
+interface RouteRequestOptions {
+  readonly allowRunSafetyOverrides: boolean;
+  readonly eventStream: ApiEventStreamHub;
+  readonly hasSession: (sessionId: string) => boolean;
 }
 
 async function routeRequest(
   request: IncomingMessage,
   response: ServerResponse,
   handlers: Required<ApiHandlers>,
-  options: { readonly allowRunSafetyOverrides: boolean }
+  options: RouteRequestOptions
 ): Promise<void> {
   const method = request.method?.toUpperCase() ?? "";
   const requestUrl = new URL(request.url ?? "/", "http://localhost");
@@ -639,8 +709,27 @@ async function routeRequest(
       return writeJson(response, 200, await handlers.sessionList(normalizeSessionListRequest(requestUrl.searchParams)));
     }
 
+    if (method === "GET" && route === "/events") {
+      // Global SSE stream: every default-API session event in publication order.
+      const lastEventId = readLastEventId(request);
+      attachEventStream(request, response, options.eventStream, { ...(lastEventId !== undefined ? { lastEventId } : {}) });
+      return;
+    }
+
     if (method === "GET" && route.startsWith("/sessions/") && route.endsWith("/events")) {
       return writeJson(response, 200, await handlers.sessionEvents(normalizeSessionEventsRequest(route)));
+    }
+
+    if (method === "GET" && route.startsWith("/sessions/") && route.endsWith("/events/stream")) {
+      // Session SSE stream. Missing session → existing sanitized JSON 404 before
+      // any SSE header is committed (handled by the shared catch below).
+      const sessionId = normalizeSessionEventStreamRequest(route);
+      if (!options.hasSession(sessionId)) {
+        throw new ApiHttpError(404, `Harness session not found: ${sessionId}`);
+      }
+      const lastEventId = readLastEventId(request);
+      attachEventStream(request, response, options.eventStream, { sessionId, ...(lastEventId !== undefined ? { lastEventId } : {}) });
+      return;
     }
 
     if (method === "GET" && route.startsWith("/sessions/") && route.endsWith("/inspect")) {
@@ -736,6 +825,89 @@ function normalizeSessionEventsRequest(route: string): ApiSessionEventsRequest {
   const sessionId = route.slice("/sessions/".length, -"/events".length);
 
   return sessionId.length > 0 ? { sessionId: decodeURIComponent(sessionId) } : {};
+}
+
+function normalizeSessionEventStreamRequest(route: string): string {
+  const sessionId = route.slice("/sessions/".length, -"/events/stream".length);
+
+  return sessionId.length > 0 ? decodeURIComponent(sessionId) : "";
+}
+
+function readLastEventId(request: IncomingMessage): string | undefined {
+  const raw = request.headers["last-event-id"];
+  // Pass the single header value through; the hub validates its decimal form and
+  // treats anything absent/non-decimal as an absent cursor (full retained replay).
+  return typeof raw === "string" && raw.length > 0 ? raw : undefined;
+}
+
+/**
+ * Bridge a Node `ServerResponse` to the hub's transport-neutral sink. The hub owns
+ * frame encoding, ordering, heartbeats, and bounded-lag eviction; this adapter only
+ * forwards writes / backpressure-drain / close to the HTTP response.
+ */
+function createServerResponseSink(response: ServerResponse): {
+  write: (frame: string) => boolean;
+  onDrain: (listener: () => void) => () => void;
+  close: () => void;
+} {
+  return {
+    write: (frame) => response.write(frame),
+    onDrain: (listener) => {
+      response.on("drain", listener);
+      return () => {
+        response.off("drain", listener);
+      };
+    },
+    close: () => {
+      response.end();
+    }
+  };
+}
+
+/**
+ * Commit the SSE headers and hand the response to the hub as a sink. Called only
+ * after the missing-session JSON 404 is ruled out, so a stream never commits
+ * `text/event-stream` for an unknown session. The subscription is detached on
+ * request abort, response close, or response error so heartbeats and listeners
+ * are released exactly once.
+ */
+function attachEventStream(
+  request: IncomingMessage,
+  response: ServerResponse,
+  hub: ApiEventStreamHub,
+  options: { readonly sessionId?: string; readonly lastEventId?: string }
+): void {
+  response.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache"
+  });
+  let subscription: { unsubscribe(): void; closed: boolean; close(): void } | undefined;
+  let cleanedUp = false;
+  const cleanup = (): void => {
+    if (cleanedUp) {
+      return;
+    }
+
+    cleanedUp = true;
+    request.off("aborted", cleanup);
+    response.off("close", cleanup);
+    response.off("error", cleanup);
+    subscription?.unsubscribe();
+  };
+
+  request.on("aborted", cleanup);
+  response.on("close", cleanup);
+  response.on("error", cleanup);
+  subscription = hub.subscribe({
+    sink: createServerResponseSink(response),
+    ...(options.sessionId !== undefined ? { sessionId: options.sessionId } : {}),
+    ...(options.lastEventId !== undefined ? { lastEventId: options.lastEventId } : {})
+  });
+  if (cleanedUp) {
+    subscription.unsubscribe();
+  } else if (subscription.closed) {
+    cleanup();
+  }
 }
 
 function normalizeSessionInspectionRequest(route: string): ApiSessionInspectionRequest {
@@ -1035,9 +1207,16 @@ function pickStringMetadata(value: Record<string, unknown>, keys: readonly strin
   return Object.fromEntries(keys.flatMap((key) => (typeof value[key] === "string" ? [[key, value[key]]] : [])));
 }
 
-function appendSessionEvent(events: Map<string, ApiSessionTimelineEvent[]>, event: ApiSessionTimelineEvent): void {
+function appendSessionEvent(
+  events: Map<string, ApiSessionTimelineEvent[]>,
+  event: ApiSessionTimelineEvent,
+  eventStream?: ApiEventStreamHub
+): void {
   const existing = events.get(event.sessionId) ?? [];
   events.set(event.sessionId, [...existing, event]);
+  // G853: fan the real timeline event into the bounded SSE hub. JSON polling is
+  // unaffected — this only reaches stream subscribers.
+  eventStream?.publish(event);
 }
 
 function createSessionStartedEvent(session: HarnessSession): ApiSessionTimelineEvent {

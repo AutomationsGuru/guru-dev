@@ -103,6 +103,10 @@ describe("YOLO access presentation", () => {
     expect(getToolAccessMode("read", true)).toBe("free");
     expect(getToolAccessMode("write", true)).toBe("yolo");
     expect(getToolAccessMode("write", false)).toBe("approval");
+    // LSP is read-only and never labelled exec despite starting a local server
+    expect(getToolAccessMode("lsp", true)).toBe("free");
+    expect(getToolAccessMode("lsp", false)).toBe("free");
+    expect(getToolAccessMode("lsp", true, { grants: [], denies: [] }, new Set(["write"]))).toBe("free");
   });
 
   it("labels mutation tools as policy-controlled when saved grants are effective", () => {

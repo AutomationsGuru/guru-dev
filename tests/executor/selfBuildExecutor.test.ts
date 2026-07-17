@@ -575,6 +575,50 @@ describe("runSelfBuildExecutor runtime hardening", () => {
     expect(model.requests).toEqual([]);
   });
 
+  it("reports a started or resumed session id before planner work begins", async () => {
+    const operationalStore = createInMemoryOperationalStore();
+    const events: string[] = [];
+    const makeModel = (): PlannerModel => ({
+      createPlan() {
+        events.push("planner");
+        return { objective: "Execute task.", summary: "No tools needed.", steps: [] };
+      }
+    });
+
+    const first = await runSelfBuildExecutor({
+      cwd: repoRoot,
+      taskId: "session-breadcrumb",
+      allowDirtyWorkspace: true,
+      allowRiskyPaths: true,
+      plannerModel: makeModel(),
+      operationalStore,
+      commandExecutor: createCommandExecutor([]),
+      onSessionStarted: (sessionId) => {
+        events.push(`session:${sessionId}`);
+      }
+    });
+    expect(events[0]).toBe(`session:${first.session.id}`);
+    expect(events[1]).toBe("planner");
+
+    events.length = 0;
+    const resumed = await runSelfBuildExecutor({
+      cwd: repoRoot,
+      taskId: "session-breadcrumb",
+      resumeSessionId: first.session.id,
+      allowDirtyWorkspace: true,
+      allowRiskyPaths: true,
+      plannerModel: makeModel(),
+      operationalStore,
+      commandExecutor: createCommandExecutor([]),
+      onSessionStarted: (sessionId) => {
+        events.push(`session:${sessionId}`);
+      }
+    });
+    expect(resumed.session.id).toBe(first.session.id);
+    expect(events[0]).toBe(`session:${first.session.id}`);
+    expect(events[1]).toBe("planner");
+  });
+
   it("should walk configured fallback candidates even when same-provider retries are one", async () => {
     const tempRoot = mkdtempSync(join(tmpdir(), "guruharness-planner-fallback-"));
     const fetchCalls: Array<{ url: string; init: RequestInit }> = [];

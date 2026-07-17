@@ -89,7 +89,8 @@ export const MANDATE_READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   "operational.state.list",
   "operational.backlog.list",
   "github.pr.status",
-  "read_diagnostics"
+  "read_diagnostics",
+  "lsp"
 ]);
 
 /**

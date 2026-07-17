@@ -69,6 +69,8 @@ export interface RunSelfBuildExecutorOptions {
   readonly allowDirtyWorkspace?: boolean;
   readonly allowRiskyPaths?: boolean;
   readonly resumeSessionId?: string;
+  /** Durable breadcrumb emitted immediately after session start/resume, before planner work. */
+  readonly onSessionStarted?: (sessionId: string) => Promise<void> | void;
   /** Construct executor/planner runtimes owned and closed by this invocation. */
   readonly runtimeFactory?: (dependencies: HarnessRuntimeDependencies) => HarnessRuntime;
 }
@@ -178,6 +180,7 @@ async function runSelfBuildExecutorWithRuntime(
     ...(options.resumeSessionId ? { resumeSessionId: options.resumeSessionId } : {}),
     options: startSessionOptions
   });
+  await options.onSessionStarted?.(session.id);
 
   if (options.resumeSessionId && !resumed) {
     await recordProgressBeacon(sessionPersistenceStore, session.id, "session-continuity", "blocked", "Requested resume session was not found; started a new blocked continuity report.", {

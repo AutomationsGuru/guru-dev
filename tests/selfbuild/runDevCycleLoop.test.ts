@@ -5,6 +5,7 @@ import type { DevCycleReport } from "../../src/selfbuild/runDevCycle.js";
 
 function report(taskId: string, terminal: "done" | "blocked"): DevCycleReport {
   return {
+    cycleId: taskId,
     verdict: terminal === "done" ? "GREEN" : "RED",
     terminal,
     stages: [],
