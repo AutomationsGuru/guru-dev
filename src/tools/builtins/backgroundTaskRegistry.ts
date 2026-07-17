@@ -1,5 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 
+import { resolveWindowsGateSpawn } from "../../review/gates.js";
+
 interface BackgroundTaskRecord {
   readonly id: string;
   readonly kind: "process" | "scheduled";
@@ -59,8 +61,12 @@ export function resetBackgroundTasks(): void {
 }
 
 export function spawnBackgroundTask(command: readonly string[], cwd: string): string {
+  if (!command[0]?.trim()) {
+    throw new Error("Background command is empty.");
+  }
+  const resolved = resolveWindowsGateSpawn(command);
   const id = `task-${(counter += 1)}`;
-  const child = spawn(command[0]!, command.slice(1), {
+  const child = spawn(resolved.executable, resolved.args, {
     cwd,
     stdio: ["pipe", "pipe", "pipe"],
     shell: false
@@ -77,13 +83,25 @@ export function spawnBackgroundTask(command: readonly string[], cwd: string): st
     startedAt: new Date().toISOString(),
     process: child
   };
+  let spawnFailed = false;
   child.stdout.on("data", (chunk: Buffer) => {
     record.stdout = appendTail(record.stdout, chunk.toString("utf8"));
   });
   child.stderr.on("data", (chunk: Buffer) => {
     record.stderr = appendTail(record.stderr, chunk.toString("utf8"));
   });
+  child.on("error", (error) => {
+    spawnFailed = true;
+    record.exitCode = null;
+    record.state = "failed";
+    record.stderr = appendTail(record.stderr, `Background task failed to start: ${error.message}\n`);
+    record.endedAt = new Date().toISOString();
+    delete record.process;
+  });
   child.on("close", (code) => {
+    if (spawnFailed) {
+      return;
+    }
     record.exitCode = code;
     record.state = record.state === "killed" ? "killed" : code === 0 ? "completed" : "failed";
     record.endedAt = new Date().toISOString();

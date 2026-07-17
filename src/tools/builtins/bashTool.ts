@@ -6,6 +6,7 @@ import { executeCommand, requiresWindowsCommandShim, type CommandExecutor } from
 import { guardContent } from "../../safety/policyGuard.js";
 import type { ToolDefinition } from "../registry.js";
 import { optimizeBashOutput, DEFAULT_BASH_OPTIMIZER_CONFIG, type BashOptimizerConfig } from "../bashOptimizer.js";
+import { spawnBackgroundTask } from "./backgroundTaskRegistry.js";
 
 export const PiBashToolInputSchema = z
   .object({
@@ -15,6 +16,7 @@ export const PiBashToolInputSchema = z
     cwd: z.string().trim().min(1).optional(),
     timeoutMs: z.number().int().positive().max(300_000).default(120_000),
     maxOutputBytes: z.number().int().positive().max(1_000_000).default(64_000),
+    background: z.boolean().optional().describe("Start the validated command as a managed background task. Defaults to false."),
     dryRun: z.boolean().default(true)
   })
   .strict();
@@ -23,7 +25,9 @@ export const PiBashToolOutputSchema = z
   .object({
     executed: z.boolean(),
     dryRun: z.boolean(),
+    background: z.boolean().default(false),
     command: z.array(z.string()),
+    taskId: z.string().trim().min(1).optional(),
     exitCode: z.number().int().nullable().optional(),
     stdout: z.string().optional(),
     stderr: z.string().optional(),
@@ -38,6 +42,8 @@ export const PiBashToolOutputSchema = z
 
 export interface PiBashToolOptions {
   readonly executor?: CommandExecutor;
+  /** Injectable managed-task launcher; production uses the shared manage_task registry. */
+  readonly startBackground?: (command: readonly string[], cwd: string) => string | Promise<string>;
   readonly shellAllowlist: readonly string[];
   readonly secretAllowList?: readonly string[];
   /** Token optimizer (ADR 2026-07-05): default OFF; never-worse guarded. */
@@ -46,11 +52,12 @@ export interface PiBashToolOptions {
 
 export function createPiBashTool(options: PiBashToolOptions = { shellAllowlist: [] }): ToolDefinition<typeof PiBashToolInputSchema, typeof PiBashToolOutputSchema> {
   const executor = options.executor ?? executeCommand;
+  const startBackground = options.startBackground ?? spawnBackgroundTask;
   return {
     id: "bash",
     title: "Run command (argv)",
     description:
-      "Bounded single-process argv runner (cwd containment, executable policy, timeout, truncation). Pass a simple command line (e.g. \"npm test\") or executable + args separately. " +
+      "Bounded single-process argv runner (cwd containment, executable policy, timeout, truncation) with optional managed background launch. Pass a simple command line (e.g. \"npm test\") or executable + args separately. " +
       "Shell operators, redirects, pipes, expansion, and command chaining are intentionally unsupported; issue separate tool calls instead. " +
       "Before any destructive/delete command (rm, a truncating `>` redirect, git reset --hard, force-push), ask: does this really need to go? (yes/no) " +
       "Preserve, rename-aside, or enhance before you delete — destructive commands are double-checked even in YOLO.",
@@ -77,10 +84,24 @@ export function createPiBashTool(options: PiBashToolOptions = { shellAllowlist: 
         ...buildBlockers(command, cwd, repoRoot, options)
       ];
       if (blockers.length > 0) {
-        return { executed: false, dryRun: input.dryRun, command: redactCommand(command), truncated: false, cancelled: false, blockers, summary: `Bash command blocked by ${blockers.length} policy check(s).` };
+        return { executed: false, dryRun: input.dryRun, background: input.background === true, command: redactCommand(command), truncated: false, cancelled: false, blockers, summary: `Bash command blocked by ${blockers.length} policy check(s).` };
       }
       if (input.dryRun) {
-        return { executed: false, dryRun: true, command, truncated: false, cancelled: false, blockers: [], summary: "Dry run only; command was not executed." };
+        return { executed: false, dryRun: true, background: input.background === true, command, truncated: false, cancelled: false, blockers: [], summary: "Dry run only; command was not executed." };
+      }
+      if (input.background === true) {
+        const taskId = await startBackground(command, cwd);
+        return {
+          executed: true,
+          dryRun: false,
+          background: true,
+          command,
+          taskId,
+          truncated: false,
+          cancelled: false,
+          blockers: [],
+          summary: `Background task started as ${taskId}; use manage_task to inspect or control it.`
+        };
       }
 
       // The executor OWNS the timeout now (ADR 2026-07-05): it kills the child on
@@ -119,6 +140,7 @@ export function createPiBashTool(options: PiBashToolOptions = { shellAllowlist: 
       return {
         executed: true,
         dryRun: false,
+        background: false,
         command,
         exitCode: result.exitCode,
         stdout: redacted ? "[redacted: sensitive output detected]" : stdout.value,
