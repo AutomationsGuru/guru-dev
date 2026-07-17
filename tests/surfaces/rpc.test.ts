@@ -17,6 +17,7 @@ import { clearRegisteredSecretValues } from "../../src/safety/secretSafety.js";
 import { createFileMemoryStore } from "../../src/memory/store.js";
 import type { AgentTurnResult } from "../../src/model/agentTurn.js";
 import { createHarnessRuntime } from "../../src/runtime/session.js";
+import { ProviderRouteDescriptorSchema, type ProviderRouteDescriptor } from "../../src/providers/schemas.js";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -25,11 +26,38 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-const route = { routeId: "stub/model", apiFamily: "openai-chat-completions", modelId: "m", capabilities: { supportsTools: true }, context: { contextWindowTokens: 128_000 } } as never;
+function modelRoute(
+  routeId: string,
+  modelId: string,
+  over: Record<string, unknown> = {}
+): ProviderRouteDescriptor {
+  return ProviderRouteDescriptorSchema.parse({
+    providerId: "stub",
+    routeId,
+    modelId,
+    routeType: "direct-api",
+    apiFamily: "openai-chat-completions",
+    status: "active",
+    directFirstRank: 0,
+    allowedRouterFallback: false,
+    capabilities: { supportsTools: true },
+    context: { contextWindowTokens: 128_000 },
+    ...over
+  });
+}
+
+const route = modelRoute("stub/model", "m");
 function stubRunner(over: { text?: string; tokens?: string[] } = {}): TurnRunner {
-  return (async (_r, _m, options) => {
+  return (async (turnRoute, _m, options) => {
     for (const chunk of over.tokens ?? []) options.onToken?.(chunk);
-    const result: AgentTurnResult = { text: over.text ?? "ok", modelId: "m", routeId: "stub/model", apiFamily: "openai-chat-completions", toolCallCount: 0, toolEvents: [] };
+    const result: AgentTurnResult = {
+      text: over.text ?? "ok",
+      modelId: turnRoute.modelId,
+      routeId: turnRoute.routeId,
+      apiFamily: turnRoute.apiFamily ?? "openai-chat-completions",
+      toolCallCount: 0,
+      toolEvents: []
+    };
     return result;
   }) as TurnRunner;
 }
@@ -381,7 +409,359 @@ describe("RPC dispatch — on the unified AgentSession engine", () => {
   });
 });
 
+describe("RPC model discovery and switching", () => {
+  const ctx = (session: AgentSession, routes: readonly ProviderRouteDescriptor[]): RpcContext => ({ session, routes, emit: () => {} });
+
+  it("keeps the legacy models response byte-for-byte compatible", async () => {
+    const routes = [route, modelRoute("stub/other", "other-model")];
+    const response = await dispatchRpc(RpcRequestSchema.parse({ id: "legacy", method: "models" }), ctx(makeSession(), routes));
+
+    expect(JSON.stringify(response)).toBe('{"id":"legacy","ok":true,"result":["stub/model","stub/other"]}');
+  });
+
+  it("get_available_models reports route identity plus active, chat-capable, and current usability truth without credential values", async () => {
+    const envName = "GURU_G788_RPC_TEST_KEY";
+    const credentialValue = "g788-test-only-credential-sentinel";
+    process.env[envName] = credentialValue;
+    try {
+      const credentialled = modelRoute("stub/credentialled", "credentialled-model", {
+        credentialSource: { type: "env-var", envVarName: envName, envVarNames: [] }
+      });
+      const nonChat = modelRoute("stub/non-chat", "non-chat-model", { apiFamily: "custom" });
+      const unusable = modelRoute("stub/unusable", "unusable-model", {
+        credentialSource: { type: "native-cli-token", envVarNames: [] }
+      });
+      const routes = [route, credentialled, nonChat, unusable];
+
+      const response = await dispatchRpc(RpcRequestSchema.parse({ method: "get_available_models" }), ctx(makeSession(), routes));
+
+      expect(response).toMatchObject({
+        ok: true,
+        result: [
+          {
+            providerId: "stub",
+            routeId: "stub/model",
+            modelId: "m",
+            apiFamily: "openai-chat-completions",
+            chatCapable: true,
+            usable: true,
+            active: true
+          },
+          {
+            providerId: "stub",
+            routeId: "stub/credentialled",
+            modelId: "credentialled-model",
+            apiFamily: "openai-chat-completions",
+            chatCapable: true,
+            usable: true,
+            active: false
+          },
+          {
+            providerId: "stub",
+            routeId: "stub/non-chat",
+            modelId: "non-chat-model",
+            apiFamily: "custom",
+            chatCapable: false,
+            usable: true,
+            active: false
+          },
+          {
+            providerId: "stub",
+            routeId: "stub/unusable",
+            modelId: "unusable-model",
+            apiFamily: "openai-chat-completions",
+            chatCapable: true,
+            usable: false,
+            active: false
+          }
+        ]
+      });
+      const serialized = JSON.stringify(response);
+      expect(serialized).not.toContain(credentialValue);
+      expect(serialized).not.toContain(envName);
+      expect(serialized).not.toContain("credentialSource");
+    } finally {
+      delete process.env[envName];
+    }
+  });
+
+  it("set_model selects one exact route and the next RPC prompt uses it", async () => {
+    const selected = modelRoute("stub/selected", "selected-model", { context: { contextWindowTokens: 64_000 } });
+    const seenRoutes: string[] = [];
+    const runner: TurnRunner = (async (turnRoute) => {
+      seenRoutes.push(turnRoute.routeId);
+      return {
+        text: `reply:${turnRoute.routeId}`,
+        modelId: turnRoute.modelId,
+        routeId: turnRoute.routeId,
+        apiFamily: turnRoute.apiFamily ?? "openai-chat-completions",
+        toolCallCount: 0,
+        toolEvents: []
+      } satisfies AgentTurnResult;
+    }) as TurnRunner;
+    const session = makeSession(runner);
+    const routes = [route, selected];
+
+    const switched = await dispatchRpc(
+      RpcRequestSchema.parse({ id: 7, method: "set_model", params: { routeId: "stub/selected" } }),
+      ctx(session, routes)
+    );
+
+    expect(switched).toEqual({
+      id: 7,
+      ok: true,
+      result: {
+        previous: { routeId: "stub/model", modelId: "m" },
+        current: { routeId: "stub/selected", modelId: "selected-model" }
+      }
+    });
+    expect(seenRoutes).toEqual([]);
+    expect(session.activeRoute).toBe(selected);
+    expect(session.stats().contextWindowTokens).toBe(64_000);
+
+    const prompt = await dispatchRpc(RpcRequestSchema.parse({ method: "prompt", params: { text: "after switch" } }), ctx(session, routes));
+    expect(prompt).toMatchObject({ ok: true, result: { text: "reply:stub/selected" } });
+    expect(seenRoutes).toEqual(["stub/selected"]);
+
+    const available = await dispatchRpc(RpcRequestSchema.parse({ method: "get_available_models" }), ctx(session, routes));
+    const rows = available.result as Array<{ routeId: string; active: boolean }>;
+    expect(rows.map((row) => [row.routeId, row.active])).toEqual([
+      ["stub/model", false],
+      ["stub/selected", true]
+    ]);
+  });
+
+  it("targets model discovery and switching at the active graph session", async () => {
+    const selected = modelRoute("stub/selected", "selected-model");
+    const seenRoutes: string[] = [];
+    const runner = (label: string) => (async (turnRoute) => {
+      seenRoutes.push(`${label}:${turnRoute.routeId}`);
+      return {
+        text: `${label}:${turnRoute.routeId}`,
+        modelId: turnRoute.modelId,
+        routeId: turnRoute.routeId,
+        apiFamily: turnRoute.apiFamily ?? "openai-chat-completions",
+        toolCallCount: 0,
+        toolEvents: []
+      } satisfies AgentTurnResult;
+    }) as TurnRunner;
+    const root = makeSession(runner("root"));
+    root.history.push({ role: "user", content: "fork here" });
+    const child = makeSession(runner("child"));
+    const graph = createRpcSessionGraph({
+      rootSessionId: "root",
+      rootSession: root,
+      createForkSession: async () => ({ sessionId: "child", session: child })
+    });
+    await graph.fork({ throughHistoryIndex: 0 });
+    const graphContext: RpcContext = {
+      session: root,
+      graph,
+      routes: [route, selected],
+      emit: () => {}
+    };
+
+    const switched = await dispatchRpc(
+      RpcRequestSchema.parse({ id: 20, method: "set_model", params: { routeId: "stub/selected" } }),
+      graphContext
+    );
+    const prompted = await dispatchRpc(
+      RpcRequestSchema.parse({ id: 21, method: "prompt", params: { text: "child turn" } }),
+      graphContext
+    );
+    const childDiscovery = await dispatchRpc(
+      RpcRequestSchema.parse({ id: 22, method: "get_available_models" }),
+      graphContext
+    );
+
+    expect(switched).toMatchObject({
+      id: 20,
+      ok: true,
+      result: {
+        previous: { routeId: "stub/model" },
+        current: { routeId: "stub/selected" }
+      }
+    });
+    expect(root.activeRoute).toBe(route);
+    expect(child.activeRoute).toBe(selected);
+    expect(prompted).toMatchObject({ id: 21, ok: true, result: { text: "child:stub/selected" } });
+    expect((childDiscovery.result as Array<{ routeId: string; active: boolean }>).map((row) => [row.routeId, row.active])).toEqual([
+      ["stub/model", false],
+      ["stub/selected", true]
+    ]);
+
+    await dispatchRpc(
+      RpcRequestSchema.parse({ id: 23, method: "switch_session", params: { sessionId: "root" } }),
+      graphContext
+    );
+    const rootDiscovery = await dispatchRpc(
+      RpcRequestSchema.parse({ id: 24, method: "get_available_models" }),
+      graphContext
+    );
+    expect((rootDiscovery.result as Array<{ routeId: string; active: boolean }>).map((row) => [row.routeId, row.active])).toEqual([
+      ["stub/model", true],
+      ["stub/selected", false]
+    ]);
+    expect(seenRoutes).toEqual(["child:stub/selected"]);
+  });
+
+  it("set_model rejects an unknown route without mutating the session or calling a model", async () => {
+    let calls = 0;
+    const runner: TurnRunner = (async () => {
+      calls += 1;
+      return { text: "unexpected", modelId: "m", routeId: "stub/model", apiFamily: "openai-chat-completions", toolCallCount: 0, toolEvents: [] };
+    }) as TurnRunner;
+    const session = makeSession(runner);
+    const historyBefore = structuredClone(session.history);
+    const statsBefore = session.stats();
+
+    const response = await dispatchRpc(
+      RpcRequestSchema.parse({ method: "set_model", params: { routeId: "stub/missing" } }),
+      ctx(session, [route])
+    );
+
+    expect(response).toMatchObject({ ok: false });
+    expect(String(response.error)).toMatch(/unknown.*route/i);
+    expect(session.activeRoute).toBe(route);
+    expect(session.history).toEqual(historyBefore);
+    expect(session.stats()).toEqual(statsBefore);
+    expect(calls).toBe(0);
+  });
+
+  it("set_model rejects a non-chat route without mutating the session or calling a model", async () => {
+    let calls = 0;
+    const runner: TurnRunner = (async () => {
+      calls += 1;
+      return { text: "unexpected", modelId: "m", routeId: "stub/model", apiFamily: "openai-chat-completions", toolCallCount: 0, toolEvents: [] };
+    }) as TurnRunner;
+    const session = makeSession(runner);
+    const nonChat = modelRoute("stub/non-chat", "non-chat-model", { apiFamily: "custom" });
+    const historyBefore = structuredClone(session.history);
+    const statsBefore = session.stats();
+
+    const response = await dispatchRpc(
+      RpcRequestSchema.parse({ method: "set_model", params: { routeId: "stub/non-chat" } }),
+      ctx(session, [route, nonChat])
+    );
+
+    expect(response).toMatchObject({ ok: false });
+    expect(String(response.error)).toMatch(/not chat-capable|non-chat/i);
+    expect(session.activeRoute).toBe(route);
+    expect(session.history).toEqual(historyBefore);
+    expect(session.stats()).toEqual(statsBefore);
+    expect(calls).toBe(0);
+  });
+
+  it("set_model rejects an unusable route without mutating the session or calling a model", async () => {
+    let calls = 0;
+    const runner: TurnRunner = (async () => {
+      calls += 1;
+      return { text: "unexpected", modelId: "m", routeId: "stub/model", apiFamily: "openai-chat-completions", toolCallCount: 0, toolEvents: [] };
+    }) as TurnRunner;
+    const session = makeSession(runner);
+    const unusable = modelRoute("stub/unusable", "unusable-model", {
+      credentialSource: { type: "native-cli-token", envVarNames: [] }
+    });
+    const historyBefore = structuredClone(session.history);
+    const statsBefore = session.stats();
+
+    const response = await dispatchRpc(
+      RpcRequestSchema.parse({ method: "set_model", params: { routeId: "stub/unusable" } }),
+      ctx(session, [route, unusable])
+    );
+
+    expect(response).toMatchObject({ ok: false });
+    expect(String(response.error)).toMatch(/not usable|unusable|credential/i);
+    expect(session.activeRoute).toBe(route);
+    expect(session.history).toEqual(historyBefore);
+    expect(session.stats()).toEqual(statsBefore);
+    expect(calls).toBe(0);
+  });
+
+  it("set_model requires a string routeId and leaves the session unchanged", async () => {
+    const session = makeSession();
+    const statsBefore = session.stats();
+    const missing = await dispatchRpc(RpcRequestSchema.parse({ method: "set_model" }), ctx(session, [route]));
+    const nonString = await dispatchRpc(
+      RpcRequestSchema.parse({ method: "set_model", params: { routeId: 42 } }),
+      ctx(session, [route])
+    );
+
+    expect(String(missing.error)).toMatch(/routeId.*required/i);
+    expect(String(nonString.error)).toMatch(/routeId.*string/i);
+    expect(session.activeRoute).toBe(route);
+    expect(session.history).toEqual([]);
+    expect(session.stats()).toEqual(statsBefore);
+  });
+
+  it("set_model returns a distinct busy error immediately and does not mutate an in-flight turn", async () => {
+    let release!: () => void;
+    let markStarted!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    const seenRoutes: string[] = [];
+    const runner: TurnRunner = (async (turnRoute) => {
+      seenRoutes.push(turnRoute.routeId);
+      markStarted();
+      await gate;
+      return {
+        text: "original done",
+        modelId: turnRoute.modelId,
+        routeId: turnRoute.routeId,
+        apiFamily: turnRoute.apiFamily ?? "openai-chat-completions",
+        toolCallCount: 0,
+        toolEvents: []
+      } satisfies AgentTurnResult;
+    }) as TurnRunner;
+    const selected = modelRoute("stub/selected", "selected-model");
+    const session = makeSession(runner);
+    const running = session.prompt("slow");
+    await started;
+    const historyBefore = structuredClone(session.history);
+    const statsBefore = session.stats();
+
+    const response = await dispatchRpc(
+      RpcRequestSchema.parse({ method: "set_model", params: { routeId: "stub/selected" } }),
+      ctx(session, [route, selected])
+    );
+
+    expect(response).toMatchObject({ ok: false });
+    expect(String(response.error)).toMatch(/busy/i);
+    expect(session.activeRoute).toBe(route);
+    expect(session.history).toEqual(historyBefore);
+    expect(session.stats()).toEqual(statsBefore);
+    expect(seenRoutes).toEqual(["stub/model"]);
+
+    release();
+    await running;
+    expect(seenRoutes).toEqual(["stub/model"]);
+  });
+});
+
 describe("runRpcMode — request ordering", () => {
+  it("advertises both model methods exactly once while preserving every legacy method", async () => {
+    const input = new PassThrough();
+    const output = new PassThrough();
+    let raw = "";
+    output.on("data", (chunk) => { raw += String(chunk); });
+    const run = runRpcMode({ session: makeSession(), routes: [route], input, output });
+    input.end();
+
+    await run;
+
+    const ready = raw
+      .split("\n")
+      .filter((line) => line.length > 0)
+      .map((line) => JSON.parse(line) as { event?: string; methods?: string[] })
+      .find((message) => message.event === "ready");
+    const expected = ["prompt", "steer", "follow_up", "abort", "state", "suit_up", "park", "models", "compaction", "get_tree", "fork", "switch_session", "get_available_models", "set_model"];
+    expect(ready).toBeDefined();
+    expect(ready?.methods).toHaveLength(expected.length);
+    for (const method of expected) {
+      expect(ready?.methods?.filter((candidate) => candidate === method)).toHaveLength(1);
+    }
+  });
+
   it("advertises compaction exactly once without reordering existing ready methods", async () => {
     const input = new PassThrough();
     const output = new PassThrough();
@@ -404,9 +784,90 @@ describe("runRpcMode — request ordering", () => {
       "compaction",
       "get_tree",
       "fork",
-      "switch_session"
+      "switch_session",
+      "get_available_models",
+      "set_model"
     ]);
     expect((ready?.methods as string[] | undefined)?.filter((method) => method === "compaction")).toHaveLength(1);
+  });
+
+  it("runs an earlier prompt before applying a later same-burst set_model", async () => {
+    const selected = modelRoute("stub/selected", "selected-model");
+    const seenRoutes: string[] = [];
+    const runner = (async (turnRoute) => {
+      seenRoutes.push(turnRoute.routeId);
+      return {
+        text: `reply:${turnRoute.routeId}`,
+        modelId: turnRoute.modelId,
+        routeId: turnRoute.routeId,
+        apiFamily: turnRoute.apiFamily ?? "openai-chat-completions",
+        toolCallCount: 0,
+        toolEvents: []
+      } satisfies AgentTurnResult;
+    }) as TurnRunner;
+    const session = makeSession(runner);
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const chunks: string[] = [];
+    output.on("data", (chunk) => chunks.push(String(chunk)));
+    const run = runRpcMode({ session, routes: [route, selected], input, output });
+
+    input.end([
+      JSON.stringify({ id: 1, method: "prompt", params: { text: "first" } }),
+      JSON.stringify({ id: 2, method: "set_model", params: { routeId: "stub/selected" } }),
+      ""
+    ].join("\n"));
+    await run;
+
+    const responses = parseRpcOutput(chunks).filter((message) => message.id !== undefined);
+    expect(seenRoutes).toEqual(["stub/model"]);
+    expect(responses.map((message) => message.id)).toEqual([1, 2]);
+    expect(responses[0]).toMatchObject({ id: 1, ok: true, result: { text: "reply:stub/model" } });
+    expect(responses[1]).toMatchObject({
+      id: 2,
+      ok: true,
+      result: { current: { routeId: "stub/selected", modelId: "selected-model" } }
+    });
+    expect(session.activeRoute).toBe(selected);
+  });
+
+  it("applies an earlier same-burst set_model before the next prompt", async () => {
+    const selected = modelRoute("stub/selected", "selected-model");
+    const seenRoutes: string[] = [];
+    const runner = (async (turnRoute) => {
+      seenRoutes.push(turnRoute.routeId);
+      return {
+        text: `reply:${turnRoute.routeId}`,
+        modelId: turnRoute.modelId,
+        routeId: turnRoute.routeId,
+        apiFamily: turnRoute.apiFamily ?? "openai-chat-completions",
+        toolCallCount: 0,
+        toolEvents: []
+      } satisfies AgentTurnResult;
+    }) as TurnRunner;
+    const session = makeSession(runner);
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const chunks: string[] = [];
+    output.on("data", (chunk) => chunks.push(String(chunk)));
+    const run = runRpcMode({ session, routes: [route, selected], input, output });
+
+    input.end([
+      JSON.stringify({ id: 3, method: "set_model", params: { routeId: "stub/selected" } }),
+      JSON.stringify({ id: 4, method: "prompt", params: { text: "after switch" } }),
+      ""
+    ].join("\n"));
+    await run;
+
+    const responses = parseRpcOutput(chunks).filter((message) => message.id !== undefined);
+    expect(seenRoutes).toEqual(["stub/selected"]);
+    expect(responses.map((message) => message.id)).toEqual([3, 4]);
+    expect(responses[0]).toMatchObject({
+      id: 3,
+      ok: true,
+      result: { current: { routeId: "stub/selected", modelId: "selected-model" } }
+    });
+    expect(responses[1]).toMatchObject({ id: 4, ok: true, result: { text: "reply:stub/selected" } });
   });
 
   it("wires bootstrapped operator questions through RPC without an injected AgentSession", async () => {

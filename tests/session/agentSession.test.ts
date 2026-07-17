@@ -9,13 +9,34 @@ import type { SummarizeRequest } from "../../src/compaction/engine.js";
 import type { ChatTurnMessage } from "../../src/model/directChat.js";
 import { createFileMemoryStore } from "../../src/memory/store.js";
 import type { AgentTurnResult } from "../../src/model/agentTurn.js";
+import { ProviderRouteDescriptorSchema, type ProviderRouteDescriptor } from "../../src/providers/schemas.js";
 
 const dirs: string[] = [];
 afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-const route = { routeId: "stub/model", apiFamily: "openai-chat-completions", modelId: "m", capabilities: { supportsTools: true }, context: { contextWindowTokens: 128_000 } } as never;
+function modelRoute(
+  routeId: string,
+  modelId: string,
+  over: Record<string, unknown> = {}
+): ProviderRouteDescriptor {
+  return ProviderRouteDescriptorSchema.parse({
+    providerId: "stub",
+    routeId,
+    modelId,
+    routeType: "direct-api",
+    apiFamily: "openai-chat-completions",
+    status: "active",
+    directFirstRank: 0,
+    allowedRouterFallback: false,
+    capabilities: { supportsTools: true },
+    context: { contextWindowTokens: 128_000 },
+    ...over
+  });
+}
+
+const route = modelRoute("stub/model", "m");
 const session = (repoRoot?: string) => ({ id: "s1", repo: repoRoot ? { repoRoot } : null, tools: [] }) as never;
 const EMPTY_MANDATE = { grants: [], denies: [] } as never;
 
@@ -215,6 +236,209 @@ describe("AgentSession — driveTurn (the TUI seam, v0.18b)", () => {
     await s.prompt("hey");
     expect(s.history.map((m) => m.role)).toEqual(["user", "assistant"]);
     expect(s.stats().turns).toBe(1);
+  });
+});
+
+describe("AgentSession — active route switching", () => {
+  it("uses the selected route, context budget, and tool capability on the next default turn", async () => {
+    const repoRoot = join(tmpdir(), `guru-as-route-${process.pid}-${dirs.length}`);
+    dirs.push(repoRoot);
+    mkdirSync(repoRoot, { recursive: true });
+    writeFileSync(join(repoRoot, "note.txt"), "ROUTE-CONTEXT-SENTINEL".repeat(16), "utf8");
+    const selected = modelRoute("stub/selected", "selected-model", {
+      capabilities: { supportsTools: false },
+      context: { contextWindowTokens: 16 }
+    });
+    let seenRoute: ProviderRouteDescriptor | undefined;
+    let seenPrompt = "";
+    let seenToolIds: readonly string[] = [];
+    const runner: TurnRunner = (async (turnRoute, messages, options) => {
+      seenRoute = turnRoute;
+      seenPrompt = messages.at(-1)?.content ?? "";
+      seenToolIds = options.tools.map((tool) => tool.id);
+      return {
+        text: "selected reply",
+        modelId: turnRoute.modelId,
+        routeId: turnRoute.routeId,
+        apiFamily: turnRoute.apiFamily ?? "openai-chat-completions",
+        toolCallCount: 0,
+        toolEvents: []
+      } satisfies AgentTurnResult;
+    }) as TurnRunner;
+    const s = makeSession({
+      session: session(repoRoot),
+      sessionTools: [{ id: "read" } as never],
+      runTurn: runner
+    });
+
+    expect(s.switchRoute(selected)).toEqual({
+      previous: { routeId: "stub/model", modelId: "m" },
+      current: { routeId: "stub/selected", modelId: "selected-model" }
+    });
+    expect(s.activeRoute).toBe(selected);
+    expect(s.stats().contextWindowTokens).toBe(16);
+
+    await s.prompt("inspect @note.txt");
+    expect(seenRoute).toBe(selected);
+    expect(seenPrompt).toBe("inspect @note.txt");
+    expect(seenPrompt).not.toContain("ROUTE-CONTEXT-SENTINEL");
+    expect(seenToolIds).toEqual([]);
+  });
+
+  it("drops a constructor model override when an exact route is selected", async () => {
+    const selected = modelRoute("stub/selected", "selected-model");
+    const seen: Array<{ routeId: string; routeModelId: string; modelIdOverride: string | undefined }> = [];
+    const runner: TurnRunner = (async (turnRoute, _messages, options) => {
+      seen.push({
+        routeId: turnRoute.routeId,
+        routeModelId: turnRoute.modelId,
+        modelIdOverride: options.modelIdOverride
+      });
+      return {
+        text: `reply:${turnRoute.routeId}`,
+        modelId: options.modelIdOverride ?? turnRoute.modelId,
+        routeId: turnRoute.routeId,
+        apiFamily: turnRoute.apiFamily ?? "openai-chat-completions",
+        toolCallCount: 0,
+        toolEvents: []
+      } satisfies AgentTurnResult;
+    }) as TurnRunner;
+    const s = makeSession({ modelIdOverride: "legacy-initial-override", runTurn: runner });
+
+    await s.prompt("before switch");
+    s.switchRoute(selected);
+    await s.prompt("after switch");
+
+    expect(seen).toEqual([
+      { routeId: "stub/model", routeModelId: "m", modelIdOverride: "legacy-initial-override" },
+      { routeId: "stub/selected", routeModelId: "selected-model", modelIdOverride: undefined }
+    ]);
+  });
+
+  it("preserves history, usage, queues, listeners, garage state, runtime session, tools, and mandate state", async () => {
+    const directory = join(tmpdir(), `guru-as-route-memory-${process.pid}-${dirs.length}`);
+    dirs.push(directory);
+    mkdirSync(directory, { recursive: true });
+    const memory = createFileMemoryStore({ directory, now: () => new Date(Date.UTC(2026, 6, 5)) });
+    const selected = modelRoute("stub/preserved", "preserved-model", { context: { contextWindowTokens: 64_000 } });
+    const runtimeSessionIds: string[] = [];
+    const toolIdsByTurn: string[][] = [];
+    const mandateDecisions: boolean[] = [];
+    const runtime = {
+      executeTool: async (sessionId: string, toolId: string) => {
+        runtimeSessionIds.push(`${sessionId}:${toolId}`);
+        return { toolId, status: "succeeded", startedAt: "t", endedAt: "t", durationMs: 0 };
+      }
+    } as never;
+    const runner: TurnRunner = (async (turnRoute, _messages, options) => {
+      toolIdsByTurn.push(options.tools.map((tool) => tool.id));
+      mandateDecisions.push(await options.approveTool("read", { path: "README.md" }));
+      await options.executeTool("read", { path: "README.md" });
+      return {
+        text: `reply:${turnRoute.routeId}`,
+        modelId: turnRoute.modelId,
+        routeId: turnRoute.routeId,
+        apiFamily: turnRoute.apiFamily ?? "openai-chat-completions",
+        toolCallCount: 0,
+        toolEvents: [],
+        usage: { inputTokens: 7, outputTokens: 3, lastRequestInputTokens: 5 }
+      } satisfies AgentTurnResult;
+    }) as TurnRunner;
+    const s = makeSession({
+      runtime,
+      session: { id: "preserved-session", repo: null, tools: [] } as never,
+      sessionTools: [{ id: "read" } as never],
+      memory,
+      runTurn: runner
+    });
+    expect(s.suitUp("preserved suit").suit?.slug).toBe("preserved-suit");
+    await s.prompt("before switch");
+    s.followUp("still queued");
+    let donePackets = 0;
+    s.subscribe("done.packet", () => { donePackets += 1; });
+    const historyRef = s.history;
+    const historyBefore = structuredClone(s.history);
+    const queueBefore = s.queueDepth();
+    const { contextWindowTokens: _oldContext, ...usageBefore } = s.stats();
+
+    s.switchRoute(selected);
+
+    expect(s.history).toBe(historyRef);
+    expect(s.history).toEqual(historyBefore);
+    const { contextWindowTokens: newContext, ...usageAfter } = s.stats();
+    expect(usageAfter).toEqual(usageBefore);
+    expect(newContext).toBe(64_000);
+    expect(s.queueDepth()).toBe(queueBefore);
+    expect(s.park()).not.toBeNull();
+
+    await s.prompt("after switch");
+    expect(donePackets).toBe(1);
+    expect(runtimeSessionIds).toEqual(["preserved-session:read", "preserved-session:read"]);
+    expect(toolIdsByTurn).toEqual([["read"], ["read"]]);
+    expect(mandateDecisions).toEqual([true, true]);
+    expect(s.queueDepth()).toBe(queueBefore);
+  });
+
+  it("rejects a route switch while a turn is active without mutating route, history, or usage", async () => {
+    let release!: () => void;
+    let markStarted!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    const seenRoutes: string[] = [];
+    const runner: TurnRunner = (async (turnRoute) => {
+      seenRoutes.push(turnRoute.routeId);
+      markStarted();
+      await gate;
+      return {
+        text: "done",
+        modelId: turnRoute.modelId,
+        routeId: turnRoute.routeId,
+        apiFamily: turnRoute.apiFamily ?? "openai-chat-completions",
+        toolCallCount: 0,
+        toolEvents: []
+      } satisfies AgentTurnResult;
+    }) as TurnRunner;
+    const s = makeSession({ runTurn: runner });
+    const running = s.prompt("slow turn");
+    await started;
+    const historyBefore = structuredClone(s.history);
+    const statsBefore = s.stats();
+
+    expect(() => s.switchRoute(modelRoute("stub/rejected", "rejected-model"))).toThrow(/running|active|busy/i);
+    expect(s.activeRoute).toBe(route);
+    expect(s.history).toEqual(historyBefore);
+    expect(s.stats()).toEqual(statsBefore);
+
+    release();
+    await running;
+    expect(seenRoutes).toEqual(["stub/model"]);
+  });
+
+  it("keeps a driver route override one-turn-only and returns to the selected route", async () => {
+    const selected = modelRoute("stub/selected", "selected-model", { context: { contextWindowTokens: 64_000 } });
+    const override = modelRoute("stub/override", "override-model", { context: { contextWindowTokens: 32_000 } });
+    const seenRoutes: string[] = [];
+    const runner: TurnRunner = (async (turnRoute) => {
+      seenRoutes.push(turnRoute.routeId);
+      return {
+        text: `reply:${turnRoute.routeId}`,
+        modelId: turnRoute.modelId,
+        routeId: turnRoute.routeId,
+        apiFamily: turnRoute.apiFamily ?? "openai-chat-completions",
+        toolCallCount: 0,
+        toolEvents: []
+      } satisfies AgentTurnResult;
+    }) as TurnRunner;
+    const s = makeSession({ runTurn: runner });
+    s.switchRoute(selected);
+
+    await s.driveTurn({ route: override });
+    expect(s.activeRoute).toBe(selected);
+    expect(s.stats().contextWindowTokens).toBe(64_000);
+    await s.prompt("default again");
+
+    expect(seenRoutes).toEqual(["stub/override", "stub/selected"]);
+    expect(s.activeRoute).toBe(selected);
   });
 });
 

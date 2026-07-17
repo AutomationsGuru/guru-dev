@@ -166,6 +166,8 @@ export class AgentSession {
   readonly history: ChatTurnMessage[] = [];
   private readonly deps: AgentSessionDeps;
   private readonly runTurn: TurnRunner;
+  private selectedRoute: ProviderRouteDescriptor;
+  private selectedModelIdOverride: string | null;
   private readonly listeners = new Map<AgentSessionEvent, Set<Listener<AgentSessionEvent>>>();
   private readonly steerQueue: QueuedSteer[] = [];
   private readonly toolsUsed = new Set<string>();
@@ -181,9 +183,31 @@ export class AgentSession {
   constructor(deps: AgentSessionDeps) {
     this.deps = deps;
     this.runTurn = deps.runTurn ?? directAgentTurn;
+    this.selectedRoute = deps.route;
+    this.selectedModelIdOverride = deps.modelIdOverride ?? null;
     if (deps.systemPrompt && deps.systemPrompt.length > 0) {
       this.history.push({ role: "system", content: deps.systemPrompt });
     }
+  }
+
+  get activeRoute(): ProviderRouteDescriptor {
+    return this.selectedRoute;
+  }
+
+  switchRoute(route: ProviderRouteDescriptor): {
+    readonly previous: { readonly routeId: string; readonly modelId: string };
+    readonly current: { readonly routeId: string; readonly modelId: string };
+  } {
+    if (this.currentAbort) {
+      throw new Error("AgentSession: session is busy; cannot switch routes while a turn is running.");
+    }
+    const previous = { routeId: this.selectedRoute.routeId, modelId: this.selectedRoute.modelId };
+    this.selectedRoute = route;
+    this.selectedModelIdOverride = null;
+    return {
+      previous,
+      current: { routeId: route.routeId, modelId: route.modelId }
+    };
   }
 
   // -- events --------------------------------------------------------------
@@ -294,7 +318,7 @@ export class AgentSession {
   }
 
   private offeredTools(): readonly ToolDefinition[] {
-    if (this.deps.route.capabilities?.supportsTools === false) {
+    if (this.selectedRoute.capabilities?.supportsTools === false) {
       return [];
     }
     const allowed = this.deps.offeredToolIds;
@@ -353,7 +377,7 @@ export class AgentSession {
     if (this.currentAbort) {
       throw new Error("AgentSession: a turn is already running — await it or call abort() first.");
     }
-    const route = driver.route ?? this.deps.route;
+    const route = driver.route ?? this.selectedRoute;
     const harnessSession = driver.session ?? this.deps.session;
     const readHistory = (): ChatTurnMessage[] => (driver.getHistory ? driver.getHistory() : this.history);
 
@@ -373,7 +397,7 @@ export class AgentSession {
     }
 
     const messages = driver.prepareMessages ? driver.prepareMessages(readHistory()) : readHistory();
-    const modelIdOverride = driver.modelIdOverride ?? this.deps.modelIdOverride ?? "";
+    const modelIdOverride = driver.modelIdOverride ?? this.selectedModelIdOverride ?? "";
     const retry = driver.retry ?? this.deps.retry;
     const startedAt = this.deps.now ? this.deps.now().getTime() : 0;
     // Abort + mid-run steer (§17 S13): a fresh controller per turn; steer-kind items
@@ -458,7 +482,7 @@ export class AgentSession {
       const expansion = expandReferences(text, {
         repoRoot: repo.repoRoot,
         baseTokens: Math.ceil(this.history.map((message) => message.content).join("").length / 4),
-        contextWindowTokens: this.deps.route.context?.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW
+        contextWindowTokens: this.selectedRoute.context?.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW
       });
       submitted = expansion.text;
     }
@@ -716,7 +740,7 @@ export class AgentSession {
       inputTokens: this.usage.inputTokens,
       outputTokens: this.usage.outputTokens,
       lastInputTokens: this.usage.lastInputTokens,
-      contextWindowTokens: this.deps.route.context?.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW,
+      contextWindowTokens: this.selectedRoute.context?.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW,
       historyLength: this.history.length
     };
   }
