@@ -9,9 +9,11 @@ import { createScheduleTool, type ScheduleToolOptions } from "./scheduleTool.js"
 import { createManageTaskTool, type ManageTaskToolOptions } from "./manageTaskTool.js";
 import { createReadDiagnosticsTool, type ReadDiagnosticsToolOptions } from "./readDiagnosticsTool.js";
 import { createLspTool, type LspToolOptions } from "./lspTool.js";
-import { manageBackgroundTask } from "./backgroundTaskRegistry.js";
+import { createMonitorTool, type MonitorToolOptions } from "./monitorTool.js";
+import {manageBackgroundTask, readBackgroundTaskLines} from "./backgroundTaskRegistry.js";
 
 export interface BaseToolFactoryOptions {
+  readonly monitor?: MonitorToolOptions;
   readonly read?: PiReadToolOptions;
   readonly write?: PiWriteToolOptions;
   readonly edit?: PiExactEditToolOptions;
@@ -43,6 +45,7 @@ export function createBaseTools(options: BaseToolFactoryOptions = {}): readonly 
   tools.push(createManageTaskTool(options.manageTask ?? { onManage: manageBackgroundTask }));
   tools.push(createReadDiagnosticsTool(options.readDiagnostics ?? {}));
   tools.push(createLspTool(options.lsp ?? {}));
+  tools.push(createMonitorTool(options.monitor ?? { onMonitor: readBackgroundTaskLines }));
 
   return tools;
 }

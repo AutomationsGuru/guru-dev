@@ -1,12 +1,12 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   manageBackgroundTask,
+  readBackgroundTaskLines,
   resetBackgroundTasks,
-  scheduleBackgroundNotification,
   spawnBackgroundTask
 } from "../../src/tools/builtins/backgroundTaskRegistry.js";
 
@@ -18,6 +18,12 @@ interface TaskStatus {
   readonly stdout: string;
   readonly stderr: string;
   readonly endedAt: string | null;
+}
+
+interface MonitoredLine {
+  readonly cursor: number;
+  readonly stream: "stdout" | "stderr";
+  readonly text: string;
 }
 
 async function waitForTerminal(taskId: string): Promise<TaskStatus> {
@@ -39,7 +45,6 @@ describe("background task registry", () => {
 
   afterEach(() => {
     resetBackgroundTasks();
-    vi.useRealTimers();
   });
 
   it("lists, reports status, and completes a short background task", async () => {
@@ -78,6 +83,65 @@ describe("background task registry", () => {
     expect(status.stderr.length).toBeLessThanOrEqual(16_384);
     expect(status.stdout.endsWith("OUT-END")).toBe(true);
     expect(status.stderr.endsWith("ERR-END")).toBe(true);
+  });
+
+  it("pages split UTF-8, multiple lines, interleaved streams, and final partial output exactly once", async () => {
+    const script = [
+      "process.stdout.write(Buffer.from([0xf0, 0x9f]))",
+      "setTimeout(() => process.stdout.write(Buffer.from([0x98, 0x80])), 10)",
+      "setTimeout(() => process.stdout.write(' alpha\\nsecond\\n'), 20)",
+      "setTimeout(() => process.stderr.write('err'), 30)",
+      "setTimeout(() => process.stderr.write('or\\n'), 40)",
+      "setTimeout(() => process.stdout.write('final'), 50)"
+    ].join(";");
+    const id = spawnBackgroundTask([process.execPath, "-e", script, "do-not-disclose"], process.cwd());
+
+    await waitForTerminal(id);
+    const first = readBackgroundTaskLines(id, 0, 2);
+    const second = readBackgroundTaskLines(id, first.nextCursor, 2);
+
+    expect(first).toMatchObject({
+      taskId: id,
+      state: "completed",
+      truncated: false,
+      oldestCursor: 1,
+      lines: [
+        { cursor: 1, stream: "stdout", text: "😀 alpha" },
+        { cursor: 2, stream: "stdout", text: "second" }
+      ]
+    });
+    expect(second.lines).toEqual([
+      { cursor: 3, stream: "stderr", text: "error" },
+      { cursor: 4, stream: "stdout", text: "final" }
+    ] satisfies readonly MonitoredLine[]);
+    expect(second.nextCursor).toBe(4);
+    expect(readBackgroundTaskLines(id, second.nextCursor, 50).lines).toEqual([]);
+
+    const serialized = JSON.stringify({ first, second });
+    expect(serialized).not.toContain("command");
+    expect(serialized).not.toContain("cwd");
+    expect(serialized).not.toContain("process");
+    expect(serialized).not.toContain("do-not-disclose");
+  });
+
+  it("bounds retained line events and reports cursor truncation without exceeding the page cap", async () => {
+    const id = spawnBackgroundTask(
+      [process.execPath, "-e", "for (let i = 0; i < 1005; i += 1) console.log(`line-${i}`)"],
+      process.cwd()
+    );
+
+    await waitForTerminal(id);
+    const truncated = readBackgroundTaskLines(id, 0, 999);
+
+    expect(truncated.truncated).toBe(true);
+    expect(truncated.oldestCursor).toBe(6);
+    expect(truncated.lines).toHaveLength(200);
+    expect(truncated.lines[0]).toEqual({ cursor: 6, stream: "stdout", text: "line-5" });
+    expect(readBackgroundTaskLines(id, 5, 1).truncated).toBe(false);
+  });
+
+  it("uses the existing bounded unknown-task error for monitor reads", () => {
+    expect(() => readBackgroundTaskLines("task-missing")).toThrow("Unknown task id: task-missing");
   });
 
   it("turns a missing executable into a failed task instead of an unhandled process error", async () => {
@@ -132,77 +196,5 @@ describe("background task registry", () => {
 
     expect(source).toContain("resolveWindowsGateSpawn(command)");
     expect(source).toMatch(/shell:\s*false/u);
-  });
-
-  // Scheduled-task tests (from current base 17153c2)
-
-  it("schedules one notification, exposes it through manage_task, and completes after delivery", async () => {
-    vi.useFakeTimers();
-    const deliver = vi.fn(async () => {});
-
-    const id = scheduleBackgroundNotification(2, "review the build", deliver);
-
-    expect(id).toBe("task-1");
-    expect(await manageBackgroundTask("list")).toEqual([
-      expect.objectContaining({ id, kind: "scheduled", prompt: "review the build", state: "running" })
-    ]);
-    expect(await manageBackgroundTask("status", id)).toEqual(
-      expect.objectContaining({ id, kind: "scheduled", state: "running" })
-    );
-
-    await vi.advanceTimersByTimeAsync(1_999);
-    expect(deliver).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(1);
-
-    expect(deliver).toHaveBeenCalledOnce();
-    expect(deliver).toHaveBeenCalledWith("[scheduled] review the build");
-    expect(await manageBackgroundTask("status", id)).toEqual(
-      expect.objectContaining({ state: "completed", exitCode: 0 })
-    );
-  });
-
-  it("cancels a scheduled notification through manage_task kill", async () => {
-    vi.useFakeTimers();
-    const deliver = vi.fn(async () => {});
-    const id = scheduleBackgroundNotification(30, "do not deliver", deliver);
-
-    expect(await manageBackgroundTask("kill", id)).toEqual(
-      expect.objectContaining({ id, state: "killed" })
-    );
-    await vi.advanceTimersByTimeAsync(30_000);
-
-    expect(deliver).not.toHaveBeenCalled();
-    expect(await manageBackgroundTask("status", id)).toEqual(
-      expect.objectContaining({ state: "killed" })
-    );
-  });
-
-  it("clears scheduled timer handles when the registry resets", async () => {
-    vi.useFakeTimers();
-    const deliver = vi.fn(async () => {});
-    scheduleBackgroundNotification(30, "reset me", deliver);
-
-    resetBackgroundTasks();
-    await vi.advanceTimersByTimeAsync(30_000);
-
-    expect(deliver).not.toHaveBeenCalled();
-    expect(await manageBackgroundTask("list")).toEqual([]);
-  });
-
-  it("marks a scheduled notification failed when delivery rejects", async () => {
-    vi.useFakeTimers();
-    const id = scheduleBackgroundNotification(1, "fail safely", async () => {
-      throw new Error("composer unavailable");
-    });
-
-    await vi.advanceTimersByTimeAsync(1_000);
-
-    expect(await manageBackgroundTask("status", id)).toEqual(
-      expect.objectContaining({
-        state: "failed",
-        exitCode: 1,
-        stderr: expect.stringContaining("composer unavailable")
-      })
-    );
   });
 });

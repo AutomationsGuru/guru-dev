@@ -17,19 +17,7 @@ describe("base tools", () => {
 
   afterEach(async () => {
     resetBackgroundTasks();
-    // Windows may keep a short lock on the temp cwd after killing a background child.
-    for (let attempt = 0; attempt < 8; attempt += 1) {
-      try {
-        await rm(repoRoot, { recursive: true, force: true });
-        return;
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        if ((code !== "EBUSY" && code !== "EPERM" && code !== "ENOTEMPTY") || attempt === 7) {
-          throw error;
-        }
-        await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
-      }
-    }
+    await rm(repoRoot, { recursive: true, force: true });
   });
 
   it("should read with offset and limit", async () => {
@@ -118,7 +106,7 @@ describe("base tools", () => {
     const launched = await executeRegisteredTool(registry, "bash", {
       repoRoot,
       command: process.execPath,
-      args: ["-e", "setTimeout(() => {}, 10_000)"],
+      args: ["-e", "console.log('ready'); setTimeout(() => {}, 10_000)"],
       background: true,
       dryRun: false
     });
@@ -137,7 +125,7 @@ describe("base tools", () => {
       executed: true,
       background: true,
       taskId: expect.stringMatching(/^task-/u),
-      command: [process.execPath, "-e", "setTimeout(() => {}, 10_000)"]
+      command: [process.execPath, "-e", "console.log('ready'); setTimeout(() => {}, 10_000)"]
     });
     expect(launchOutput).not.toHaveProperty("exitCode");
     expect(launchOutput).not.toHaveProperty("stdout");
@@ -150,7 +138,81 @@ describe("base tools", () => {
 
     const status = await executeRegisteredTool(registry, "manage_task", { Action: "status", TaskId: launchOutput.taskId });
     expect(status.output).toMatchObject({ result: { id: launchOutput.taskId, state: "running" } });
+
+    let monitor = await executeRegisteredTool(registry, "monitor", { TaskId: launchOutput.taskId });
+    const deadline = Date.now() + 2_000;
+    while (
+      Date.now() < deadline &&
+      ((monitor.output as { lines?: readonly unknown[] } | undefined)?.lines?.length ?? 0) === 0
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      monitor = await executeRegisteredTool(registry, "monitor", { TaskId: launchOutput.taskId });
+    }
+    expect(monitor.status).toBe("succeeded");
+    expect(monitor.output).toMatchObject({
+      taskId: launchOutput.taskId,
+      lines: [{ cursor: 1, stream: "stdout", text: "ready" }],
+      nextCursor: 1,
+      truncated: false
+    });
+    expect(monitor.output).not.toHaveProperty("command");
+    expect(monitor.output).not.toHaveProperty("cwd");
     await executeRegisteredTool(registry, "manage_task", { Action: "kill", TaskId: launchOutput.taskId });
+  });
+
+  it("pages a deterministic real child through monitor without exposing launch metadata", async () => {
+    const registry = createToolRegistry(createBaseTools({ bash: { shellAllowlist: [process.execPath] } }));
+    const script = [
+      "process.stdout.write('out')",
+      "setTimeout(() => process.stdout.write('put-one\\noutput-two\\n'), 10)",
+      "setTimeout(() => process.stderr.write('error-one\\n'), 20)",
+      "setTimeout(() => process.stdout.write('final-partial'), 30)"
+    ].join(";");
+    const launched = await executeRegisteredTool(registry, "bash", {
+      repoRoot,
+      command: process.execPath,
+      args: ["-e", script, "private-launch-argument"],
+      background: true,
+      dryRun: false
+    });
+    const taskId = (launched.output as { readonly taskId?: string }).taskId;
+    expect(taskId).toMatch(/^task-/u);
+
+    const deadline = Date.now() + 5_000;
+    let completed = await executeRegisteredTool(registry, "monitor", { TaskId: taskId, MaxLines: 200 });
+    while (
+      Date.now() < deadline &&
+      (completed.output as { readonly state?: string } | undefined)?.state === "running"
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      completed = await executeRegisteredTool(registry, "monitor", { TaskId: taskId, MaxLines: 200 });
+    }
+    expect(completed.output).toMatchObject({ state: "completed" });
+
+    const first = await executeRegisteredTool(registry, "monitor", { TaskId: taskId, MaxLines: 2 });
+    const firstOutput = first.output as { readonly lines: readonly unknown[]; readonly nextCursor: number };
+    const second = await executeRegisteredTool(registry, "monitor", {
+      TaskId: taskId,
+      AfterCursor: firstOutput.nextCursor,
+      MaxLines: 2
+    });
+    expect(firstOutput.lines).toEqual([
+      { cursor: 1, stream: "stdout", text: "output-one" },
+      { cursor: 2, stream: "stdout", text: "output-two" }
+    ]);
+    expect(second.output).toMatchObject({
+      lines: [
+        { cursor: 3, stream: "stderr", text: "error-one" },
+        { cursor: 4, stream: "stdout", text: "final-partial" }
+      ],
+      nextCursor: 4,
+      truncated: false
+    });
+    const serialized = JSON.stringify({ first: first.output, second: second.output });
+    expect(serialized).not.toContain("command");
+    expect(serialized).not.toContain("cwd");
+    expect(serialized).not.toContain("environment");
+    expect(serialized).not.toContain("private-launch-argument");
   });
 });
 
@@ -239,7 +301,7 @@ describe("bash full-command-line handling (shakedown fixes)", () => {
     const shared = {
       repoRoot: process.cwd(),
       command: 'node -e "console.log(1)"',
-      args: [] as string[],
+      args: [],
       timeoutMs: 5000,
       maxOutputBytes: 64000,
       dryRun: false
@@ -540,5 +602,27 @@ describe("parity tools (askQuestion)", () => {
     const obs = await executeRegisteredTool(registry, "manage_task", { Action: "status", TaskId: "t1" });
     expect(obs.status).toBe("succeeded");
     expect(obs.output).toMatchObject({ result: "status on t1" });
+  });
+
+  it("should execute monitor tool when callback is provided", async () => {
+    const registry = createToolRegistry(createBaseTools({
+      monitor: {
+        onMonitor: async (taskId, afterCursor, maxLines) => ({
+          taskId,
+          state: "running",
+          lines: [{ cursor: 8, stream: "stdout", text: `${afterCursor}:${maxLines}` }],
+          nextCursor: 8,
+          truncated: false,
+          oldestCursor: 8
+        })
+      }
+    }));
+
+    const obs = await executeRegisteredTool(registry, "monitor", { TaskId: "t1", AfterCursor: 7, MaxLines: 20 });
+    expect(obs.status).toBe("succeeded");
+    expect(obs.output).toMatchObject({
+      taskId: "t1",
+      lines: [{ cursor: 8, stream: "stdout", text: "7:20" }]
+    });
   });
 });
