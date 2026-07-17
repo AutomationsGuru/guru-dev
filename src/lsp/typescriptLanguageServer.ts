@@ -344,11 +344,11 @@ function protocolRange(value: unknown): TypeScriptLanguageServerRange | null {
   return start && end ? { start, end } : null;
 }
 
-function normalizeLocation(
+async function normalizeLocation(
   value: unknown,
   repoRoot: string,
   platform: NodeJS.Platform = process.platform
-): TypeScriptLanguageServerLocation | null {
+): Promise<TypeScriptLanguageServerLocation | null> {
   const record = asRecord(value);
   if (!record) return null;
   const uri = typeof record.targetUri === "string"
@@ -360,9 +360,21 @@ function normalizeLocation(
   if (!uri || !range) return null;
 
   try {
-    const targetPath = lspFileUriToPath(uri, platform);
-    if (isContained(repoRoot, targetPath, platform)) {
-      return { path: repoRelativePath(repoRoot, targetPath, platform), range };
+    let targetPath = lspFileUriToPath(uri, platform);
+    // realpath both sides so Windows 8.3 short paths match long repo roots.
+    try {
+      targetPath = await realpath(targetPath);
+    } catch {
+      // keep decoded path
+    }
+    let root = repoRoot;
+    try {
+      root = await realpath(repoRoot);
+    } catch {
+      // keep prepared root
+    }
+    if (isContained(root, targetPath, platform)) {
+      return { path: repoRelativePath(root, targetPath, platform), range };
     }
   } catch {
     // Non-file and malformed external URIs remain URI-labelled below.
@@ -370,15 +382,15 @@ function normalizeLocation(
   return { uri: sanitizeText(uri, MAX_URI_CHARS), range };
 }
 
-function normalizeLocations(
+async function normalizeLocations(
   value: unknown,
   repoRoot: string,
   maxLocations: number
-): readonly TypeScriptLanguageServerLocation[] {
+): Promise<readonly TypeScriptLanguageServerLocation[]> {
   const raw = value == null ? [] : Array.isArray(value) ? value : [value];
   const locations: TypeScriptLanguageServerLocation[] = [];
   for (const candidate of raw) {
-    const normalized = normalizeLocation(candidate, repoRoot);
+    const normalized = await normalizeLocation(candidate, repoRoot);
     if (normalized) locations.push(normalized);
     if (locations.length >= maxLocations) break;
   }
@@ -568,7 +580,7 @@ export function createTypeScriptLanguageServerAdapter(
           { textDocument: { uri: document.uri }, position: position(input) },
           waitOptions(input.signal, requestTimeoutMs)
         );
-        return normalizeLocations(result, document.repoRoot, maxLocations);
+        return await normalizeLocations(result, document.repoRoot, maxLocations);
       });
     },
 
@@ -583,7 +595,7 @@ export function createTypeScriptLanguageServerAdapter(
           },
           waitOptions(input.signal, requestTimeoutMs)
         );
-        return normalizeLocations(result, document.repoRoot, maxLocations);
+        return await normalizeLocations(result, document.repoRoot, maxLocations);
       });
     },
 
