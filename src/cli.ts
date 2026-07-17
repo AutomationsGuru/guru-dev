@@ -26,6 +26,7 @@ import { createMandateStore } from "./mandates/store.js";
 import { buildDevCyclePlan, renderDevCyclePlan } from "./selfbuild/devCyclePlan.js";
 import { makeAskModelFromRoute, routeFromPlannerConfig } from "./selfbuild/askModelAdapter.js";
 import { makeSmokeDeps } from "./selfbuild/smokeDeps.js";
+import { commandExists } from "./review/gates.js";
 import { createFileMemoryStore } from "./memory/store.js";
 import { normalizeKnownPathFields } from "./runtime/pathNormalization.js";
 import { startHarnessApiServer } from "./surfaces/api.js";
@@ -272,19 +273,27 @@ if (command === "self-build-plan") {
   const cwd = getFlagValue(args, "--cwd") ?? process.cwd();
   const taskId = getFlagValue(args, "--task-id");
   const configPath = getFlagValue(args, "--config");
+  const devCycleConfig = loadHarnessConfig({ cwd, ...(configPath ? { configPath } : {}) }).config;
+  const plannerModel = devCycleConfig.plannerModel;
+  const keyPresent = plannerModel !== undefined && Boolean(process.env[plannerModel.apiKeyEnvVar]);
 
   if (hasFlag(args, "--dry-run")) {
-    // Preview only — no model call, no gate run, no mutation.
-    const plan = buildDevCyclePlan({ cwd, ...(taskId ? { taskId } : {}) });
+    // Preview only — reflect live wiring without constructing a provider adapter,
+    // calling a model, running a gate/smoke/git command, or mutating anything.
+    const plan = buildDevCyclePlan({
+      cwd,
+      ...(taskId ? { taskId } : {}),
+      hasSmoke: true,
+      hasReviewer: keyPresent,
+      hasGitDelivery: commandExists("git")
+    });
     console.log(renderDevCyclePlan(plan));
     process.exit(0);
   }
 
   // Build a live reviewer askModel from the configured model ONLY when its key is present in
-  // the environment (presence check — the value is never read here). Absent → REVIEW is YELLOW.
-  const devCycleConfig = loadHarnessConfig({ cwd, ...(configPath ? { configPath } : {}) }).config;
-  const plannerModel = devCycleConfig.plannerModel;
-  const keyPresent = plannerModel !== undefined && (process.env[plannerModel.apiKeyEnvVar] ?? "").length > 0;
+  // the environment (presence check — the value is never printed, persisted, or sent here).
+  // Absent → REVIEW is YELLOW.
   const askModel = plannerModel && keyPresent ? makeAskModelFromRoute(routeFromPlannerConfig(plannerModel), { env: process.env }) : undefined;
 
   const executorOptions = {
