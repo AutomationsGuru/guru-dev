@@ -1,9 +1,3 @@
-/**
- * Chat memory slash commands + boot injection. Honcho turn logging: when
- * `memory.honcho.syncOnTurn` is enabled, `recordTurn` calls `honcho_log_turn`
- * via the runtime tool registry (background, non-blocking) — not via
- * `GURU_CHAT_TOOL_IDS` model surface. See `main/README.md` Memory + gaps **G663**.
- */
 import type { MemoryConfig, MemoryStorageConfig } from "../config/schema.js";
 import type { Learning } from "../garage/flywheel.js";
 import { loadLearnings } from "../garage/flywheelStore.js";
@@ -13,6 +7,7 @@ import {
   type FactInjectionSource,
   type LearningInjectionSource
 } from "../memory/inject.js";
+import { searchMemoryEntries, type MemoryFactEntry } from "../memory/policy.js";
 import { createMarkdownMemoryStore, type MemoryFactStore } from "../memory/provider.js";
 import { buildRecallIndex, queryRecall } from "../memory/recall.js";
 import { MEMORY_SCOPES, createScopedMemory, type MemoryScope, type ScopedMemoryOptions } from "../memory/scopes.js";
@@ -74,12 +69,16 @@ export interface MemorySessionService {
   readonly injectedLearningIds: readonly string[];
   readonly providerLabel: "Markdown" | "PostgreSQL";
   readonly storageDescription: string;
+  /** Selected-provider facts cached by the latest successful refresh (picker only). */
+  readonly referenceFacts: readonly MemoryFactEntry[];
   bindRepoRoot(repoRoot: string | null): void;
   bindRole(roleSlug: string | null): void;
   localStoreFor(scope: MemoryScope): FileMemoryStore | null;
   composeSystemPrompt(basePrompt: string): string;
   briefingLines(honcho: Pick<MemoryHonchoStatus, "status" | "summary">): readonly string[];
   refresh(options?: MemoryRefreshOptions): Promise<string>;
+  /** Resolve full selected-provider fact bodies through the shared search policy. */
+  resolveFacts(query: string, limit?: number): Promise<readonly MemoryFactEntry[]>;
   honchoStatus(context?: MemoryToolContext): Promise<MemoryHonchoStatus>;
   recordTurn(context: MemoryToolContext | undefined, userSummary: string, assistantSummary: string): void;
   runCommand(command: MemorySlashCommand, args: readonly string[], context?: MemoryToolContext): Promise<MemoryCommandResult>;
@@ -135,6 +134,7 @@ export function createMemorySessionService(options: MemorySessionServiceOptions)
   let injectedLearningIds: readonly string[] = [];
   let injectedLearningPreview: readonly Learning[] = [];
   let canonicalFactCount = 0;
+  let referenceFacts: readonly MemoryFactEntry[] = [];
 
   const markdownFacade = (store: FileMemoryStore): MemoryFactStore => {
     if (store === options.baseStore && options.configuredStore.provider === "markdown") {
@@ -169,6 +169,33 @@ export function createMemorySessionService(options: MemorySessionServiceOptions)
     return sources;
   };
 
+  /** Most-specific active scope wins when the same fact name appears twice. */
+  const mergeSelectedFacts = (sources: readonly FactInjectionSource[]): readonly MemoryFactEntry[] => {
+    const merged = new Map<string, MemoryFactEntry>();
+    for (const { entries } of sources) {
+      for (const entry of entries) {
+        if (entry.fact.type !== "learning") merged.set(entry.fact.name, entry);
+      }
+    }
+    return [...merged.values()];
+  };
+
+  const resolveFacts = async (query: string, requestedLimit = 6): Promise<readonly MemoryFactEntry[]> => {
+    const terms = query.trim();
+    if (terms.length === 0) return [];
+    const limit = Math.max(1, Math.min(20, Math.floor(requestedLimit)));
+    const sources: FactInjectionSource[] = await Promise.all(
+      activeFactStores().map(async ({ scope, store }) => ({ scope, entries: await store.list() }))
+    );
+    const entries = mergeSelectedFacts(sources);
+    const hits = searchMemoryEntries({ terms, limit }, entries).hits;
+    const byName = new Map(entries.map((entry) => [entry.fact.name, entry]));
+    return hits.flatMap((hit) => {
+      const found = byName.get(hit.name);
+      return found ? [found] : [];
+    });
+  };
+
   const refresh = async (refreshOptions: MemoryRefreshOptions = {}): Promise<string> => {
     honchoBlock = "";
     try {
@@ -188,6 +215,7 @@ export function createMemorySessionService(options: MemorySessionServiceOptions)
       }
       canonicalBlock = injection.block;
       canonicalFactCount = factSources.reduce((sum, source) => sum + source.entries.length, 0);
+      referenceFacts = mergeSelectedFacts(factSources);
       injectedLearningIds = injection.injectedLearningIds;
       injectedLearningPreview = injectedLearningIds.flatMap((id) => {
         const learning = learningById.get(id);
@@ -201,6 +229,7 @@ export function createMemorySessionService(options: MemorySessionServiceOptions)
         canonicalFactCount = 0;
         injectedLearningIds = [];
         injectedLearningPreview = [];
+        referenceFacts = [];
       }
     }
     const honcho = options.memoryConfig.honcho;
@@ -497,6 +526,9 @@ export function createMemorySessionService(options: MemorySessionServiceOptions)
     get storageDescription() {
       return describeMemoryStorage(options.memoryConfig.storage);
     },
+    get referenceFacts() {
+      return referenceFacts;
+    },
     bindRepoRoot(repoRoot) {
       scoped.setRepoRoot(repoRoot);
     },
@@ -521,6 +553,7 @@ export function createMemorySessionService(options: MemorySessionServiceOptions)
       return lines;
     },
     refresh,
+    resolveFacts,
     honchoStatus,
     recordTurn,
     async runCommand(command, args, context) {

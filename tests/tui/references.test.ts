@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 import { afterAll, describe, expect, it } from "vitest";
 
-import { expandReferences } from "../../src/tui/references.js";
+import { expandInteractiveReferences, expandReferences } from "../../src/tui/references.js";
 import { clearRegisteredSecretValues, registerSecretValue } from "../../src/safety/secretSafety.js";
 
 const root = join(tmpdir(), `guru-refs-${process.pid}`);
@@ -18,7 +18,7 @@ afterAll(() => {
   clearRegisteredSecretValues();
 });
 
-const opts = (over: object = {}) => ({ repoRoot: root, baseTokens: 0, contextWindowTokens: 128_000, ...over });
+const opts = <T extends object>(over?: T) => ({ repoRoot: root, baseTokens: 0, contextWindowTokens: 128_000, ...(over ?? {}) });
 
 describe("expandReferences", () => {
   it("no @ tokens → text unchanged, no notices", () => {
@@ -95,5 +95,73 @@ describe("expandReferences", () => {
     expect(result.text).not.toContain("SECRET-OUTSIDE-CONTENT");
     expect(result.notices.some((notice) => notice.includes("outside"))).toBe(true);
     rmSync(outside, { force: true });
+  });
+
+  it("leaves virtual tokens for the interactive resolver without duplicate file-not-found notices", () => {
+    const result = expandReferences("@terminal @session:saved", opts());
+    expect(result.text).toBe("@terminal @session:saved");
+    expect(result.notices).toEqual([]);
+  });
+});
+
+describe("expandInteractiveReferences", () => {
+  const providers = {
+    sessionSummary: async (id: string) => (id === "saved" ? "stored branch summary" : null),
+    memoryFacts: async (query: string) => (query === "oauth" ? "OAuth fact body" : null),
+    stagedDiff: async () => "diff --git a/a.ts b/a.ts",
+    terminalTail: async () => "npm test\n42 passed"
+  };
+
+  it("expands all four exact forms, preserves punctuation, and handles a mixed file reference in document order", async () => {
+    const result = await expandInteractiveReferences(
+      "@session:saved, @src/small.ts @memory:oauth. @git-changes: @terminal)",
+      { ...opts(), providers }
+    );
+
+    expect(result.notices).toEqual([]);
+    expect(result.text).toContain("stored branch summary");
+    expect(result.text).toContain("export const x = 1;");
+    expect(result.text).toContain("OAuth fact body");
+    expect(result.text).toContain("diff --git a/a.ts b/a.ts");
+    expect(result.text).toContain("npm test\n42 passed");
+    expect(result.text.indexOf("stored branch summary")).toBeLessThan(result.text.indexOf("export const x = 1;"));
+    expect(result.text).toMatch(/`````\n,/u);
+    expect(result.text).toMatch(/`````\n\./u);
+    expect(result.text).toMatch(/`````\n:/u);
+    expect(result.text).toMatch(/`````\n\)/u);
+  });
+
+  it("leaves an unavailable source literal and emits exactly one deterministic notice", async () => {
+    const result = await expandInteractiveReferences("inspect @session:missing", { ...opts(), providers });
+    expect(result.text).toBe("inspect @session:missing");
+    expect(result.notices).toEqual(["@session:missing skipped: session not found"]);
+  });
+
+  it("secret-scrubs and per-result truncates virtual content", async () => {
+    registerSecretValue("sk-virtual-secret-value-1234");
+    const result = await expandInteractiveReferences(
+      "@terminal",
+      {
+        ...opts(),
+        providers: { ...providers, terminalTail: async () => `head sk-virtual-secret-value-1234 ${"z".repeat(200)} tail` },
+        maxReferenceBytes: 64
+      }
+    );
+    expect(result.text).not.toContain("sk-virtual-secret-value-1234");
+    expect(result.text).toContain("redacted");
+    expect(result.text).toContain("bytes truncated");
+    expect(result.notices).toEqual(["@terminal truncated to ~1KB (head+tail)"]);
+  });
+
+  it("applies one aggregate 80%-of-context budget across mixed references", async () => {
+    const result = await expandInteractiveReferences(
+      "@session:saved @src/small.ts",
+      { ...opts(), providers, contextWindowTokens: 30, estimateTokens: () => 20 }
+    );
+    expect(result.text).toContain("stored branch summary");
+    expect(result.text).toContain("@src/small.ts");
+    expect(result.notices).toEqual([
+      "@src/small.ts skipped: expansion would exceed ~80% of the context window — reference specific lines instead"
+    ]);
   });
 });

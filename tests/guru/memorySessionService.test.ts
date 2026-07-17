@@ -30,9 +30,9 @@ afterEach(() => {
   }
 });
 
-function entry(name: string, title: string, description: string): MemoryFactEntry {
+function entry(name: string, title: string, description: string, body = description): MemoryFactEntry {
   const stamp = "2026-07-14T00:00:00.000Z";
-  return { fact: { name, title, description, type: "project", createdAt: stamp, updatedAt: stamp, confidence: 1 }, body: description };
+  return { fact: { name, title, description, type: "project", createdAt: stamp, updatedAt: stamp, confidence: 1 }, body };
 }
 
 function fakeStore(provider: "markdown" | "postgres", list: () => Promise<readonly MemoryFactEntry[]>): MemoryFactStore {
@@ -62,6 +62,28 @@ function fakeStore(provider: "markdown" | "postgres", list: () => Promise<readon
 }
 
 describe("memory session service", () => {
+  it("resolves bounded full fact bodies from the selected PostgreSQL provider without Markdown fallback", async () => {
+    const root = freshRoot();
+    const base = createFileMemoryStore({ directory: join(root, "local") });
+    base.remember({ name: "local-oauth", title: "Local OAuth", description: "must not leak", body: "local body", type: "project", edit: "replace", confidence: 1 });
+    const postgres = fakeStore("postgres", async () => [
+      entry("database-oauth", "Database OAuth", "canonical login policy", "full PostgreSQL OAuth body")
+    ]);
+    const service = createMemorySessionService({
+      baseStore: base,
+      configuredStore: postgres,
+      memoryConfig: MemoryConfigSchema.parse({ storage: { provider: "postgres" } })
+    });
+
+    const facts = await service.resolveFacts("oauth", 5);
+    expect(facts).toHaveLength(1);
+    expect(facts[0]?.body).toBe("full PostgreSQL OAuth body");
+    expect(facts.some(({ fact }) => fact.name === "local-oauth")).toBe(false);
+
+    await service.refresh();
+    expect(service.referenceFacts.map(({ fact }) => fact.name)).toEqual(["database-oauth"]);
+  });
+
   it("keeps healthy PostgreSQL facts and boot briefing when the local learning store fails", async () => {
     const root = freshRoot();
     const base = createFileMemoryStore({ directory: join(root, "local") });

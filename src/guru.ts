@@ -133,8 +133,22 @@ import {
   stringDisplayWidth,
   withBufferText
 } from "./tui/editor.js";
-import { completePathToken, filterFiles, scanRepoFiles, type PathCompletion, type RepoFileScan } from "./tui/filePicker.js";
-import { expandReferences } from "./tui/references.js";
+import {
+  buildReferencePickerEntries,
+  completePathToken,
+  scanRepoFiles,
+  type PathCompletion,
+  type ReferencePickerEntry,
+  type RepoFileScan
+} from "./tui/filePicker.js";
+import { expandInteractiveReferences } from "./tui/references.js";
+import {
+  appendTerminalTail,
+  buildSessionReferenceSummary,
+  readStagedGitDiff,
+  type VirtualReferencePickerSuggestion,
+  type VirtualReferenceProviders
+} from "./tui/virtualReferences.js";
 import { discoverPromptTemplates, expandTemplate, type PromptTemplate } from "./prompts/templates.js";
 import { createKeyDecoder } from "./tui/keys.js";
 import type { EditorKey } from "./tui/editor.js";
@@ -215,6 +229,8 @@ interface GuruState {
    * draft is painted in-place (no scrollback stack per character).
    */
   busySteerDraft: string;
+  /** Ephemeral, capped stdout tail from successful interactive bash observations. */
+  terminalTail: string;
   /** The encrypted credential vault (env-var alternative). Mutated by /keys. */
   vault: Vault;
   store: SessionLogStore;
@@ -310,6 +326,50 @@ function systemPrompt(state: Pick<GuruState, "memory">): string {
 
 function memoryToolContext(state: GuruState): MemoryToolContext | undefined {
   return state.session ? { sessionId: state.session.id, runtime: state.runtime } : undefined;
+}
+
+function createVirtualReferenceProviders(state: GuruState): VirtualReferenceProviders {
+  return {
+    async sessionSummary(id) {
+      const saved = state.store.load(id);
+      if (!saved) return null;
+      return buildSessionReferenceSummary({
+        ...(saved.branchSummary !== undefined ? { branchSummary: saved.branchSummary } : {}),
+        ...(saved.compaction?.summary !== undefined ? { compactionSummary: saved.compaction.summary } : {}),
+        messages: saved.messages
+      });
+    },
+    async memoryFacts(query) {
+      try {
+        const facts = await state.memory.resolveFacts(query, 6);
+        if (facts.length === 0) return null;
+        return facts
+          .map(({ fact, body }) => `[[${fact.name}]] — ${fact.title}\n${fact.description}\n\n${body}`)
+          .join("\n\n---\n\n");
+      } catch {
+        return null;
+      }
+    },
+    stagedDiff: (repoRoot) => readStagedGitDiff(repoRoot),
+    async terminalTail() {
+      const tail = state.terminalTail.trim();
+      return tail.length > 0 ? tail : null;
+    }
+  };
+}
+
+function virtualReferenceSuggestions(state: GuruState): readonly VirtualReferencePickerSuggestion[] {
+  const sessions = state.store.list().slice(0, 50).map((session) => ({
+    value: `@session:${session.id}`,
+    label: `@session:${session.id}`,
+    hint: session.title
+  }));
+  const facts = state.memory.referenceFacts.slice(0, 50).map(({ fact }) => ({
+    value: `@memory:${fact.name}`,
+    label: `@memory:${fact.name}`,
+    hint: `${fact.title} — ${fact.description}`
+  }));
+  return [...sessions, ...facts];
 }
 
 async function refreshStateMemory(state: GuruState, query?: string): Promise<void> {
@@ -3185,6 +3245,10 @@ export interface ComposerDeps {
   drillItems(parentId: string): MenuItem[];
   /** @ picker candidates for a query — injectable; defaults to the bounded repo scan. */
   pickFiles?(query: string): readonly string[];
+  /** Full reference picker seam; virtual values retain their leading @. */
+  pickReferences?(query: string): readonly ReferencePickerEntry[];
+  /** Live session/memory suggestions merged with static roots and repo files. */
+  virtualReferenceSuggestions?(): readonly VirtualReferencePickerSuggestion[];
   /** Tab path completion — injectable; defaults to completePathToken. */
   completePath?(token: string, cwd: string): PathCompletion;
 }
@@ -3375,14 +3439,17 @@ export function attachComposer(deps: ComposerDeps): {
   const cwd = deps.cwd ?? process.cwd();
   const completePath = deps.completePath ?? completePathToken;
   let pickerScan: RepoFileScan | null = null;
-  const pickFiles =
-    deps.pickFiles ??
-    ((query: string): readonly string[] => {
-      // Re-walked on every picker OPEN (openPickerScan below) so files created
-      // mid-session appear; the walk is bounded, so this stays instant.
-      pickerScan ??= scanRepoFiles(cwd);
-      return filterFiles(pickerScan.files, query).map((match) => match.path);
-    });
+  const pickReferences =
+    deps.pickReferences ??
+    (deps.pickFiles
+      ? (query: string): readonly ReferencePickerEntry[] =>
+          deps.pickFiles?.(query).map((path) => ({ value: path, label: path, hint: "", kind: "file" })) ?? []
+      : (query: string): readonly ReferencePickerEntry[] => {
+          // Re-walked on every picker OPEN (openPickerScan below) so files created
+          // mid-session appear; the walk is bounded, so this stays instant.
+          pickerScan ??= scanRepoFiles(cwd);
+          return buildReferencePickerEntries(pickerScan.files, deps.virtualReferenceSuggestions?.() ?? [], query);
+        });
   const openPickerScan = (): void => {
     pickerScan = null; // invalidate: fresh bounded walk for this picker session
   };
@@ -3598,7 +3665,7 @@ export function attachComposer(deps: ComposerDeps): {
       picker = null;
       return;
     }
-    const items: MenuItem[] = pickFiles(query).map((path) => ({ id: path, label: path, hint: "" }));
+    const items: MenuItem[] = pickReferences(query).map((entry) => ({ id: entry.value, label: entry.label, hint: entry.hint }));
     picker = { ...picker, menu: createMenuState(items, query) };
   };
 
@@ -4386,15 +4453,16 @@ async function chatTurn(state: GuruState, text: string, retried401 = false): Pro
   // Keep a guru-native OAuth token fresh: refresh (rotating token persisted) BEFORE the
   // turn if it's within the expiry margin, so long sessions don't silently 401.
   await refreshCodexTokenIfNeeded(state, state.connectedRoute);
-  // @-reference content expansion (ADR 2026-07-05-composer-completion): pull
-  // referenced file contents inline, guarded (50KB head/tail, 80%-window skip,
-  // secret scrub). Notices print so expansion is never silent.
+  // Interactive @ references share one ordered budget: Guru-native virtual
+  // sources resolve through narrow providers, while repo files keep their
+  // existing containment/binary/secret guards. Notices are never silent.
   let submitted = text;
-  if (text.includes("@") && state.session?.repo) {
-    const expansion = expandReferences(text, {
-      repoRoot: state.session.repo.repoRoot,
+  if (text.includes("@")) {
+    const expansion = await expandInteractiveReferences(text, {
+      repoRoot: state.session?.repo?.repoRoot ?? process.cwd(),
       baseTokens: estimateChatHistoryTokens(state.history),
-      contextWindowTokens: state.connectedRoute.context?.contextWindowTokens ?? FALLBACK_CONTEXT_WINDOW_TOKENS
+      contextWindowTokens: state.connectedRoute.context?.contextWindowTokens ?? FALLBACK_CONTEXT_WINDOW_TOKENS,
+      providers: createVirtualReferenceProviders(state)
     });
     submitted = expansion.text;
     for (const notice of expansion.notices) {
@@ -4565,7 +4633,7 @@ async function chatTurn(state: GuruState, text: string, retried401 = false): Pro
           ? []
           : state.sessionTools.filter((tool) => activeChatToolIds(state).has(tool.id)),
       prepareMessages: (history) => sendableHistory(history, state.compaction.config.enabled && !state.compaction.sendLegacyWindowThisTurn),
-      executeTool: (toolId, input, signal) => {
+      executeTool: async (toolId, input, signal) => {
         if (!session) {
           return Promise.resolve({
             toolId,
@@ -4578,7 +4646,14 @@ async function chatTurn(state: GuruState, text: string, retried401 = false): Pro
         }
         // Cumulative file tracking for compaction details (read/write/edit paths).
         trackCompactionFileOp(state.compaction.files, toolId, input);
-        return state.runtime.executeTool(session.id, toolId, injectRepoRoot(toolId, input, session), signal);
+        const observation = await state.runtime.executeTool(session.id, toolId, injectRepoRoot(toolId, input, session), signal);
+        if (toolId === "bash" && observation.status === "succeeded" && observation.output && typeof observation.output === "object") {
+          const stdout = Reflect.get(observation.output, "stdout");
+          if (typeof stdout === "string" && stdout.length > 0) {
+            state.terminalTail = appendTerminalTail(state.terminalTail, stdout);
+          }
+        }
+        return observation;
       },
       approveTool: async (toolId, input) => {
         if (READ_ONLY_TOOL_IDS.has(toolId) || MANDATE_READ_ONLY_TOOLS.has(toolId)) {
@@ -5154,6 +5229,7 @@ export async function runGuru(): Promise<void> {
     busy: false,
     awaitingApproval: false,
     busySteerDraft: "",
+    terminalTail: "",
     vault,
     store: createSessionLogStore(),
     conversationId: randomUUID(),
@@ -5481,6 +5557,7 @@ export async function runGuru(): Promise<void> {
       },
       commandItems,
       drillItems,
+      virtualReferenceSuggestions: () => virtualReferenceSuggestions(state),
       headerRows: (width: number) => [composerTopRule(paint, width, composerModeLabel())],
       chromeRows: (width: number) => {
         // Queue depth lives on the status bar's `q:N` chip — don't duplicate it on

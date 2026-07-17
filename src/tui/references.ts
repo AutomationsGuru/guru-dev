@@ -2,6 +2,11 @@ import { readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
 import { scrubSecretValues } from "../safety/secretSafety.js";
+import {
+  isVirtualReference,
+  resolveVirtualReference,
+  type VirtualReferenceProviders
+} from "./virtualReferences.js";
 
 /**
  * @-reference content expansion (Composer Completion wave, ADR
@@ -27,6 +32,12 @@ export interface ExpandReferencesOptions {
 export interface ExpandReferencesResult {
   readonly text: string;
   readonly notices: readonly string[];
+}
+
+export interface ExpandInteractiveReferencesOptions extends ExpandReferencesOptions {
+  readonly providers: VirtualReferenceProviders;
+  /** Per-virtual-result byte cap before head/tail truncation. Default 50KB. */
+  readonly maxReferenceBytes?: number;
 }
 
 const DEFAULT_MAX_FILE_BYTES = 50 * 1024;
@@ -149,6 +160,12 @@ export function expandReferences(text: string, options: ExpandReferencesOptions)
   let spent = 0;
   const replacements = new Map<number, string>(); // index → block
   for (const ref of refs) {
+    // Interactive Guru resolves these through typed providers first. The
+    // file-only/headless path leaves them literal and must not add a duplicate
+    // "not found" notice.
+    if (isVirtualReference(ref.rel)) {
+      continue;
+    }
     const resolved = resolveOne(ref, options, estimate);
     if ("skip" in resolved) {
       notices.push(resolved.skip);
@@ -175,6 +192,55 @@ export function expandReferences(text: string, options: ExpandReferencesOptions)
   for (const ref of ordered) {
     const block = replacements.get(ref.index) as string;
     out = `${out.slice(0, ref.index)}${block}${out.slice(ref.index + ref.raw.length)}`;
+  }
+  return { text: out, notices };
+}
+
+/**
+ * Interactive-only resolver: virtual and file references share one ordered
+ * admission loop and therefore one aggregate 80%-of-context budget. The
+ * existing synchronous file-only API remains unchanged for headless callers.
+ */
+export async function expandInteractiveReferences(
+  text: string,
+  options: ExpandInteractiveReferencesOptions
+): Promise<ExpandReferencesResult> {
+  const refs = findReferences(text);
+  if (refs.length === 0) return { text, notices: [] };
+
+  const estimate = options.estimateTokens ?? defaultEstimate;
+  const budget = Math.max(0, Math.floor(options.contextWindowTokens * CONTEXT_BUDGET_FRACTION) - options.baseTokens);
+  const notices: string[] = [];
+  const replacements = new Map<number, string>();
+  let spent = 0;
+
+  for (const ref of refs) {
+    const resolved = isVirtualReference(ref.rel)
+      ? await resolveVirtualReference(ref, {
+          repoRoot: options.repoRoot,
+          providers: options.providers,
+          estimateTokens: estimate,
+          ...(options.maxReferenceBytes !== undefined ? { maxReferenceBytes: options.maxReferenceBytes } : {})
+        })
+      : resolveOne(ref, options, estimate);
+    if ("skip" in resolved) {
+      notices.push(resolved.skip);
+      continue;
+    }
+    if (spent + resolved.tokens > budget) {
+      notices.push(`${ref.raw} skipped: expansion would exceed ~80% of the context window — reference specific lines instead`);
+      continue;
+    }
+    spent += resolved.tokens;
+    replacements.set(ref.index, resolved.block);
+    if (resolved.notice) notices.push(resolved.notice);
+  }
+
+  if (replacements.size === 0) return { text, notices };
+  let out = text;
+  const ordered = [...refs].filter((ref) => replacements.has(ref.index)).sort((left, right) => right.index - left.index);
+  for (const ref of ordered) {
+    out = `${out.slice(0, ref.index)}${replacements.get(ref.index) as string}${out.slice(ref.index + ref.raw.length)}`;
   }
   return { text: out, notices };
 }

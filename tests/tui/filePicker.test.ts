@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 import { afterAll, describe, expect, it } from "vitest";
 
-import { completePathToken, filterFiles, fuzzyScore, scanRepoFiles } from "../../src/tui/filePicker.js";
+import { buildReferencePickerEntries, completePathToken, filterFiles, fuzzyScore, scanRepoFiles } from "../../src/tui/filePicker.js";
 
 const root = join(tmpdir(), `guru-picker-${process.pid}`);
 mkdirSync(join(root, "src", "compaction"), { recursive: true });
@@ -76,6 +76,37 @@ describe("fuzzy matching", () => {
     const contiguous = fuzzyScore("engine", "src/compaction/engine.ts");
     const scattered = fuzzyScore("engine", "src/e/n/g/i/n/e-x.md");
     expect(contiguous).toBeGreaterThan(scattered);
+  });
+});
+
+describe("virtual reference picker", () => {
+  const dynamic = [
+    { value: "@session:session-123", label: "@session:session-123", hint: "Saved session" },
+    { value: "@memory:oauth-login", label: "@memory:oauth-login", hint: "OAuth login" }
+  ];
+
+  it("always offers all four static roots and preserves the leading @", () => {
+    const entries = buildReferencePickerEntries(["src/guru.ts"], dynamic, "", 20);
+    expect(entries.map(({ value }) => value)).toEqual(expect.arrayContaining([
+      "@session:",
+      "@memory:",
+      "@git-changes",
+      "@terminal",
+      "@session:session-123",
+      "@memory:oauth-login",
+      "src/guru.ts"
+    ]));
+  });
+
+  it("filters static and dynamic suggestions deterministically without changing file values", () => {
+    const first = buildReferencePickerEntries(["src/guru.ts"], dynamic, "session123", 8);
+    const second = buildReferencePickerEntries(["src/guru.ts"], [...dynamic].reverse(), "session123", 8);
+    expect(first).toEqual(second);
+    expect(first[0]?.value).toBe("@session:session-123");
+
+    const file = buildReferencePickerEntries(["src/guru.ts"], dynamic, "guru", 8);
+    expect(file.some(({ value }) => value === "src/guru.ts")).toBe(true);
+    expect(file.some(({ value }) => value === "@src/guru.ts")).toBe(false);
   });
 });
 

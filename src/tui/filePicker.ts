@@ -1,6 +1,8 @@
 import { lstatSync, readdirSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 
+import { STATIC_VIRTUAL_REFERENCES, type VirtualReferencePickerSuggestion } from "./virtualReferences.js";
+
 /**
  * The @ file-reference picker + Tab path completion (P1 composer wave, ADR
  * 2026-07-05-composer-editor). Bounded by construction: the walk caps its
@@ -115,6 +117,55 @@ export function filterFiles(files: readonly string[], query: string, limit = 8):
   }
   matches.sort((left, right) => right.score - left.score || left.path.localeCompare(right.path));
   return matches.slice(0, limit);
+}
+
+export interface ReferencePickerEntry {
+  readonly value: string;
+  readonly label: string;
+  readonly hint: string;
+  readonly kind: "virtual" | "file";
+}
+
+interface RankedReferencePickerEntry extends ReferencePickerEntry {
+  readonly score: number;
+  readonly priority: number;
+}
+
+/**
+ * Merge static roots, live session/memory suggestions, and repo files into one
+ * deterministic picker. Virtual values retain their leading @; file values
+ * intentionally retain the pre-existing path-only insertion contract.
+ */
+export function buildReferencePickerEntries(
+  files: readonly string[],
+  dynamicVirtual: readonly VirtualReferencePickerSuggestion[],
+  query: string,
+  limit = 8
+): readonly ReferencePickerEntry[] {
+  const candidates = new Map<string, RankedReferencePickerEntry>();
+  const addVirtual = (suggestion: VirtualReferencePickerSuggestion, priority: number): void => {
+    if (candidates.has(suggestion.value)) return;
+    const score = Math.max(
+      fuzzyScore(query, suggestion.value),
+      fuzzyScore(query, suggestion.label),
+      fuzzyScore(query, suggestion.hint)
+    );
+    if (score >= 0) {
+      candidates.set(suggestion.value, { ...suggestion, kind: "virtual", score, priority });
+    }
+  };
+  for (const suggestion of STATIC_VIRTUAL_REFERENCES) addVirtual(suggestion, 0);
+  for (const suggestion of dynamicVirtual) addVirtual(suggestion, 1);
+  for (const path of files) {
+    const score = fuzzyScore(query, path);
+    if (score >= 0 && !candidates.has(path)) {
+      candidates.set(path, { value: path, label: path, hint: "", kind: "file", score, priority: 2 });
+    }
+  }
+  return [...candidates.values()]
+    .sort((left, right) => right.score - left.score || left.priority - right.priority || left.value.localeCompare(right.value))
+    .slice(0, limit)
+    .map(({ value, label, hint, kind }) => ({ value, label, hint, kind }));
 }
 
 // ---------------------------------------------------------------------------
