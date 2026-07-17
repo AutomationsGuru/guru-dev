@@ -27,7 +27,53 @@ describe("native critic panel (P1) — guru's OWN model-powered review, read-onl
     const result = await runNativeCriticPanel(ctx, { askModel: model.askModel, panel: panel() });
     expect(result.verdict).toBe("GREEN");
     expect(result.findings).toHaveLength(0);
+    expect(result.usage).toBeUndefined(); // legacy string responses carry no invented usage
     expect(model.calls()).toBe(4); // 4 personas, nothing to verify
+  });
+
+  it("aggregates every completed FIND and VERIFY response exactly once", async () => {
+    const askModel: AskModel = async (_prompt, meta) => {
+      if (meta.phase === "find") {
+        return {
+          text:
+            meta.persona === "security"
+              ? JSON.stringify([{ severity: "high", summary: "false positive", failureScenario: "test" }])
+              : "[]",
+          usage: { input: 10, output: 1 }
+        };
+      }
+      return {
+        text: JSON.stringify({ confirmed: false, reason: "refuted" }),
+        usage: { input: 7, output: 2 }
+      };
+    };
+
+    const result = await runNativeCriticPanel(ctx, { askModel, panel: panel() });
+
+    expect(result.verdict).toBe("GREEN");
+    expect(result.refutedCount).toBe(1);
+    expect(result.usage).toEqual({ input: 47, output: 6 });
+  });
+
+  it("counts fulfilled FIND usage once when VERIFY throws and keeps the finding fail-safe", async () => {
+    const askModel: AskModel = async (_prompt, meta) => {
+      if (meta.phase === "verify") {
+        throw new Error("provider unavailable");
+      }
+      return {
+        text:
+          meta.persona === "security"
+            ? JSON.stringify([{ severity: "high", summary: "real issue", failureScenario: "test" }])
+            : "[]",
+        usage: { input: 2, output: 1 }
+      };
+    };
+
+    const result = await runNativeCriticPanel(ctx, { askModel, panel: panel() });
+
+    expect(result.verdict).toBe("RED");
+    expect(result.findings).toHaveLength(1);
+    expect(result.usage).toEqual({ input: 8, output: 4 });
   });
 
   it("a CONFIRMED high finding → RED", async () => {

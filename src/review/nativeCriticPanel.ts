@@ -34,14 +34,31 @@ export interface NativeReviewResult {
   readonly reviewers: readonly string[];
   readonly refutedCount: number;
   readonly summary: string;
+  /** Aggregate usage from completed FIND/VERIFY responses; absent for legacy string responses. */
+  readonly usage?: ModelTokenUsage;
 }
+
+export interface ModelTokenUsage {
+  readonly input: number;
+  readonly output: number;
+}
+
+export interface AskModelResponse {
+  readonly text: string;
+  readonly usage?: ModelTokenUsage;
+}
+
+export type AskModelResult = string | AskModelResponse;
 
 /**
  * The one external dependency — a single-turn model call. Critics are read-only BY
  * CONSTRUCTION: they receive a prompt and return text; they are never handed a tool,
  * a file handle, or an executor, so there is nothing to deny.
  */
-export type AskModel = (prompt: string, meta: { readonly persona: string; readonly phase: "find" | "verify" }) => Promise<string>;
+export type AskModel = (
+  prompt: string,
+  meta: { readonly persona: string; readonly phase: "find" | "verify" }
+) => Promise<AskModelResult>;
 
 const PERSONA_BRIEF: Readonly<Record<string, string>> = {
   security: "secrets/credential leaks, injection, unsafe shell/eval, auth/permission bypass, path traversal, unsafe deserialization",
@@ -74,6 +91,27 @@ function extractJson(text: string): unknown {
 function normalizeSeverity(value: unknown): Severity {
   const s = String(value ?? "").toLowerCase();
   return s === "high" || s === "critical" ? "high" : s === "low" ? "low" : "medium";
+}
+
+function normalizeTokenCount(value: number): number {
+  return Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : 0;
+}
+
+function normalizeAskModelResult(result: AskModelResult): AskModelResponse {
+  if (typeof result === "string") {
+    return { text: result };
+  }
+  return {
+    text: result.text,
+    ...(result.usage
+      ? {
+          usage: {
+            input: normalizeTokenCount(result.usage.input),
+            output: normalizeTokenCount(result.usage.output)
+          }
+        }
+      : {})
+  };
 }
 
 function findPrompt(persona: string, context: NativeReviewContext): string {
@@ -114,15 +152,27 @@ export async function runNativeCriticPanel(
   const { askModel, panel } = deps;
   const personas = panel.personas;
   let calls = 0;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let observedUsage = false;
   const budgetLeft = (): number => panel.maxWorkers - calls;
+  const recordResponse = (result: AskModelResult): AskModelResponse => {
+    const response = normalizeAskModelResult(result);
+    if (response.usage) {
+      observedUsage = true;
+      inputTokens += response.usage.input;
+      outputTokens += response.usage.output;
+    }
+    return response;
+  };
 
   // --- FIND (each persona reads the diff; capped by the worker budget) ---
   const findResults = await Promise.all(
     personas.slice(0, Math.max(0, budgetLeft())).map(async (persona) => {
       calls += 1;
       try {
-        const raw = await askModel(findPrompt(persona, context), { persona, phase: "find" });
-        const parsed = extractJson(raw);
+        const response = recordResponse(await askModel(findPrompt(persona, context), { persona, phase: "find" }));
+        const parsed = extractJson(response.text);
         const items = Array.isArray(parsed) ? parsed : [];
         return items
           .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null)
@@ -156,8 +206,8 @@ export async function runNativeCriticPanel(
     }
     calls += 1;
     try {
-      const raw = await askModel(verifyPrompt(finding, context), { persona: finding.persona, phase: "verify" });
-      const parsed = extractJson(raw) as { confirmed?: unknown } | null;
+      const response = recordResponse(await askModel(verifyPrompt(finding, context), { persona: finding.persona, phase: "verify" }));
+      const parsed = extractJson(response.text) as { confirmed?: unknown } | null;
       if (parsed && parsed.confirmed === false) {
         refutedCount += 1;
       } else {
@@ -182,7 +232,14 @@ export async function runNativeCriticPanel(
       ? `native-critic-panel GREEN — ${reviewers.length} lenses, no confirmed defects (${refutedCount} refuted).`
       : `native-critic-panel ${verdict} — ${confirmed.length} confirmed finding(s) across ${reviewers.length} lenses (${refutedCount} refuted).`;
 
-  return { verdict, findings: confirmed, reviewers, refutedCount, summary };
+  return {
+    verdict,
+    findings: confirmed,
+    reviewers,
+    refutedCount,
+    summary,
+    ...(observedUsage ? { usage: { input: inputTokens, output: outputTokens } } : {})
+  };
 }
 
 /** Wrap the panel as a NativeReviewer (gate → CommandGateResult) for runReviewGates. */
@@ -204,7 +261,8 @@ export function makeNativeReviewer(deps: {
       durationMs: Date.now() - startedAt,
       status: review.verdict === "RED" ? "failed" : "passed",
       verdict: review.verdict,
-      summary: review.summary
+      summary: review.summary,
+      ...(review.usage ? { tokens: review.usage.input + review.usage.output } : {})
     };
   };
 }
