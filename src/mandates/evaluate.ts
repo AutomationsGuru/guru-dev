@@ -60,7 +60,8 @@ const TOOL_VERBS: Readonly<Record<string, readonly MandateVerb[]>> = {
   pyautogui_keyboard: ["exec"],
   // Cursor-parity local tools (wave 2026-07-10) — no mutation.
   read_diagnostics: [],
-  manage_task: []
+  manage_task: [],
+  monitor: []
 };
 
 /** Read-only tools: never gated by the mandate (the always-allowed floor). */
@@ -90,6 +91,7 @@ export const MANDATE_READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   "operational.backlog.list",
   "github.pr.status",
   "read_diagnostics",
+  "monitor",
   "lsp"
 ]);
 

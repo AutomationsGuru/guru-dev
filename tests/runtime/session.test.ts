@@ -114,6 +114,7 @@ describe("startHarnessSession", () => {
       "memory_remember",
       "memory_search",
       "memory_status",
+      "monitor",
       "operational.backlog.create",
       "operational.backlog.list",
       "operational.blocker.record",

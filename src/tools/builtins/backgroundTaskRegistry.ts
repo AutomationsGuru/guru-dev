@@ -1,15 +1,34 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 
 import { resolveWindowsGateSpawn } from "../../review/gates.js";
 import { scrubSecretValues } from "../../safety/secretSafety.js";
 
+export type BackgroundTaskState = "running" | "completed" | "failed" | "killed";
+export type BackgroundTaskLineStream = "stdout" | "stderr";
+
+export interface BackgroundTaskLineEvent {
+  readonly cursor: number;
+  readonly stream: BackgroundTaskLineStream;
+  readonly text: string;
+}
+
+export interface BackgroundTaskLinePage {
+  readonly taskId: string;
+  readonly state: BackgroundTaskState;
+  readonly lines: BackgroundTaskLineEvent[];
+  readonly nextCursor: number;
+  readonly truncated: boolean;
+  readonly oldestCursor: number | null;
+}
+
 interface BackgroundTaskRecord {
   readonly id: string;
-  readonly kind: "process" | "scheduled";
+  readonly kind?: "process" | "scheduled";
   readonly command: readonly string[];
   readonly cwd: string;
   readonly prompt?: string;
-  state: "running" | "completed" | "failed" | "killed";
+  state: BackgroundTaskState;
   exitCode: number | null;
   stdout: string;
   stderr: string;
@@ -17,23 +36,77 @@ interface BackgroundTaskRecord {
   endedAt?: string;
   process?: ChildProcessWithoutNullStreams | undefined;
   timer?: ReturnType<typeof setTimeout> | undefined;
+  readonly lineEvents: BackgroundTaskLineEvent[];
+  nextLineCursor: number;
+  readonly lineBuffers: Record<BackgroundTaskLineStream, string>;
+  readonly lineDecoders: Record<BackgroundTaskLineStream, StringDecoder>;
+  lineBuffersFlushed: boolean;
 }
 
 const tasks = new Map<string, BackgroundTaskRecord>();
 let counter = 0;
 
 const MAX_TAIL = 16_384;
+const MAX_RETAINED_LINE_EVENTS = 1_000;
+const DEFAULT_MONITOR_LINES = 50;
+const MAX_MONITOR_LINES = 200;
 
 function appendTail(current: string, chunk: string): string {
   const next = current + chunk;
   return next.length <= MAX_TAIL ? next : next.slice(-MAX_TAIL);
 }
 
+function appendLineEvent(task: BackgroundTaskRecord, stream: BackgroundTaskLineStream, text: string): void {
+  task.lineEvents.push({
+    cursor: (task.nextLineCursor += 1),
+    stream,
+    text: appendTail("", text)
+  });
+  if (task.lineEvents.length > MAX_RETAINED_LINE_EVENTS) {
+    task.lineEvents.splice(0, task.lineEvents.length - MAX_RETAINED_LINE_EVENTS);
+  }
+}
+
+function consumeDecodedOutput(task: BackgroundTaskRecord, stream: BackgroundTaskLineStream, decoded: string): void {
+  if (decoded.length === 0) {
+    return;
+  }
+  task[stream] = appendTail(task[stream], decoded);
+  const combined = task.lineBuffers[stream] + decoded;
+  let start = 0;
+  let newline = combined.indexOf("\n", start);
+  while (newline >= 0) {
+    const complete = combined.slice(start, newline);
+    appendLineEvent(task, stream, complete.endsWith("\r") ? complete.slice(0, -1) : complete);
+    start = newline + 1;
+    newline = combined.indexOf("\n", start);
+  }
+  task.lineBuffers[stream] = appendTail("", combined.slice(start));
+}
+
+function consumeOutputChunk(task: BackgroundTaskRecord, stream: BackgroundTaskLineStream, chunk: Buffer): void {
+  consumeDecodedOutput(task, stream, task.lineDecoders[stream].write(chunk));
+}
+
+function flushLineBuffers(task: BackgroundTaskRecord): void {
+  if (task.lineBuffersFlushed) {
+    return;
+  }
+  task.lineBuffersFlushed = true;
+  for (const stream of ["stdout", "stderr"] as const) {
+    consumeDecodedOutput(task, stream, task.lineDecoders[stream].end());
+    const partial = task.lineBuffers[stream];
+    if (partial.length > 0) {
+      appendLineEvent(task, stream, partial);
+      task.lineBuffers[stream] = "";
+    }
+  }
+}
+
 function publicView(task: BackgroundTaskRecord) {
-  // Agent-visible choke point: same secret-shape scrub as foreground bash/output paths.
   return {
     id: task.id,
-    kind: task.kind,
+    ...(task.kind !== undefined ? { kind: task.kind } : {}),
     command: [...task.command],
     cwd: task.cwd,
     ...(task.prompt !== undefined ? { prompt: scrubSecretValues(task.prompt) } : {}),
@@ -75,7 +148,6 @@ export function spawnBackgroundTask(command: readonly string[], cwd: string): st
   });
   const record: BackgroundTaskRecord = {
     id,
-    kind: "process",
     command,
     cwd,
     state: "running",
@@ -83,20 +155,26 @@ export function spawnBackgroundTask(command: readonly string[], cwd: string): st
     stdout: "",
     stderr: "",
     startedAt: new Date().toISOString(),
-    process: child
+    process: child,
+    lineEvents: [],
+    nextLineCursor: 0,
+    lineBuffers: { stdout: "", stderr: "" },
+    lineDecoders: { stdout: new StringDecoder("utf8"), stderr: new StringDecoder("utf8") },
+    lineBuffersFlushed: false
   };
   let spawnFailed = false;
   child.stdout.on("data", (chunk: Buffer) => {
-    record.stdout = appendTail(record.stdout, chunk.toString("utf8"));
+    consumeOutputChunk(record, "stdout", chunk);
   });
   child.stderr.on("data", (chunk: Buffer) => {
-    record.stderr = appendTail(record.stderr, chunk.toString("utf8"));
+    consumeOutputChunk(record, "stderr", chunk);
   });
   child.on("error", (error) => {
     spawnFailed = true;
     record.exitCode = null;
     record.state = "failed";
     record.stderr = appendTail(record.stderr, `Background task failed to start: ${error.message}\n`);
+    flushLineBuffers(record);
     record.endedAt = new Date().toISOString();
     delete record.process;
   });
@@ -104,6 +182,7 @@ export function spawnBackgroundTask(command: readonly string[], cwd: string): st
     if (spawnFailed) {
       return;
     }
+    flushLineBuffers(record);
     record.exitCode = code;
     record.state = record.state === "killed" ? "killed" : code === 0 ? "completed" : "failed";
     record.endedAt = new Date().toISOString();
@@ -111,6 +190,73 @@ export function spawnBackgroundTask(command: readonly string[], cwd: string): st
   });
   tasks.set(id, record);
   return id;
+}
+
+export function readBackgroundTaskLines(
+  taskId: string,
+  afterCursor = 0,
+  maxLines = DEFAULT_MONITOR_LINES
+): BackgroundTaskLinePage {
+  const task = tasks.get(taskId);
+  if (!task) {
+    throw new Error(`Unknown task id: ${taskId}`);
+  }
+  const normalizedAfter = Number.isFinite(afterCursor) ? Math.max(0, Math.trunc(afterCursor)) : 0;
+  const normalizedMax = Number.isFinite(maxLines)
+    ? Math.min(MAX_MONITOR_LINES, Math.max(1, Math.trunc(maxLines)))
+    : DEFAULT_MONITOR_LINES;
+  const oldestCursor = task.lineEvents[0]?.cursor ?? null;
+  const lines = task.lineEvents
+    .filter((line) => line.cursor > normalizedAfter)
+    .slice(0, normalizedMax)
+    .map((line) => ({ ...line }));
+  return {
+    taskId: task.id,
+    state: task.state,
+    lines,
+    nextCursor: lines.at(-1)?.cursor ?? normalizedAfter,
+    truncated: oldestCursor !== null && normalizedAfter < oldestCursor - 1,
+    oldestCursor
+  };
+}
+
+export async function manageBackgroundTask(action: string, taskId?: string, input?: string): Promise<unknown> {
+  switch (action) {
+    case "list":
+      return [...tasks.values()].map(publicView);
+    case "status": {
+      const task = tasks.get(taskId ?? "");
+      if (!task) {
+        throw new Error(`Unknown task id: ${taskId}`);
+      }
+      return publicView(task);
+    }
+    case "kill": {
+      const task = tasks.get(taskId ?? "");
+      if (!task) {
+        throw new Error(`Unknown task id: ${taskId}`);
+      }
+      if (task.state === "running" && task.process && !task.process.killed) {
+        task.process.kill("SIGTERM");
+        task.state = "killed";
+        task.endedAt = new Date().toISOString();
+      }
+      return publicView(task);
+    }
+    case "send_input": {
+      const task = tasks.get(taskId ?? "");
+      if (!task) {
+        throw new Error(`Unknown task id: ${taskId}`);
+      }
+      if (task.state !== "running" || !task.process?.stdin) {
+        throw new Error("Task is not running or does not accept input.");
+      }
+      task.process.stdin.write(`${input ?? ""}\n`);
+      return publicView(task);
+    }
+    default:
+      throw new Error(`Unsupported manage_task action: ${action}`);
+  }
 }
 
 export function scheduleBackgroundNotification(
@@ -138,7 +284,12 @@ export function scheduleBackgroundNotification(
     exitCode: null,
     stdout: "",
     stderr: "",
-    startedAt: new Date().toISOString()
+    startedAt: new Date().toISOString(),
+    lineEvents: [],
+    nextLineCursor: 0,
+    lineBuffers: { stdout: "", stderr: "" },
+    lineDecoders: { stdout: new StringDecoder("utf8"), stderr: new StringDecoder("utf8") },
+    lineBuffersFlushed: true
   };
 
   const timer = setTimeout(() => {
@@ -172,47 +323,3 @@ export function scheduleBackgroundNotification(
   return id;
 }
 
-export async function manageBackgroundTask(action: string, taskId?: string, input?: string): Promise<unknown> {
-  switch (action) {
-    case "list":
-      return [...tasks.values()].map(publicView);
-    case "status": {
-      const task = tasks.get(taskId ?? "");
-      if (!task) {
-        throw new Error(`Unknown task id: ${taskId}`);
-      }
-      return publicView(task);
-    }
-    case "kill": {
-      const task = tasks.get(taskId ?? "");
-      if (!task) {
-        throw new Error(`Unknown task id: ${taskId}`);
-      }
-      if (task.state === "running") {
-        if (task.timer !== undefined) {
-          clearTimeout(task.timer);
-          delete task.timer;
-        }
-        if (task.process && !task.process.killed) {
-          task.process.kill("SIGTERM");
-        }
-        task.state = "killed";
-        task.endedAt = new Date().toISOString();
-      }
-      return publicView(task);
-    }
-    case "send_input": {
-      const task = tasks.get(taskId ?? "");
-      if (!task) {
-        throw new Error(`Unknown task id: ${taskId}`);
-      }
-      if (task.state !== "running" || !task.process?.stdin) {
-        throw new Error("Task is not running or does not accept input.");
-      }
-      task.process.stdin.write(`${input ?? ""}\n`);
-      return publicView(task);
-    }
-    default:
-      throw new Error(`Unsupported manage_task action: ${action}`);
-  }
-}

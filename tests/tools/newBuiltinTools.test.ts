@@ -2,6 +2,9 @@ import { describe, expect, it } from "vitest";
 
 import { createScheduleTool, ScheduleToolInputSchema } from "../../src/tools/builtins/scheduleTool.js";
 import { createManageTaskTool, ManageTaskToolInputSchema } from "../../src/tools/builtins/manageTaskTool.js";
+import { createMonitorTool, MonitorToolInputSchema } from "../../src/tools/builtins/monitorTool.js";
+import { GURU_CHAT_TOOL_IDS, READ_ONLY_TOOL_IDS } from "../../src/guru.js";
+import { MANDATE_READ_ONLY_TOOLS, verbsForCall } from "../../src/mandates/evaluate.js";
 
 /**
  * Coverage for the schedule / manage_task tools (wave 2026-07-10). Each has an
@@ -76,3 +79,53 @@ describe("manage_task tool", () => {
   });
 });
 
+describe("monitor tool", () => {
+  it("requires a backend when used outside the default base-tool factory", async () => {
+    const tool = createMonitorTool();
+    await expect(tool.execute({ TaskId: "t1", AfterCursor: 0, MaxLines: 50 }, {})).rejects.toThrow(/monitor backend/iu);
+  });
+
+  it("uses bounded cursor defaults and returns only structured observation fields", async () => {
+    const calls: Array<[string, number, number]> = [];
+    const tool = createMonitorTool({
+      onMonitor: async (taskId, afterCursor, maxLines) => {
+        calls.push([taskId, afterCursor, maxLines]);
+        return {
+          taskId,
+          state: "completed",
+          lines: [{ cursor: 1, stream: "stdout", text: "ok" }],
+          nextCursor: 1,
+          truncated: false,
+          oldestCursor: 1
+        };
+      }
+    });
+
+    const output = await tool.execute({ TaskId: "t1", AfterCursor: 0, MaxLines: 50 }, {});
+    expect(calls).toEqual([["t1", 0, 50]]);
+    expect(output).toEqual({
+      taskId: "t1",
+      state: "completed",
+      lines: [{ cursor: 1, stream: "stdout", text: "ok" }],
+      nextCursor: 1,
+      truncated: false,
+      oldestCursor: 1
+    });
+  });
+
+  it("has a strict non-mutating schema with the documented bounds", () => {
+    expect(MonitorToolInputSchema.parse({ TaskId: "t1" })).toEqual({ TaskId: "t1" });
+    expect(MonitorToolInputSchema.safeParse({ TaskId: "t1", AfterCursor: -1 }).success).toBe(false);
+    expect(MonitorToolInputSchema.safeParse({ TaskId: "t1", MaxLines: 0 }).success).toBe(false);
+    expect(MonitorToolInputSchema.safeParse({ TaskId: "t1", MaxLines: 201 }).success).toBe(false);
+    expect(MonitorToolInputSchema.safeParse({ TaskId: "t1", Action: "kill" }).success).toBe(false);
+    expect(MonitorToolInputSchema.safeParse({ TaskId: "t1", Input: "payload" }).success).toBe(false);
+  });
+
+  it("is exposed to chat and classified read-only across both policy registries", () => {
+    expect(GURU_CHAT_TOOL_IDS.has("monitor")).toBe(true);
+    expect(READ_ONLY_TOOL_IDS.has("monitor")).toBe(true);
+    expect(MANDATE_READ_ONLY_TOOLS.has("monitor")).toBe(true);
+    expect(verbsForCall("monitor", { TaskId: "t1", Action: "kill" })).toEqual([]);
+  });
+});
