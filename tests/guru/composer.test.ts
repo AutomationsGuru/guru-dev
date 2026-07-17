@@ -43,6 +43,7 @@ function rig(options: {
   drills?: Record<string, MenuItem[]>;
   chromeRows?: () => string[];
   pickFiles?: (query: string) => readonly string[];
+  pickReferences?: ComposerDeps["pickReferences"];
   completePath?: ComposerDeps["completePath"];
   busy?: () => boolean;
   allowBusySteer?: () => boolean;
@@ -91,6 +92,7 @@ function rig(options: {
     ...(options.headerRows ? { headerRows: options.headerRows } : {}),
     ...(options.chromeRows ? { chromeRows: options.chromeRows } : {}),
     ...(options.pickFiles ? { pickFiles: options.pickFiles } : {}),
+    ...(options.pickReferences ? { pickReferences: options.pickReferences } : {}),
     ...(options.completePath ? { completePath: options.completePath } : {})
   };
   const composer = attachComposer(deps);
@@ -195,6 +197,15 @@ describe("composer — @ file references (ACCEPTANCE)", () => {
     expect(r2.composer.isPickerOpen()).toBe(true);
     await r2.type(KEYS.backspace);
     expect(r2.composer.isPickerOpen()).toBe(false);
+  });
+
+  it("retains the leading @ when a virtual reference suggestion is accepted", async () => {
+    const r = rig({
+      pickReferences: () => [{ value: "@terminal", label: "@terminal", hint: "recent bash output", kind: "virtual" }]
+    });
+    await r.type("inspect @term");
+    await r.type(KEYS.enter);
+    expect(r.composer.bufferText()).toBe("inspect @terminal");
   });
 });
 
