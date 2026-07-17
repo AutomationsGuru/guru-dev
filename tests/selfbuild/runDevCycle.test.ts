@@ -9,7 +9,9 @@ import {
 } from "../../src/selfbuild/runDevCycle.js";
 import type { SelfBuildExecutorReport } from "../../src/executor/selfBuildExecutor.js";
 import type { CommandExecutor } from "../../src/review/gates.js";
-import type { Clock, DevStage } from "../../src/selfbuild/devCycle.js";
+import type { Clock, DevStage, StageOutcome } from "../../src/selfbuild/devCycle.js";
+import type { DevCycleCheckpoint } from "../../src/selfbuild/devCycleCheckpoint.js";
+import type { DevCycleCheckpointController } from "../../src/selfbuild/runDevCycle.js";
 import type { GateFailureNote } from "../../src/selfbuild/parseGateFailure.js";
 import type { LearnedFact } from "../../src/selfbuild/learn.js";
 import { makeSmokeDeps } from "../../src/selfbuild/smokeDeps.js";
@@ -47,6 +49,88 @@ const greenGating: Partial<Record<DevStage, StageRunner>> = {
 
 const passExec: CommandExecutor = async () => ({ exitCode: 0, stdout: "", stderr: "", durationMs: 0 });
 const failGate = (name: string): CommandExecutor => async (_c, ctx) => ({ exitCode: ctx.gate.name === name ? 1 : 0, stdout: "", stderr: "", durationMs: 0 });
+
+type WorkingStage = Exclude<DevStage, "done" | "blocked">;
+type CheckpointOutcome = StageOutcome & { readonly stage: WorkingStage };
+
+function completedBefore(stage: WorkingStage): CheckpointOutcome[] {
+  const green = (completedStage: WorkingStage): CheckpointOutcome => ({
+    stage: completedStage,
+    verdict: "GREEN",
+    evidence: `${completedStage} complete`
+  });
+  const prefix = [green("select"), green("build"), green("test"), green("smoke"), green("review"), green("ship")];
+  switch (stage) {
+    case "select":
+      return [];
+    case "build":
+      return prefix.slice(0, 1);
+    case "test":
+      return prefix.slice(0, 2);
+    case "smoke":
+      return prefix.slice(0, 3);
+    case "review":
+      return prefix.slice(0, 4);
+    case "ship":
+      return prefix.slice(0, 5);
+    case "learn":
+      return prefix;
+    case "debug":
+      return [green("select"), green("build"), { stage: "test", verdict: "RED", evidence: "test failed" }];
+  }
+}
+
+function resumeCheckpoint(over: Partial<DevCycleCheckpoint> = {}): DevCycleCheckpoint {
+  return {
+    schemaVersion: 1,
+    cycleId: "resume-cycle-1",
+    cwd: process.cwd(),
+    selectedTaskId: "persisted-task",
+    stage: "test",
+    stageState: "pending",
+    completedStages: [
+      { stage: "select", verdict: "GREEN", evidence: "selected" },
+      { stage: "build", verdict: "GREEN", evidence: "built" }
+    ],
+    lastFailure: null,
+    executorSessionId: null,
+    budget: {
+      attempts: 1,
+      maxIterations: 6,
+      tokens: 200,
+      tokenBudget: 500_000,
+      spentUsd: 0,
+      ceilingUsd: 0,
+      elapsedMs: 100,
+      wallClockMs: 1_800_000
+    },
+    status: "running",
+    verdict: null,
+    learned: null,
+    resumeReruns: [],
+    createdAt: "2026-07-15T00:00:00.000Z",
+    updatedAt: "2026-07-15T00:00:00.000Z",
+    ...over
+  };
+}
+
+function checkpointController(initial?: DevCycleCheckpoint): {
+  readonly controller: DevCycleCheckpointController;
+  readonly saved: DevCycleCheckpoint[];
+} {
+  const saved: DevCycleCheckpoint[] = [];
+  return {
+    controller: {
+      cycleId: initial?.cycleId ?? "new-cycle-1",
+      ...(initial ? { resume: initial } : {}),
+      now: () => new Date("2026-07-15T01:00:00.000Z"),
+      save: (checkpoint) => {
+        saved.push(structuredClone(checkpoint));
+      }
+    },
+    saved
+  };
+}
 
 describe("failClosedMandatePolicy (P7) — spend/mutation escalate, read-only allowed", () => {
   const policy = failClosedMandatePolicy();
@@ -435,5 +519,283 @@ describe("runDevCycle (P4) — SELECT scoring + LEARN write-back", () => {
     expect(report.terminal).toBe("blocked");
     expect(report.learned?.outcome).toBe("blocked");
     expect(report.learned?.blockerNote).toBeDefined();
+  });
+});
+
+describe("runDevCycle (G102) — checkpoint and safe resume", () => {
+  it("skips completed stages and continues exactly once from the recorded boundary", async () => {
+    const executor = vi.fn<SelfBuildExecutorFn>(async () => fakeReport());
+    const { controller } = checkpointController(resumeCheckpoint());
+
+    const report = await runDevCycle({ executor, checkpoint: controller, stages: greenGating });
+
+    expect(executor).not.toHaveBeenCalled();
+    expect(report.cycleId).toBe("resume-cycle-1");
+    expect(report.stages.map((stage) => stage.stage)).toEqual(["select", "build", "test", "smoke", "review", "ship", "learn"]);
+    expect(report.budget).toMatchObject({ attempts: 1, tokens: 200 });
+  });
+
+  it("preserves the selected task and structured failure note across a restart", async () => {
+    const failure: GateFailureNote = {
+      gate: "test",
+      kind: "vitest",
+      summary: "persisted failure",
+      failures: ["FAIL persisted.test.ts"],
+      raw: "FAIL persisted.test.ts"
+    };
+    const repair = vi.fn<RepairFn>(async () => ({ repaired: true, evidence: "repaired persisted failure" }));
+    const { controller } = checkpointController(
+      resumeCheckpoint({
+        stage: "debug",
+        lastFailure: { ...failure, failures: [...failure.failures] },
+        completedStages: completedBefore("debug")
+      })
+    );
+
+    const report = await runDevCycle({
+      checkpoint: controller,
+      repair,
+      executor: async () => fakeReport(),
+      stages: {
+        test: async () => ({ verdict: "GREEN", evidence: "test" }),
+        smoke: async () => ({ verdict: "GREEN", evidence: "smoke" }),
+        review: async () => ({ verdict: "GREEN", evidence: "review" }),
+        ship: async () => ({ verdict: "GREEN", evidence: "ship" })
+      }
+    });
+
+    expect(repair).toHaveBeenCalledWith(failure);
+    expect(report.learned?.taskId).toBe("persisted-task");
+  });
+
+  it("blocks before another stage when the hydrated budget is already exhausted", async () => {
+    const stage = vi.fn<StageRunner>(async () => ({ verdict: "GREEN", evidence: "must not run" }));
+    const { controller, saved } = checkpointController(
+      resumeCheckpoint({ budget: { ...resumeCheckpoint().budget, attempts: 6 } })
+    );
+
+    const report = await runDevCycle({ checkpoint: controller, stages: { test: stage } });
+
+    expect(stage).not.toHaveBeenCalled();
+    expect(report.terminal).toBe("blocked");
+    expect(report.budget.attempts).toBe(6);
+    expect(report.stages.at(-1)?.evidence).toMatch(/attempt cap reached \(6\/6\)/u);
+    expect(saved).toEqual([]);
+  });
+
+  it.each(["test", "smoke", "review"] as const)(
+    "reruns only interrupted read-only %s and records the rerun explicitly",
+    async (interruptedStage) => {
+      const stage = vi.fn<StageRunner>(async () => ({ verdict: "GREEN", evidence: `reran ${interruptedStage}` }));
+      const { controller, saved } = checkpointController(
+        resumeCheckpoint({ stage: interruptedStage, stageState: "running", completedStages: completedBefore(interruptedStage) })
+      );
+
+      const report = await runDevCycle({
+        checkpoint: controller,
+        executor: async () => fakeReport(),
+        stages: { ...greenGating, [interruptedStage]: stage }
+      });
+
+      expect(stage).toHaveBeenCalledTimes(1);
+      expect(report.stages[completedBefore(interruptedStage).length]?.stage).toBe(interruptedStage);
+      expect(saved.some((checkpoint) => checkpoint.resumeReruns.some((entry) => entry.stage === interruptedStage))).toBe(true);
+    }
+  );
+
+  it("resumes an interrupted BUILD through the captured executor session id", async () => {
+    const executor = vi.fn<SelfBuildExecutorFn>(async (options) => {
+      await options.onSessionStarted?.("executor-session-1");
+      return fakeReport();
+    });
+    const { controller } = checkpointController(
+      resumeCheckpoint({
+        stage: "build",
+        stageState: "running",
+        completedStages: completedBefore("build"),
+        executorSessionId: "executor-session-1"
+      })
+    );
+
+    await runDevCycle({ checkpoint: controller, executor, stages: greenGating });
+
+    expect(executor).toHaveBeenCalledTimes(1);
+    expect(executor.mock.calls[0]![0].resumeSessionId).toBe("executor-session-1");
+  });
+
+  it("resumes an interrupted DEBUG re-plan through the captured executor session id", async () => {
+    const executor = vi.fn<SelfBuildExecutorFn>(async (options) => {
+      await options.onSessionStarted?.("debug-session-1");
+      return fakeReport();
+    });
+    const { controller } = checkpointController(
+      resumeCheckpoint({
+        stage: "debug",
+        stageState: "running",
+        completedStages: completedBefore("debug"),
+        executorSessionId: "debug-session-1",
+        lastFailure: { gate: "test", kind: "vitest", summary: "failed", failures: ["FAIL"], raw: "FAIL" }
+      })
+    );
+
+    await runDevCycle({ checkpoint: controller, executor, stages: greenGating });
+
+    expect(executor).toHaveBeenCalledTimes(1);
+    expect(executor.mock.calls[0]![0].resumeSessionId).toBe("debug-session-1");
+  });
+
+  it.each(["build", "debug"] as const)(
+    "fails closed for interrupted %s without a continuation session id",
+    async (interruptedStage) => {
+      const executor = vi.fn<SelfBuildExecutorFn>(async () => fakeReport());
+      const repair = vi.fn<RepairFn>(async () => ({ repaired: true, evidence: "must not run" }));
+      const { controller } = checkpointController(
+        resumeCheckpoint({
+          stage: interruptedStage,
+          stageState: "running",
+          completedStages: completedBefore(interruptedStage),
+          lastFailure:
+            interruptedStage === "debug"
+              ? { gate: "test", kind: "vitest", summary: "failed", failures: ["FAIL"], raw: "FAIL" }
+              : null
+        })
+      );
+
+      const report = await runDevCycle({ checkpoint: controller, executor, repair, stages: greenGating });
+
+      expect(report.terminal).toBe("blocked");
+      expect(report.summary).toMatch(/resume|continuation/i);
+      expect(executor).not.toHaveBeenCalled();
+      expect(repair).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each(["ship", "learn"] as const)("never replays an interrupted %s stage", async (interruptedStage) => {
+    const ship = vi.fn<StageRunner>(async () => ({ verdict: "GREEN", evidence: "must not ship" }));
+    const recordFact = vi.fn<(fact: LearnedFact) => void>();
+    const { controller } = checkpointController(
+      resumeCheckpoint({
+        stage: interruptedStage,
+        stageState: "running",
+        completedStages: completedBefore(interruptedStage)
+      })
+    );
+
+    const report = await runDevCycle({ checkpoint: controller, ship, recordFact, stages: greenGating });
+
+    expect(report.terminal).toBe("blocked");
+    expect(report.summary).toMatch(/uncertain|replay|resume/i);
+    expect(ship).not.toHaveBeenCalled();
+    expect(recordFact).not.toHaveBeenCalled();
+  });
+
+  it("returns a terminal checkpoint without executing any product stage", async () => {
+    const executor = vi.fn<SelfBuildExecutorFn>(async () => fakeReport());
+    const stage = vi.fn<StageRunner>(async () => ({ verdict: "GREEN", evidence: "must not run" }));
+    const terminal = resumeCheckpoint({
+      stage: "done",
+      stageState: "completed",
+      status: "done",
+      verdict: "GREEN",
+      completedStages: [...completedBefore("learn"), { stage: "learn", verdict: "GREEN", evidence: "learned" }]
+    });
+    const { controller, saved } = checkpointController(terminal);
+
+    const report = await runDevCycle({ checkpoint: controller, executor, stages: { select: stage } });
+
+    expect(report).toMatchObject({ cycleId: terminal.cycleId, terminal: "done", verdict: "GREEN" });
+    expect(report.stages).toEqual(terminal.completedStages);
+    expect(executor).not.toHaveBeenCalled();
+    expect(stage).not.toHaveBeenCalled();
+    expect(saved).toEqual([]);
+  });
+
+  it.each(["build", "debug"] as const)(
+    "resumes the exact interrupted %s attempt at the attempt cap without incrementing attempts",
+    async (interruptedStage) => {
+      const executor = vi.fn<SelfBuildExecutorFn>(async (options) => {
+        await options.onSessionStarted?.(`${interruptedStage}-session-1`);
+        return fakeReport();
+      });
+      const { controller } = checkpointController(
+        resumeCheckpoint({
+          stage: interruptedStage,
+          stageState: "running",
+          completedStages: completedBefore(interruptedStage),
+          executorSessionId: `${interruptedStage}-session-1`,
+          budget: { ...resumeCheckpoint().budget, attempts: 1, maxIterations: 1 },
+          lastFailure:
+            interruptedStage === "debug"
+              ? { gate: "test", kind: "vitest", summary: "failed", failures: ["FAIL"], raw: "FAIL" }
+              : null
+        })
+      );
+
+      const report = await runDevCycle({ checkpoint: controller, executor, stages: greenGating });
+
+      expect(executor).toHaveBeenCalledTimes(1);
+      expect(executor.mock.calls[0]![0].resumeSessionId).toBe(`${interruptedStage}-session-1`);
+      expect(report.budget.attempts).toBe(1);
+    }
+  );
+
+  it("still enforces the token ceiling before resuming a captured BUILD attempt", async () => {
+    const executor = vi.fn<SelfBuildExecutorFn>(async () => fakeReport());
+    const { controller } = checkpointController(
+      resumeCheckpoint({
+        stage: "build",
+        stageState: "running",
+        completedStages: completedBefore("build"),
+        executorSessionId: "build-session-1",
+        budget: { ...resumeCheckpoint().budget, attempts: 1, maxIterations: 1, tokens: 10, tokenBudget: 10 }
+      })
+    );
+
+    const report = await runDevCycle({ checkpoint: controller, executor, stages: greenGating });
+
+    expect(executor).not.toHaveBeenCalled();
+    expect(report.stages.at(-1)?.evidence).toMatch(/token budget exhausted/u);
+  });
+
+  it("still enforces elapsed wall-clock before resuming a captured DEBUG attempt", async () => {
+    const executor = vi.fn<SelfBuildExecutorFn>(async () => fakeReport());
+    const clock: Clock = { now: () => 1_000 };
+    const { controller } = checkpointController(
+      resumeCheckpoint({
+        stage: "debug",
+        stageState: "running",
+        completedStages: completedBefore("debug"),
+        executorSessionId: "debug-session-1",
+        budget: { ...resumeCheckpoint().budget, attempts: 1, maxIterations: 1, elapsedMs: 100, wallClockMs: 100 },
+        lastFailure: { gate: "test", kind: "vitest", summary: "failed", failures: ["FAIL"], raw: "FAIL" }
+      })
+    );
+
+    const report = await runDevCycle({ checkpoint: controller, clock, executor, stages: greenGating });
+
+    expect(executor).not.toHaveBeenCalled();
+    expect(report.stages.at(-1)?.evidence).toMatch(/wall-clock exceeded/u);
+  });
+
+  it("rejects a forged resume history before checkpoint save or stage invocation", async () => {
+    const stage = vi.fn<StageRunner>(async () => ({ verdict: "GREEN", evidence: "must not run" }));
+    const { controller, saved } = checkpointController(
+      resumeCheckpoint({ stage: "ship", stageState: "pending", completedStages: [] })
+    );
+
+    await expect(runDevCycle({ checkpoint: controller, stages: { ship: stage } })).rejects.toThrow(
+      /history|stage|boundary|checkpoint/i
+    );
+    expect(stage).not.toHaveBeenCalled();
+    expect(saved).toEqual([]);
+  });
+
+  it("rejects a task-mismatched checkpoint without modifying it", async () => {
+    const { controller, saved } = checkpointController(resumeCheckpoint());
+
+    await expect(
+      runDevCycle({ checkpoint: controller, executorOptions: { taskId: "different-task" }, stages: greenGating })
+    ).rejects.toThrow(/task/i);
+    expect(saved).toEqual([]);
   });
 });

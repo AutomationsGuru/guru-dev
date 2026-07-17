@@ -55,22 +55,36 @@ export interface BudgetSnapshot {
   readonly wallClockMs: number;
 }
 
+export const DevCycleBudgetSeedSchema = z
+  .object({
+    attempts: z.number().int().nonnegative(),
+    tokens: z.number().int().nonnegative(),
+    spentUsd: z.number().nonnegative(),
+    elapsedMs: z.number().nonnegative()
+  })
+  .strict();
+export type DevCycleBudgetSeed = z.infer<typeof DevCycleBudgetSeedSchema>;
+
 /**
  * Bounds a dev-cycle run three independent ways (any one is sufficient to halt) and
  * gates spend. `$0` ceiling denies every positive spend — the fail-closed default.
  */
 export class DevCycleBudget {
-  private attempts = 0;
-  private tokens = 0;
+  private attempts: number;
+  private tokens: number;
   private spentUsd: number;
   private readonly startedAt: number;
 
   constructor(
     private readonly config: RunDevCycleConfig,
-    private readonly clock: Clock = SYSTEM_CLOCK
+    private readonly clock: Clock = SYSTEM_CLOCK,
+    seed?: DevCycleBudgetSeed
   ) {
-    this.spentUsd = config.spend.spentUsd;
-    this.startedAt = clock.now();
+    const hydrated = seed ? DevCycleBudgetSeedSchema.parse(seed) : null;
+    this.attempts = hydrated?.attempts ?? 0;
+    this.tokens = hydrated?.tokens ?? 0;
+    this.spentUsd = hydrated?.spentUsd ?? config.spend.spentUsd;
+    this.startedAt = clock.now() - (hydrated?.elapsedMs ?? 0);
   }
 
   /** Non-null reason the loop must stop (attempt / token / wall-clock exhausted), else null. */

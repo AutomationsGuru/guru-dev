@@ -1,4 +1,7 @@
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
 
 import {
   runSelfBuildExecutor,
@@ -31,6 +34,7 @@ import {
   type StageOutcome,
   type StageVerdict
 } from "./devCycle.js";
+import { DevCycleCheckpointSchema, type DevCycleCheckpoint } from "./devCycleCheckpoint.js";
 
 /**
  * runDevCycle (P7) — the orchestrator that WRAPS `runSelfBuildExecutor` and drives one
@@ -111,6 +115,15 @@ export interface RunDevCycleInput {
   readonly stages?: Partial<Record<DevStage, StageRunner>>;
   /** Progress sink: fires once per completed stage (0→7), so an unattended run is observable. */
   readonly onStage?: (event: DevStageEvent) => void;
+  /** Optional project-local checkpoint seam. The CLI supplies a store-backed controller. */
+  readonly checkpoint?: DevCycleCheckpointController;
+}
+
+export interface DevCycleCheckpointController {
+  readonly cycleId: string;
+  readonly resume?: DevCycleCheckpoint;
+  readonly now?: () => Date;
+  save(checkpoint: DevCycleCheckpoint): Promise<void> | void;
 }
 
 export interface DevStageEvent {
@@ -122,6 +135,7 @@ export interface DevStageEvent {
 }
 
 export interface DevCycleReport {
+  readonly cycleId: string;
   readonly verdict: StageVerdict;
   readonly terminal: "done" | "blocked";
   readonly stages: readonly StageOutcome[];
@@ -146,41 +160,217 @@ const NATIVE_REVIEW_GATE: CommandGate = {
 const CONSUMES_ATTEMPT = new Set<DevStage>(["build", "debug"]);
 
 export async function runDevCycle(input: RunDevCycleInput = {}): Promise<DevCycleReport> {
-  const budgetConfig = RunDevCycleConfigSchema.parse(input.budget ?? {});
-  const budget = new DevCycleBudget(budgetConfig, input.clock);
+  const cwd = input.executorOptions?.cwd ?? process.cwd();
+  const canonicalCwd = realpathSync(resolve(cwd));
+  const resumed = input.checkpoint?.resume ? DevCycleCheckpointSchema.parse(input.checkpoint.resume) : null;
+  const cycleId = input.checkpoint?.cycleId ?? randomUUID();
+
+  if (resumed) {
+    if (resumed.cycleId !== cycleId) {
+      throw new Error(`Dev-cycle checkpoint id mismatch: expected ${cycleId}.`);
+    }
+    if (realpathSync(resolve(resumed.cwd)) !== canonicalCwd) {
+      throw new Error(`Dev-cycle checkpoint cwd mismatch for cycle ${cycleId}.`);
+    }
+    if (input.executorOptions?.taskId && input.executorOptions.taskId !== resumed.selectedTaskId) {
+      throw new Error(`Dev-cycle checkpoint task mismatch for cycle ${cycleId}.`);
+    }
+  }
+
+  const resumedBudgetConfig = resumed
+    ? RunDevCycleConfigSchema.parse({
+        maxIterations: resumed.budget.maxIterations,
+        tokenBudget: resumed.budget.tokenBudget,
+        wallClockMs: resumed.budget.wallClockMs,
+        spend: { ceilingUsd: resumed.budget.ceilingUsd, spentUsd: resumed.budget.spentUsd }
+      })
+    : null;
+  const budgetConfig = resumedBudgetConfig ?? RunDevCycleConfigSchema.parse(input.budget ?? {});
+  if (resumed && input.budget) {
+    const requested = RunDevCycleConfigSchema.parse(input.budget);
+    if (
+      requested.maxIterations !== budgetConfig.maxIterations ||
+      requested.tokenBudget !== budgetConfig.tokenBudget ||
+      requested.wallClockMs !== budgetConfig.wallClockMs ||
+      requested.spend.ceilingUsd !== budgetConfig.spend.ceilingUsd
+    ) {
+      throw new Error(`Dev-cycle checkpoint budget mismatch for cycle ${cycleId}; resume cannot reset limits.`);
+    }
+  }
+
+  const budget = new DevCycleBudget(
+    budgetConfig,
+    input.clock,
+    resumed
+      ? {
+          attempts: resumed.budget.attempts,
+          tokens: resumed.budget.tokens,
+          spentUsd: resumed.budget.spentUsd,
+          elapsedMs: resumed.budget.elapsedMs
+        }
+      : undefined
+  );
   const basePolicy =
     input.mandatePolicy ?? failClosedMandatePolicy(input.mandateState ?? MandateStateSchema.parse({}));
   // Wrap the policy so every decision is recorded into the audit ledger (decisions unchanged).
   const policy = input.ledger ? ledgerRecordingPolicy(basePolicy, input.ledger) : basePolicy;
   const runExecutor = input.executor ?? runSelfBuildExecutor;
-  const cwd = input.executorOptions?.cwd ?? process.cwd();
-  const stages: StageOutcome[] = [];
+  const stages: StageOutcome[] = resumed ? [...resumed.completedStages] : [];
   let executorReport: SelfBuildExecutorReport | null = null;
   // The most recent RED gate, parsed into a structured note for DEBUG to repair.
-  let lastFailure: GateFailureNote | null = null;
+  let lastFailure: GateFailureNote | null = resumed?.lastFailure ?? null;
   // The task this cycle is building (SELECT may re-pick from the ready set), and what it learned.
-  let selectedTaskId = input.executorOptions?.taskId ?? "unnamed-task";
-  let learnedFact: LearnedFact | null = null;
+  let selectedTaskId = resumed?.selectedTaskId ?? input.executorOptions?.taskId ?? "unnamed-task";
+  let learnedFact: LearnedFact | null = resumed?.learned
+    ? {
+        taskId: resumed.learned.taskId,
+        outcome: resumed.learned.outcome,
+        verdict: resumed.learned.verdict,
+        confidence: resumed.learned.confidence,
+        fact: resumed.learned.fact,
+        ...(resumed.learned.blockerNote === undefined ? {} : { blockerNote: resumed.learned.blockerNote })
+      }
+    : null;
+  let executorSessionId: string | null = resumed?.executorSessionId ?? null;
+  const resumeReruns = resumed ? [...resumed.resumeReruns] : [];
+  const now = input.checkpoint?.now ?? (() => new Date());
+  const createdAt = resumed?.createdAt ?? now().toISOString();
+  let stage: DevStage = resumed?.stage ?? "select";
+  let continuationStage: "build" | "debug" | null = null;
+  let continuationSessionId: string | null = null;
+  let preserveAttemptForInterruptedStage = false;
+
+  const saveCheckpoint = async (options: {
+    readonly stage: DevStage;
+    readonly stageState: "pending" | "running" | "completed";
+    readonly status: "running" | "done" | "blocked";
+    readonly verdict: StageVerdict | null;
+  }): Promise<void> => {
+    if (!input.checkpoint) {
+      return;
+    }
+    const checkpoint = DevCycleCheckpointSchema.parse({
+      schemaVersion: 1,
+      cycleId,
+      cwd: canonicalCwd,
+      selectedTaskId,
+      stage: options.stage,
+      stageState: options.stageState,
+      completedStages: stages,
+      lastFailure,
+      executorSessionId,
+      budget: budget.snapshot(),
+      status: options.status,
+      verdict: options.verdict,
+      learned: learnedFact,
+      resumeReruns,
+      createdAt,
+      updatedAt: now().toISOString()
+    });
+    await input.checkpoint.save(checkpoint);
+  };
+
+  if (resumed && resumed.status !== "running") {
+    return {
+      cycleId,
+      verdict: resumed.verdict ?? (resumed.status === "done" ? "GREEN" : "RED"),
+      terminal: resumed.status,
+      stages,
+      budget: budget.snapshot(),
+      executor: null,
+      learned: learnedFact,
+      ledger: input.ledger?.entries() ?? [],
+      summary: `dev cycle restored from terminal checkpoint ${cycleId}; no stages executed.`
+    };
+  }
+
+  if (resumed?.stageState === "running") {
+    if (stage === "test" || stage === "smoke" || stage === "review") {
+      resumeReruns.push({ stage, interruptedAt: resumed.updatedAt, resumedAt: now().toISOString() });
+      await saveCheckpoint({ stage, stageState: "pending", status: "running", verdict: null });
+    } else if ((stage === "build" || stage === "debug") && executorSessionId) {
+      continuationStage = stage;
+      continuationSessionId = executorSessionId;
+      preserveAttemptForInterruptedStage = true;
+    } else {
+      const interruptedStage = stage;
+      const evidence =
+        interruptedStage === "ship" || interruptedStage === "learn"
+          ? `resume blocked: uncertain in-flight ${interruptedStage.toUpperCase()} is never replayed`
+          : `resume blocked: interrupted ${interruptedStage.toUpperCase()} has no safe continuation session id`;
+      stages.push({ stage: interruptedStage, verdict: "RED", evidence });
+      stage = "blocked";
+      learnedFact = deriveLearning({
+        taskId: selectedTaskId,
+        terminal: "blocked",
+        verdict: "RED",
+        note: evidence
+      });
+      // SELECT-RED and LEARN-RED reduce to `done`, so manufacturing a persisted
+      // `blocked` terminal would itself be an impossible history. Preserve the
+      // interrupted checkpoint unchanged for recovery instead.
+      if (interruptedStage !== "select" && interruptedStage !== "learn") {
+        await saveCheckpoint({ stage, stageState: "completed", status: "blocked", verdict: "RED" });
+      }
+      return {
+        cycleId,
+        verdict: "RED",
+        terminal: "blocked",
+        stages,
+        budget: budget.snapshot(),
+        executor: null,
+        learned: learnedFact,
+        ledger: input.ledger?.entries() ?? [],
+        summary: `dev cycle resume blocked for ${cycleId}: ${evidence}`
+      };
+    }
+  } else if (!resumed) {
+    await saveCheckpoint({ stage, stageState: "pending", status: "running", verdict: null });
+  }
 
   const boundedRetries = Math.min(
     input.executorOptions?.maxPlannerRetries ?? budgetConfig.maxIterations,
     budgetConfig.maxIterations
   );
 
+  const withSessionBreadcrumb = (
+    executorStage: "build" | "debug",
+    options: RunSelfBuildExecutorOptions
+  ): RunSelfBuildExecutorOptions => {
+    const requestedResumeId = continuationStage === executorStage ? continuationSessionId : null;
+    const outerBreadcrumb = input.executorOptions?.onSessionStarted;
+    return {
+      ...options,
+      ...(requestedResumeId ? { resumeSessionId: requestedResumeId } : {}),
+      onSessionStarted: async (sessionId) => {
+        executorSessionId = sessionId;
+        await saveCheckpoint({ stage: executorStage, stageState: "running", status: "running", verdict: null });
+        await outerBreadcrumb?.(sessionId);
+      }
+    };
+  };
+
   // Default repair: re-plan via BUILD carrying the failure note forward so the planner
   // fixes exactly what failed. Bounded by the budget's attempt cap (DEBUG consumes an attempt).
   const defaultRepair = async (note: GateFailureNote): Promise<{ repaired: boolean; evidence: string; tokens?: number }> => {
     const base = input.executorOptions?.objective ?? selectedTaskId;
     const objective = `${base}\n\nThe previous attempt FAILED the ${note.gate} gate (${note.kind}):\n${note.summary}\n${note.failures.join("\n")}\nProduce a plan that fixes exactly these failures.`;
-    const report = await runExecutor({
-      ...input.executorOptions,
-      taskId: selectedTaskId,
-      objective,
-      mandatePolicy: policy,
-      includeReviewGate: false,
-      maxPlannerRetries: boundedRetries
-    });
+    const report = await runExecutor(
+      withSessionBreadcrumb("debug", {
+        ...input.executorOptions,
+        taskId: selectedTaskId,
+        objective,
+        mandatePolicy: policy,
+        includeReviewGate: false,
+        maxPlannerRetries: boundedRetries
+      })
+    );
     executorReport = report;
+    if (report.session.id) {
+      executorSessionId = report.session.id;
+    }
+    continuationStage = null;
+    continuationSessionId = null;
     return {
       repaired: report.planner.status === "completed",
       evidence: `re-plan ${report.planner.status}`,
@@ -202,7 +392,7 @@ export async function runDevCycle(input: RunDevCycleInput = {}): Promise<DevCycl
       return { verdict: "GREEN", evidence: `task provided (${selectedTaskId})` };
     },
     build: async () => {
-      const options: RunSelfBuildExecutorOptions = {
+      const options = withSessionBreadcrumb("build", {
         ...input.executorOptions,
         taskId: selectedTaskId,
         mandatePolicy: policy,
@@ -212,8 +402,13 @@ export async function runDevCycle(input: RunDevCycleInput = {}): Promise<DevCycl
           input.executorOptions?.maxPlannerRetries ?? budgetConfig.maxIterations,
           budgetConfig.maxIterations
         )
-      };
+      });
       executorReport = await runExecutor(options);
+      if (executorReport.session.id) {
+        executorSessionId = executorReport.session.id;
+      }
+      continuationStage = null;
+      continuationSessionId = null;
       const built = executorReport.planner.status === "completed";
       return {
         verdict: built ? "GREEN" : "RED",
@@ -350,25 +545,83 @@ export async function runDevCycle(input: RunDevCycleInput = {}): Promise<DevCycl
   };
   const runners: Record<DevStage, StageRunner> = { ...defaults, ...input.stages };
 
-  let stage: DevStage = "select";
+  const overallFor = (terminalStage: DevStage): StageVerdict => {
+    if (terminalStage !== "done") {
+      return "RED";
+    }
+    const reachedWork = stages.some((outcome) => outcome.stage !== "select");
+    if (!reachedWork) {
+      return "YELLOW";
+    }
+    return stages.some((outcome) => outcome.verdict === "YELLOW") ? "YELLOW" : "GREEN";
+  };
+
+  let guard = 0;
+  let canPersistTerminalCheckpoint = true;
   // Hard backstop against a malformed transition table (the budget is the real bound).
-  for (let guard = 0; !isTerminal(stage) && guard < 100; guard += 1) {
-    const exhausted = budget.exhaustedReason();
+  for (; !isTerminal(stage) && guard < 100; guard += 1) {
+    const resumingCapturedAttempt =
+      preserveAttemptForInterruptedStage &&
+      continuationStage === stage &&
+      continuationSessionId !== null &&
+      executorSessionId === continuationSessionId;
+    const snapshot = budget.snapshot();
+    const exhausted = resumingCapturedAttempt
+      ? snapshot.tokens >= snapshot.tokenBudget
+        ? `token budget exhausted (${snapshot.tokens}/${snapshot.tokenBudget})`
+        : snapshot.elapsedMs >= snapshot.wallClockMs
+          ? `wall-clock exceeded (${snapshot.elapsedMs}ms/${snapshot.wallClockMs}ms)`
+          : null
+      : budget.exhaustedReason();
     if (exhausted) {
       stages.push({ stage, verdict: "RED", evidence: `budget exhausted: ${exhausted}` });
       stage = "blocked";
+      // Budget exhaustion occurs before the current stage runs, so it is not a
+      // reducer outcome. Preserve the last valid pending/running checkpoint
+      // rather than forge a terminal history that never transitioned here.
+      canPersistTerminalCheckpoint = false;
       break;
     }
-    if (CONSUMES_ATTEMPT.has(stage)) {
+
+    if (CONSUMES_ATTEMPT.has(stage) && !preserveAttemptForInterruptedStage) {
       budget.recordAttempt();
     }
-    const result = await runners[stage]();
-    stages.push({ stage, verdict: result.verdict, evidence: result.evidence });
+    if ((stage === "build" || stage === "debug") && continuationStage !== stage) {
+      executorSessionId = null;
+    }
+
+    const completedStage = stage;
+    await saveCheckpoint({ stage: completedStage, stageState: "running", status: "running", verdict: null });
+    const result = await runners[completedStage]();
+    stages.push({ stage: completedStage, verdict: result.verdict, evidence: result.evidence });
     if (result.tokens) {
       budget.recordTokens(result.tokens);
     }
-    input.onStage?.({ index: guard, stage, verdict: result.verdict, evidence: result.evidence, budget: budget.snapshot() });
-    stage = nextStage(stage, result.verdict);
+    preserveAttemptForInterruptedStage = false;
+    stage = nextStage(completedStage, result.verdict);
+    if (isTerminal(stage)) {
+      await saveCheckpoint({
+        stage,
+        stageState: "completed",
+        status: stage === "done" ? "done" : "blocked",
+        verdict: overallFor(stage)
+      });
+    } else {
+      await saveCheckpoint({ stage, stageState: "pending", status: "running", verdict: null });
+    }
+    input.onStage?.({
+      index: stages.length - 1,
+      stage: completedStage,
+      verdict: result.verdict,
+      evidence: result.evidence,
+      budget: budget.snapshot()
+    });
+  }
+
+  if (!isTerminal(stage)) {
+    stages.push({ stage, verdict: "RED", evidence: "dev-cycle transition guard exhausted" });
+    stage = "blocked";
+    canPersistTerminalCheckpoint = false;
   }
 
   const blocked = stage !== "done";
@@ -376,13 +629,7 @@ export async function runDevCycle(input: RunDevCycleInput = {}): Promise<DevCycl
   // not a false GREEN. A DEBUG-recovered cycle DID reach work and ends clean, so its healed
   // TEST-RED (still in `stages`) must not drag the verdict to RED — hence the reachedWork guard.
   const reachedWork = stages.some((s) => s.stage !== "select");
-  const overall: StageVerdict = blocked
-    ? "RED"
-    : !reachedWork
-      ? "YELLOW"
-      : stages.some((s) => s.verdict === "YELLOW")
-        ? "YELLOW"
-        : "GREEN";
+  const overall: StageVerdict = blocked ? "RED" : !reachedWork ? "YELLOW" : overallFor(stage);
 
   // A blocked cycle still learns: record the blocker so the next SELECT deprioritises this task.
   if (blocked && !learnedFact) {
@@ -398,7 +645,17 @@ export async function runDevCycle(input: RunDevCycleInput = {}): Promise<DevCycl
     }
   }
 
+  if (canPersistTerminalCheckpoint) {
+    await saveCheckpoint({
+      stage,
+      stageState: "completed",
+      status: blocked ? "blocked" : "done",
+      verdict: overall
+    });
+  }
+
   return {
+    cycleId,
     verdict: overall,
     terminal: blocked ? "blocked" : "done",
     stages,

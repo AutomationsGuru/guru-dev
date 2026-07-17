@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
@@ -26,6 +27,7 @@ import { createMandateStore } from "./mandates/store.js";
 import { buildDevCyclePlan, renderDevCyclePlan } from "./selfbuild/devCyclePlan.js";
 import { makeAskModelFromRoute, routeFromPlannerConfig } from "./selfbuild/askModelAdapter.js";
 import { makeSmokeDeps } from "./selfbuild/smokeDeps.js";
+import { createDevCycleCheckpointStore } from "./selfbuild/devCycleCheckpoint.js";
 import { commandExists } from "./review/gates.js";
 import { createFileMemoryStore } from "./memory/store.js";
 import { normalizeKnownPathFields } from "./runtime/pathNormalization.js";
@@ -254,6 +256,7 @@ if (command === "self-build-plan") {
         "",
         "  --dry-run                      Discover gates + print the stage plan; execute NOTHING.",
         "  --task-id <id>                 Task to build.",
+        "  --resume-cycle <id>            Resume one project-local .guru/dev-cycles checkpoint.",
         "  --loop                         UNATTENDED multi-cycle: drive the whole ready task set",
         "                                 (SELECT re-picks after every cycle; blocked tasks are",
         "                                 deprioritised). Tasks unlocked by cycles completed in",
@@ -273,6 +276,26 @@ if (command === "self-build-plan") {
   const cwd = getFlagValue(args, "--cwd") ?? process.cwd();
   const taskId = getFlagValue(args, "--task-id");
   const configPath = getFlagValue(args, "--config");
+  const resumeFlag = hasFlag(args, "--resume-cycle");
+  const resumeCycle = getFlagValue(args, "--resume-cycle");
+
+  if (resumeFlag && !resumeCycle) {
+    throw new Error("Usage: guru self-build-run --resume-cycle <id> [--cwd <path>] [--config <path>]");
+  }
+  if (resumeCycle) {
+    const conflicts = [
+      ...(taskId ? ["--task-id"] : []),
+      ...(hasFlag(args, "--dry-run") ? ["--dry-run"] : []),
+      ...(hasFlag(args, "--loop") ? ["--loop"] : [])
+    ];
+    if (conflicts.length > 0) {
+      const loopResidual = conflicts.includes("--loop")
+        ? " Loop-level resume remains an explicit residual; resume one non-loop cycle only."
+        : "";
+      throw new Error(`--resume-cycle is mutually exclusive with ${conflicts.join(", ")}.${loopResidual}`);
+    }
+  }
+
   const devCycleConfig = loadHarnessConfig({ cwd, ...(configPath ? { configPath } : {}) }).config;
   const plannerModel = devCycleConfig.plannerModel;
   const keyPresent = plannerModel !== undefined && Boolean(process.env[plannerModel.apiKeyEnvVar]);
@@ -290,6 +313,10 @@ if (command === "self-build-plan") {
     console.log(renderDevCyclePlan(plan));
     process.exit(0);
   }
+
+  const checkpointStore = createDevCycleCheckpointStore({ cwd });
+  const resumedCheckpoint = resumeCycle ? checkpointStore.load(resumeCycle) : undefined;
+  const cycleId = resumeCycle ?? randomUUID();
 
   // Build a live reviewer askModel from the configured model ONLY when its key is present in
   // the environment (presence check — the value is never printed, persisted, or sent here).
@@ -337,11 +364,19 @@ if (command === "self-build-plan") {
     console.log(JSON.stringify(loopReport, null, 2));
     process.exitCode = loopReport.blocked.length === 0 ? 0 : 1;
   } else {
+    console.error(`[self-build-run] cycle=${cycleId}${resumeCycle ? ` resume=${resumeCycle}` : ""}`);
     const devCycleReport = await runDevCycle({
       ...(askModel ? { askModel } : {}),
       // Real SMOKE: nucleus boot + model-free session/tool self-call (bounded).
       smoke: makeSmokeDeps({ cwd, timeoutMs: 30_000 }),
-      executorOptions
+      executorOptions,
+      checkpoint: {
+        cycleId,
+        ...(resumedCheckpoint ? { resume: resumedCheckpoint } : {}),
+        save: (checkpoint) => {
+          checkpointStore.save(checkpoint);
+        }
+      }
     });
     console.log(JSON.stringify(devCycleReport, null, 2));
     process.exitCode = devCycleReport.terminal === "done" ? 0 : 1;
