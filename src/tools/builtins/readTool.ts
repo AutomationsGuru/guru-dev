@@ -48,6 +48,7 @@ export function createPiReadTool(options: PiReadToolOptions = {}): ToolDefinitio
       "Read a bounded byte window with secret-aware text output. UTF-8 characters are kept whole, so a window may extend by at most three bytes; use nextOffset for the following page.",
     inputSchema: PiReadToolInputSchema,
     outputSchema: PiReadToolOutputSchema,
+    effect: "read-only",
     async execute(input) {
       const repoRoot = resolve(input.repoRoot);
       const targetPath = resolve(repoRoot, input.path);

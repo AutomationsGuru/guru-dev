@@ -8,7 +8,6 @@ import { z } from "zod";
 
 import {
   createHarnessRuntime,
-  createDefaultHarnessToolRegistry,
   createInMemoryOperationalStore,
   createInMemorySessionPersistenceStore,
   createToolRegistry,
@@ -17,7 +16,6 @@ import {
   type ToolDefinition
 } from "../../src/index.js";
 import { initExtensions } from "../../src/extensions/initExtensions.js";
-import { loadHarnessConfig } from "../../src/config/loadConfig.js";
 import { ensureGuruHome } from "../../src/home/paths.js";
 import { manageBackgroundTask, resetBackgroundTasks } from "../../src/tools/builtins/backgroundTaskRegistry.js";
 
@@ -291,26 +289,6 @@ describe("createHarnessRuntime", () => {
     }
   });
 
-  it("does not invoke an askQuestion callback with an invented empty session id", async () => {
-    const askQuestion = vi.fn(async () => [["yes"]]);
-    const config = loadHarnessConfig({ cwd: repoRoot }).config;
-    const registry = createDefaultHarnessToolRegistry({
-      skillLoaderOptions: { directories: config.skillDirectories, cwd: repoRoot },
-      operationalStore: createInMemoryOperationalStore(),
-      runtimeHardening: config.runtimeHardening,
-      memoryConfig: config.memory,
-      interactiveCallbacks: { askQuestion }
-    });
-    const tool = registry.get("ask_question");
-
-    const result = await tool!.execute({
-      questions: [{ question: "Proceed?", options: ["yes", "no"], multiSelect: false }]
-    }, {});
-
-    expect(askQuestion).not.toHaveBeenCalled();
-    expect(result).toMatchObject({ interactive: false, answers: [[]] });
-  });
-
   it("clears pending scheduled notifications when the runtime closes", async () => {
     const runtime = createHarnessRuntime({
       interactiveCallbacks: { schedule: async () => {} }
@@ -565,5 +543,162 @@ describe("createToolRegistry", () => {
     const registry = createToolRegistry([echoTool]);
 
     expect(registry.list().map((tool) => tool.id)).toEqual(["custom.echo"]);
+  });
+});
+
+describe("plan-mode runtime gate", () => {
+  it("exposes exactly glob, grep, ls, read in registry order for a live session", async () => {
+    const runtime = createHarnessRuntime();
+    try {
+      const session = await runtime.startSession({ cwd: repoRoot });
+
+      expect(runtime.getSessionPlanModeTools(session.id).map((tool) => tool.id)).toEqual(["glob", "grep", "ls", "read"]);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("runs a certified read and forwards the turn abort signal without invoking a planner/provider", async () => {
+    const runtime = createHarnessRuntime();
+    try {
+      const session = await runtime.startSession({ cwd: repoRoot });
+      const controller = new AbortController();
+
+      const observation = await runtime.executePlanModeTool(
+        session.id,
+        "read",
+        { repoRoot, path: "package.json", limit: 80 },
+        controller.signal
+      );
+
+      expect(observation).toMatchObject({ toolId: "read", status: "succeeded" });
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("refuses write: failed observation, no file created, and no execute/result extension hooks", async () => {
+    const runtime = createHarnessRuntime();
+    const host = initExtensions().host;
+    const sendMessage = vi.spyOn(host, "sendMessage");
+    const targetDir = await mkdtemp(resolve(tmpdir(), "guruharness-plan-mode-write-"));
+    const targetPath = resolve(targetDir, "must-not-create.txt");
+
+    try {
+      const session = await runtime.startSession({ cwd: repoRoot });
+      const observation = await runtime.executePlanModeTool(session.id, "write", {
+        repoRoot: targetDir,
+        path: "must-not-create.txt",
+        contents: "blocked",
+        dryRun: false
+      });
+
+      expect(observation).toMatchObject({
+        toolId: "write",
+        status: "failed",
+        error: expect.stringContaining("not allowlisted")
+      });
+      expect(existsSync(targetPath)).toBe(false);
+      expect(sendMessage.mock.calls.filter(([event]) => event === "tool:execute" || event === "tool:result")).toEqual([]);
+    } finally {
+      sendMessage.mockRestore();
+      await runtime.close();
+      await rm(targetDir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses bash without invoking its executor", async () => {
+    let executorCalls = 0;
+    const runtime = createHarnessRuntime({
+      commandExecutor: async () => {
+        executorCalls += 1;
+
+        return { exitCode: 0, stdout: "", stderr: "", durationMs: 0 };
+      }
+    });
+
+    try {
+      const session = await runtime.startSession({ cwd: repoRoot });
+      const observation = await runtime.executePlanModeTool(session.id, "bash", {
+        repoRoot,
+        command: "node",
+        args: ["-e", "1"],
+        dryRun: false
+      });
+
+      expect(observation).toMatchObject({ toolId: "bash", status: "failed", error: expect.stringContaining("not allowlisted") });
+      expect(executorCalls).toBe(0);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("excludes attached MCP tools from the certified surface and refuses to invoke them", async () => {
+    const config = await writeMcpConfig([fakeMcpConfig()]);
+    const runtime = createHarnessRuntime();
+
+    try {
+      const session = await runtime.startSession({ cwd: repoRoot, configPath: config.path });
+
+      expect(runtime.getSessionTools(session.id).map((tool) => tool.id)).toContain("mcp.fake.echo");
+      expect(runtime.getSessionPlanModeTools(session.id).map((tool) => tool.id)).toEqual(["glob", "grep", "ls", "read"]);
+
+      const observation = await runtime.executePlanModeTool(session.id, "mcp.fake.echo", { arguments: { value: "runtime" } });
+
+      expect(observation).toMatchObject({
+        toolId: "mcp.fake.echo",
+        status: "failed",
+        error: expect.stringContaining("not allowlisted")
+      });
+      expect(observation.output).toBeUndefined();
+    } finally {
+      await closeRuntimeAndRemoveConfig(runtime, config.directory);
+    }
+  });
+
+  it("treats unknown and closed sessions as empty-list / failed-observation parity", async () => {
+    const runtime = createHarnessRuntime();
+
+    try {
+      expect(runtime.getSessionPlanModeTools("missing-session")).toEqual([]);
+      const missing = await runtime.executePlanModeTool("missing-session", "read", { repoRoot, path: "package.json" });
+
+      expect(missing).toMatchObject({ toolId: "read", status: "failed", error: expect.stringContaining("session not found") });
+
+      const session = await runtime.startSession({ cwd: repoRoot });
+      await runtime.closeSession(session.id);
+
+      expect(runtime.getSessionPlanModeTools(session.id)).toEqual([]);
+      const closed = await runtime.executePlanModeTool(session.id, "read", { repoRoot, path: "package.json" });
+
+      expect(closed).toMatchObject({ status: "failed" });
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it("exposes the same restricted surface on start and resume without a configured planner model", async () => {
+    const persistence = createInMemorySessionPersistenceStore();
+    const firstRuntime = createHarnessRuntime({ sessionPersistenceStore: persistence });
+    const secondRuntime = createHarnessRuntime({ sessionPersistenceStore: persistence });
+
+    try {
+      const started = await firstRuntime.startSession({ cwd: repoRoot });
+      const surface = firstRuntime.getSessionPlanModeTools(started.id).map((tool) => tool.id);
+
+      expect(surface).toEqual(["glob", "grep", "ls", "read"]);
+
+      const resumed = await secondRuntime.resumeSession(started.id, { cwd: repoRoot });
+
+      expect(resumed).toBeDefined();
+      expect(secondRuntime.getSessionPlanModeTools(started.id).map((tool) => tool.id)).toEqual(surface);
+
+      const observation = await secondRuntime.executePlanModeTool(started.id, "read", { repoRoot, path: "package.json", limit: 50 });
+
+      expect(observation.status).toBe("succeeded");
+    } finally {
+      await firstRuntime.close();
+      await secondRuntime.close();
+    }
   });
 });

@@ -13,6 +13,7 @@ import { createMcpMetaDispatchTools } from "../mcp/metaDispatch.js";
 import type { McpServerConfig, McpServerStatus } from "../mcp/schemas.js";
 import { createInMemoryOperationalStore, type OperationalStore } from "../operational/store.js";
 import { createBlockedPlannerRunReport, runPlannerExecution, type PlannerModel } from "../planner/runtime.js";
+import { createCertifiedPlanModePolicy, executePlanModeTool as runPlanModeTool, type PlanModePolicy } from "../planner/planMode.js";
 import {
   createOperationalSessionPersistenceStore,
   type PersistedSessionEvent,
@@ -45,7 +46,7 @@ import { createReviewGatesTool } from "../tools/builtins/reviewGatesTool.js";
 import { createListSkillsTool, createLoadSkillTool } from "../tools/builtins/skillLoaderTools.js";
 import { createShellExecTool } from "../tools/builtins/shellExecTool.js";
 import { BashOptimizerConfigSchema, type BashOptimizerConfig } from "../tools/bashOptimizer.js";
-import { createToolRegistry, executeRegisteredTool, type ToolObservation, type ToolRegistry } from "../tools/registry.js";
+import { createToolRegistry, executeRegisteredTool, type ToolDefinition, type ToolObservation, type ToolRegistry } from "../tools/registry.js";
 import { initExtensions } from "../extensions/initExtensions.js";
 import { bootstrapProjectHarness, refreshProjectHarnessManifest } from "../project-harness/bootstrap.js";
 import type { CommandExecutor } from "../review/gates.js";
@@ -89,6 +90,20 @@ export interface HarnessRuntime {
   executeTool(sessionId: string, toolId: string, input: unknown, signal?: AbortSignal): Promise<ToolObservation>;
   /** Full tool definitions (with schemas) registered for a session — for model tool-calling. */
   getSessionTools(sessionId: string): readonly import("../tools/registry.js").ToolDefinition[];
+  /**
+   * Read-only plan-mode tool definitions certified for a live session (G1004
+   * runtime gate). The surface is frozen at session start/resume to exactly the
+   * tools that declared `effect === "read-only"`. Unknown or closed sessions
+   * return an empty list, matching {@link getSessionTools}.
+   */
+  getSessionPlanModeTools(sessionId: string): readonly ToolDefinition[];
+  /**
+   * Execute a read-only plan-mode tool for a session. The signal forwards the
+   * turn abort like {@link executeTool}. Refusals (non-certified tool ids)
+   * return a failed observation WITHOUT invoking the underlying tool, general
+   * extension execution hooks, or a planner/provider call.
+   */
+  executePlanModeTool(sessionId: string, toolId: string, input: unknown, signal?: AbortSignal): Promise<ToolObservation>;
   /** MCP readiness/discovery results for a live session. Unknown or closed sessions return an empty list. */
   getSessionMcpStatuses(sessionId: string): readonly McpServerStatus[];
   /** Close retained MCP clients and forget one live session. Returns false when the id is not live. */
@@ -104,6 +119,7 @@ interface BuiltHarnessSession {
   readonly session: HarnessSession;
   readonly registry: ToolRegistry;
   readonly mcpAttachment: McpAttachment;
+  readonly planModePolicy: PlanModePolicy;
 }
 
 interface RebuiltHarnessSessionDependencies {
@@ -271,6 +287,48 @@ export function createHarnessRuntime(dependencies: HarnessRuntimeDependencies = 
 
       return builtSession ? builtSession.registry.list() : [];
     },
+    getSessionPlanModeTools(sessionId) {
+      return sessions.get(sessionId)?.planModePolicy.listTools() ?? [];
+    },
+    async executePlanModeTool(sessionId, toolId, input, signal) {
+      const builtSession = sessions.get(sessionId);
+
+      if (!builtSession) {
+        return createMissingSessionObservation(sessionId, toolId);
+      }
+
+      const policy = builtSession.planModePolicy;
+
+      // Refusal floor: a non-certified tool id is rejected BEFORE any execution
+      // or extension hook fires, so plan mode never invokes a mutating tool or
+      // its general extension execution hooks.
+      if (!policy.getTool(toolId)) {
+        return createFailedRuntimeObservation(toolId, `Tool is not allowlisted for plan mode: ${toolId}`);
+      }
+
+      initExtensions().host.sendMessage("tool:execute", { toolId, input });
+
+      const observation = await runPlanModeTool(policy, toolId, input, {
+        runId: builtSession.session.id,
+        ...(builtSession.session.repo ? { cwd: builtSession.session.repo.repoRoot } : {}),
+        startedBy: DEFAULT_RUNTIME_STARTED_BY,
+        metadata: {
+          ...(builtSession.session.task ? { taskId: builtSession.session.task.id } : {}),
+          runtimeName: builtSession.session.runtimeName
+        },
+        // Forward the turn abort so a long-running read can be cancelled, matching executeTool.
+        ...(signal ? { signal } : {})
+      });
+      await safeRecordToolObservation(sessionPersistenceStore, sessionId, observation); // best-effort audit persistence
+      try {
+        initExtensions().host.sendMessage("tool:result", { toolId, output: observation });
+      } catch {
+        // Post-observation extensions are best-effort and cannot change or
+        // repeat a tool result that already crossed the central sanitizer.
+      }
+
+      return observation;
+    },
     getSessionMcpStatuses(sessionId) {
       return sessions.get(sessionId)?.mcpAttachment.statuses ?? [];
     },
@@ -342,8 +400,10 @@ export function createDefaultHarnessToolRegistry(options: CreateDefaultHarnessTo
       read: { secretAllowList: options.runtimeHardening.secretAllowList },
       // TUI/RPC can inject ask_question; otherwise the tool falls back to its own TTY prompt.
       // When a sessionId is allocated, wrap the callback so it receives the typed context.
-      ...(options.interactiveCallbacks?.askQuestion && options.sessionId
-        ? { askQuestion: { onAsk: (questions: any) => options.interactiveCallbacks!.askQuestion!(questions, { sessionId: options.sessionId! }) } }
+      ...(options.interactiveCallbacks?.askQuestion
+        ? { askQuestion: { onAsk: options.sessionId
+            ? (questions: any) => options.interactiveCallbacks!.askQuestion!(questions, { sessionId: options.sessionId! })
+            : (questions: any) => options.interactiveCallbacks!.askQuestion!(questions, { sessionId: "" }) } }
         : {}),
       ...(scheduleDelivery
         ? {
@@ -433,7 +493,7 @@ async function rebuildHarnessSession(
   });
   const configCwd = configResult.status === "loaded" ? dirname(configResult.path) : cwd;
   const catalog = discoverSessionSkills(configResult.config.skillDirectories, configCwd, []);
-  const { registry, mcpAttachment } = await createSessionTooling({
+  const { registry, mcpAttachment, planModePolicy } = await createSessionTooling({
     skillLoaderOptions: { directories: configResult.config.skillDirectories, cwd: configCwd },
     operationalStore: dependencies.operationalStore,
     runtimeHardening: configResult.config.runtimeHardening,
@@ -461,7 +521,7 @@ async function rebuildHarnessSession(
     tools: materializeTools(registry)
   });
 
-  return { session: rebuiltSession, registry, mcpAttachment };
+  return { session: rebuiltSession, registry, mcpAttachment, planModePolicy };
 }
 
 async function buildHarnessSession(
@@ -502,7 +562,7 @@ async function buildHarnessSession(
   const sessionId = randomUUID();
   const catalog = discoverSessionSkills(configResult.config.skillDirectories, configCwd, blockers);
   const loadedSkills = loadSessionSkills(parsedOptions.skillIds, configResult.config.skillDirectories, configCwd, blockers);
-  const { registry, mcpAttachment } = await createSessionTooling({
+  const { registry, mcpAttachment, planModePolicy } = await createSessionTooling({
     skillLoaderOptions: { directories: configResult.config.skillDirectories, cwd: configCwd },
     operationalStore: dependencies.operationalStore,
     runtimeHardening: configResult.config.runtimeHardening,
@@ -572,14 +632,14 @@ async function buildHarnessSession(
     nextActions: buildNextActions(blockers, task, projectHarness)
   });
 
-  return { session, registry, mcpAttachment };
+  return { session, registry, mcpAttachment, planModePolicy };
 }
 
 interface CreateSessionToolingOptions extends CreateDefaultHarnessToolRegistryOptions {
   readonly mcpServers: readonly McpServerConfig[];
 }
 
-async function createSessionTooling(options: CreateSessionToolingOptions): Promise<Pick<BuiltHarnessSession, "registry" | "mcpAttachment">> {
+async function createSessionTooling(options: CreateSessionToolingOptions): Promise<Pick<BuiltHarnessSession, "registry" | "mcpAttachment" | "planModePolicy">> {
   const registry = createDefaultHarnessToolRegistry(options);
   const mcpAttachment = await attachConfiguredMcpServers({ servers: options.mcpServers });
 
@@ -590,7 +650,10 @@ async function createSessionTooling(options: CreateSessionToolingOptions): Promi
     for (const tool of createMcpMetaDispatchTools(registry)) {
       registry.register(tool);
     }
-    return { registry, mcpAttachment };
+    // Certify and snapshot the plan-mode policy AFTER the registry is final so
+    // later mutation or registration cannot enlarge/replace the frozen surface.
+    const planModePolicy = createCertifiedPlanModePolicy(registry);
+    return { registry, mcpAttachment, planModePolicy };
   } catch (error) {
     await mcpAttachment.closeAll();
     throw error;

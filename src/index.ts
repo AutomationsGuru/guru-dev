@@ -15,6 +15,7 @@ export * from "./model/openAiCompatiblePlannerModel.js";
 export * from "./model/schemas.js";
 export * from "./operational/schemas.js";
 export * from "./operational/store.js";
+export * from "./planner/planMode.js";
 export * from "./planner/runtime.js";
 export * from "./planner/schemas.js";
 export * from "./project-harness/bootstrap.js";
