@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   effectiveKeepRecentTokens,
@@ -16,6 +16,7 @@ import {
 } from "../../src/guru.js";
 import { runCompaction, shouldCompact, SUMMARY_ENTRY_PREFIX } from "../../src/compaction/engine.js";
 import { CompactionConfigSchema } from "../../src/compaction/schemas.js";
+import { createExtensionHost } from "../../src/extensions/host.js";
 import { createConversationStore } from "../../src/guru/conversationStore.js";
 import { refreshMemorySystemHead } from "../../src/guru/memorySessionService.js";
 import { clearRegisteredSecretValues, registerSecretValue } from "../../src/safety/secretSafety.js";
@@ -232,6 +233,62 @@ describe("/compact surfaces", () => {
       })
     ).toBe(true);
   });
+
+  it("wires the active extension-host veto into both manual and threshold compaction", () => {
+    const source = readFileSync(join(process.cwd(), "src", "guru.ts"), "utf8");
+    const runnerStart = source.indexOf("async function runGuruCompaction");
+    const runnerEnd = source.indexOf("\n}\n\n/**", runnerStart);
+    const runner = source.slice(runnerStart, runnerEnd);
+
+    expect(runnerStart).toBeGreaterThanOrEqual(0);
+    expect(runnerEnd).toBeGreaterThan(runnerStart);
+    expect(source).toContain("beforeCompact: extensions.host.beforeCompact");
+    expect(runner).toContain("beforeCompact: state.beforeCompact");
+    expect(runner.indexOf("if (\"cancelled\" in result)")).toBeLessThan(runner.indexOf("state.history ="));
+    expect(source).toContain('await runGuruCompaction(state, "threshold")');
+    expect(source).toContain('await runGuruCompaction(state, "manual", slash.args.join(" "))');
+    expect(source).not.toContain("const beforeCompactHook: BeforeCompactHook = () => undefined");
+  });
+
+  it.each(["manual", "threshold"] as const)(
+    "a %s extension veto preserves entries and suppresses summary plus compact notification",
+    async (reason) => {
+      const host = createExtensionHost();
+      const beforeCompact = vi.fn(() => ({ cancel: true as const }));
+      host.registerExtension((api) => {
+        api.registerBeforeCompact(beforeCompact);
+      });
+      host.start();
+
+      const entries = [
+        { id: "e1", kind: "user" as const, content: "old question" },
+        { id: "e2", kind: "assistant" as const, content: "old answer" },
+        { id: "e3", kind: "user" as const, content: "recent question" }
+      ];
+      const originalEntries = structuredClone(entries);
+      const summarize = vi.fn(() => Promise.resolve("must not run"));
+      const onCompact = vi.fn();
+
+      const result = await runCompaction({
+        entries,
+        config: CompactionConfigSchema.parse({ keepRecentTokens: 1 }),
+        summarize,
+        now: () => NOW,
+        reason,
+        beforeCompact: host.beforeCompact,
+        onCompact
+      });
+
+      expect(result).toEqual({ cancelled: true });
+      expect(entries).toEqual(originalEntries);
+      expect(beforeCompact).toHaveBeenCalledOnce();
+      expect(beforeCompact).toHaveBeenCalledWith(
+        expect.objectContaining({ reason, tokensBefore: expect.any(Number), firstKeptEntryId: expect.any(String) })
+      );
+      expect(summarize).not.toHaveBeenCalled();
+      expect(onCompact).not.toHaveBeenCalled();
+    }
+  );
 });
 
 describe("ACCEPTANCE: the auto-compaction flow end-to-end (deterministic, no network)", () => {

@@ -1,3 +1,4 @@
+import type { BeforeCompactHook } from "../compaction/engine.js";
 import type { ToolDefinition } from "../tools/registry.js";
 import type { LifecycleEventMap, LifecycleEvent } from "./events.js";
 
@@ -52,6 +53,7 @@ export interface ExtensionApi {
   registerCommand(id: string, handler: CommandHandler, metadata: CommandMetadata): void;
   registerRoute(method: string, path: string, handler: RouteHandler): void;
   registerMessageRenderer(id: string, renderer: MessageRenderer): void;
+  registerBeforeCompact(hook: BeforeCompactHook): void;
   on<T extends LifecycleEvent>(event: T, listener: (payload: LifecycleEventMap[T]) => void): void;
   off<T extends LifecycleEvent>(event: T, listener: (payload: LifecycleEventMap[T]) => void): void;
   sendMessage<T extends LifecycleEvent>(event: T, payload: LifecycleEventMap[T]): void;

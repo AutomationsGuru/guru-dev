@@ -121,4 +121,85 @@ describe("createExtensionHost", () => {
     const commands = [...host.getCommandRegistry().keys()].filter((id) => id === "once");
     expect(commands).toHaveLength(1);
   });
+
+  it("runs before-compact hooks in extension registration order", () => {
+    const host = createExtensionHost();
+    const calls: string[] = [];
+    host.registerExtension((api) => {
+      api.registerBeforeCompact(() => {
+        calls.push("first");
+        return { cancel: false };
+      });
+      api.registerBeforeCompact(() => {
+        calls.push("second");
+      });
+    });
+
+    host.start();
+
+    expect(host.beforeCompact({ tokensBefore: 1_200, firstKeptEntryId: "e9", reason: "manual" })).toBeUndefined();
+    expect(calls).toEqual(["first", "second"]);
+  });
+
+  it("short-circuits before-compact hooks when any hook cancels", () => {
+    const host = createExtensionHost();
+    const calls: string[] = [];
+    host.registerExtension((api) => {
+      api.registerBeforeCompact(() => {
+        calls.push("first");
+      });
+      api.registerBeforeCompact(() => {
+        calls.push("cancel");
+        return { cancel: true };
+      });
+      api.registerBeforeCompact(() => {
+        calls.push("unreachable");
+      });
+    });
+
+    host.start();
+
+    expect(host.beforeCompact({ tokensBefore: 1_200, firstKeptEntryId: "e9", reason: "threshold" })).toEqual({
+      cancel: true
+    });
+    expect(calls).toEqual(["first", "cancel"]);
+  });
+
+  it("converts a throwing before-compact hook into cancellation", () => {
+    const host = createExtensionHost();
+    let reachedLaterHook = false;
+    host.registerExtension((api) => {
+      api.registerBeforeCompact(() => {
+        throw new Error("veto hook failed");
+      });
+      api.registerBeforeCompact(() => {
+        reachedLaterHook = true;
+      });
+    });
+
+    host.start();
+
+    expect(host.beforeCompact({ tokensBefore: 1_200, firstKeptEntryId: "e9", reason: "manual" })).toEqual({
+      cancel: true
+    });
+    expect(reachedLaterHook).toBe(false);
+  });
+
+  it("rebuilds before-compact hooks on restart without duplicating them", () => {
+    const host = createExtensionHost();
+    let calls = 0;
+    host.registerExtension((api) => {
+      api.registerBeforeCompact(() => {
+        calls += 1;
+      });
+    });
+
+    host.start();
+    host.beforeCompact({ tokensBefore: 1_200, firstKeptEntryId: "e9", reason: "manual" });
+    host.stop();
+    host.start();
+    host.beforeCompact({ tokensBefore: 1_200, firstKeptEntryId: "e9", reason: "manual" });
+
+    expect(calls).toBe(2);
+  });
 });
