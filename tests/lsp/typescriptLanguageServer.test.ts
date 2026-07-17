@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -205,7 +205,7 @@ describe("TypeScript language-server lifecycle", () => {
       "textDocument/definition",
       "shutdown"
     ]);
-    expect(connection.requests[0]?.params).toMatchObject({ rootUri: pathToLspFileUri(repoRoot) });
+    expect(connection.requests[0]?.params).toMatchObject({ rootUri: pathToLspFileUri(realpathSync(repoRoot)) });
     expect(connection.notifications).toEqual([
       { method: "initialized", params: {} },
       {
