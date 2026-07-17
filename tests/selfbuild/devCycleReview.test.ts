@@ -17,6 +17,17 @@ describe("makeDevCycleReviewer (P7) — build the live reviewer from an askModel
     expect(reviewer).toBeDefined();
     const result = await reviewer!(gate, process.cwd());
     expect(result.verdict).toBe("GREEN");
+    expect(result.tokens).toBeUndefined();
+  });
+
+  it("returns the aggregate token total from usage-bearing model responses", async () => {
+    const askModel: AskModel = async () => ({ text: "[]", usage: { input: 2, output: 1 } });
+    const reviewer = makeDevCycleReviewer({ askModel, getReviewContext: async () => ({ diff: "a change" }) });
+
+    const result = await reviewer!(gate, process.cwd());
+
+    expect(result.verdict).toBe("GREEN");
+    expect(result.tokens).toBe(12); // four FIND calls × (2 input + 1 output)
   });
 });
 

@@ -344,6 +344,36 @@ describe("runDevCycle (P7 spine) — the real organs run", () => {
     expect(report.terminal).toBe("done");
   });
 
+  it("draws REVIEW tokens once and blocks SHIP when the drawdown reaches the ceiling", async () => {
+    const ship = vi.fn<StageRunner>(async () => ({ verdict: "GREEN", evidence: "ship-stub" }));
+    const report = await runDevCycle({
+      executor: async () => fakeReport(),
+      budget: { tokenBudget: 12 },
+      stages: {
+        test: async () => ({ verdict: "GREEN", evidence: "t" }),
+        smoke: async () => ({ verdict: "GREEN", evidence: "s" }),
+        ship
+      },
+      nativeReviewer: async (gate) => ({
+        ...gate,
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        durationMs: 0,
+        status: "passed",
+        verdict: "GREEN",
+        summary: "native panel GREEN",
+        tokens: 12
+      })
+    });
+
+    expect(report.budget.tokens).toBe(12);
+    expect(report.terminal).toBe("blocked");
+    expect(report.stages.at(-1)).toMatchObject({ stage: "ship", verdict: "RED" });
+    expect(report.stages.at(-1)?.evidence).toMatch(/token budget exhausted/u);
+    expect(ship).not.toHaveBeenCalled();
+  });
+
   it("REVIEW with no reviewer wired is a legible YELLOW (never a silent pass)", async () => {
     const report = await runDevCycle({
       executor: async () => fakeReport(),

@@ -47,6 +47,16 @@ export function makeAskModelFromRoute(route: ProviderRouteDescriptor, options: P
       }),
       approveTool: options.approveTool ?? (() => false)
     });
-    return result.text;
+    return {
+      text: result.text,
+      ...(result.usage
+        ? {
+            usage: {
+              input: result.usage.inputTokens ?? 0,
+              output: result.usage.outputTokens ?? 0
+            }
+          }
+        : {})
+    };
   };
 }

@@ -30,8 +30,8 @@ describe("makeAskModelFromRoute (P7) — a live askModel for critics", () => {
       }) as typeof fetch
     });
 
-    const text = await askModel("Review this diff for security issues.", { persona: "security", phase: "find" });
-    expect(text).toBe("[]");
+    const response = await askModel("Review this diff for security issues.", { persona: "security", phase: "find" });
+    expect(response).toEqual({ text: "[]", usage: { input: 5, output: 1 } });
     // Critics are read-only by construction — the turn offers no tools.
     expect(sawTools === undefined || (Array.isArray(sawTools) && sawTools.length === 0)).toBe(true);
   });

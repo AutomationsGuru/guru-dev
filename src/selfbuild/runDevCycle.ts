@@ -454,7 +454,11 @@ export async function runDevCycle(input: RunDevCycleInput = {}): Promise<DevCycl
       }
       const result = await reviewer(NATIVE_REVIEW_GATE, cwd);
       const verdict: StageVerdict = result.verdict ?? (result.status === "passed" ? "GREEN" : "RED");
-      return { verdict, evidence: result.summary };
+      return {
+        verdict,
+        evidence: result.summary,
+        ...(result.tokens !== undefined ? { tokens: result.tokens } : {})
+      };
     },
     debug: async () => {
       if (input.debug) {

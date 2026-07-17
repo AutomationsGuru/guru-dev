@@ -103,6 +103,8 @@ export type NativeReviewer = (gate: CommandGate, cwd?: string) => Promise<Comman
 export interface CommandGateResult extends CommandGate, CommandExecutionResult {
   readonly status: GateStatus;
   readonly summary: string;
+  /** Model tokens consumed by a native gate; absent for command gates and unknown usage. */
+  readonly tokens?: number;
   /** Explicit GREEN/YELLOW/RED (the native panel emits YELLOW on medium-only findings). */
   readonly verdict?: ReviewGateVerdict;
 }
