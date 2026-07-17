@@ -1,3 +1,4 @@
+import type { BeforeCompactHook } from "../compaction/engine.js";
 import type { ToolDefinition } from "../tools/registry.js";
 import {
   type ExtensionApi,
@@ -35,6 +36,7 @@ export interface ExtensionHost {
   getCommandRegistry(): ReadonlyMap<string, CommandEntry>;
   getRouteRegistry(): readonly RouteEntry[];
   getToolFactories(): readonly ToolFactoryRegistration[];
+  beforeCompact: BeforeCompactHook;
   sendMessage<T extends LifecycleEvent>(event: T, payload: LifecycleEventMap[T]): void;
   start(): void;
   stop(): void;
@@ -46,6 +48,7 @@ export function createExtensionHost(): ExtensionHost {
   const toolFactoryList: ToolFactoryRegistration[] = [];
   const providerRegistrations: ProviderRegistration[] = [];
   const messageRendererRegistrations: MessageRendererRegistration[] = [];
+  const beforeCompactHooks: BeforeCompactHook[] = [];
   const extensionRegistrations: ExtensionRegistration[] = [];
   const bus: EventBus = createEventBus();
   let activeModelId: string | null = null;
@@ -81,6 +84,10 @@ export function createExtensionHost(): ExtensionHost {
       messageRendererRegistrations.push({ id, renderer });
     },
 
+    registerBeforeCompact(hook: BeforeCompactHook): void {
+      beforeCompactHooks.push(hook);
+    },
+
     on<T extends LifecycleEvent>(event: T, listener: (payload: LifecycleEventMap[T]) => void): void {
       bus.on(event, listener);
     },
@@ -97,6 +104,19 @@ export function createExtensionHost(): ExtensionHost {
       activeModelId = modelId;
       bus.emit("model:select", { modelId });
     }
+  };
+
+  const beforeCompact: BeforeCompactHook = (preparation) => {
+    for (const hook of [...beforeCompactHooks]) {
+      try {
+        if (hook(preparation)?.cancel === true) {
+          return { cancel: true };
+        }
+      } catch {
+        return { cancel: true };
+      }
+    }
+    return undefined;
   };
 
   const host: ExtensionHost = {
@@ -120,6 +140,8 @@ export function createExtensionHost(): ExtensionHost {
       return toolFactoryList;
     },
 
+    beforeCompact,
+
     sendMessage<T extends LifecycleEvent>(event: T, payload: LifecycleEventMap[T]): void {
       bus.emit(event, payload);
     },
@@ -136,6 +158,7 @@ export function createExtensionHost(): ExtensionHost {
       toolFactoryList.length = 0;
       providerRegistrations.length = 0;
       messageRendererRegistrations.length = 0;
+      beforeCompactHooks.length = 0;
 
       // Isolate each extension (review 2026-07-08): a throw in one extension's
       // registration body (a bad tool factory, a missing field) used to abort the

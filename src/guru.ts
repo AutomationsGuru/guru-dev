@@ -227,6 +227,7 @@ interface GuruState {
   /** Append-only bookkeeping: last meta signature written, last compaction count logged. */
   lastMetaSig: string;
   lastCompactionCount: number;
+  beforeCompact: BeforeCompactHook;
   compaction: GuruCompactionState;
   /** Turn-loop retry policy (ADR 2026-07-05) — wired into every directAgentTurn. */
   retryConfig: RetryConfig;
@@ -441,9 +442,7 @@ export const GURU_CHAT_TOOL_IDS: ReadonlySet<string> = new Set([
   "pyautogui_keyboard",
   // Cursor-parity local tools (gap analysis 2026-07-10)
   "read_diagnostics",
-  "manage_task",
-  // LSP code intelligence (G576)
-  "lsp"
+  "manage_task"
 ]);
 
 export const READ_ONLY_TOOL_IDS: ReadonlySet<string> = new Set([
@@ -474,8 +473,7 @@ export const READ_ONLY_TOOL_IDS: ReadonlySet<string> = new Set([
   "operational.state.list",
   "operational.backlog.list",
   "github.pr.status",
-  "read_diagnostics",
-  "lsp"
+  "read_diagnostics"
 ]);
 
 /** Access text for `/tools`: reflect the mode actually active in this session. */
@@ -1319,9 +1317,7 @@ function routeDirectReady(route: ProviderRouteDescriptor | null): boolean {
 const SUMMARIZER_SYSTEM_PROMPT =
   "You summarize an agent-session transcript so the conversation can continue with less context. Produce a dense, factual summary: the operator's goals, decisions made, work completed (files, commands, outcomes), open threads, and any constraints stated. Never invent details. Never include credential values.";
 
-/** session_before_compact / session_compact seams — callable now, extension-event
- * delivery lands in the extension wave (deferred; noted in the Done Packet). */
-const beforeCompactHook: BeforeCompactHook = () => undefined;
+/** session_compact seam — callable now; event delivery remains deferred. */
 const onCompactHook: CompactHook = () => undefined;
 
 function buildRouteSummarizer(state: GuruState): (request: SummarizeRequest) => Promise<string> {
@@ -1437,7 +1433,7 @@ async function runGuruCompaction(
         readFiles: [...state.compaction.files.readFiles].sort(),
         modifiedFiles: [...state.compaction.files.modifiedFiles].sort()
       },
-      beforeCompact: beforeCompactHook,
+      beforeCompact: state.beforeCompact,
       onCompact: onCompactHook
     });
     if (result === null) {
@@ -5166,6 +5162,7 @@ export async function runGuru(): Promise<void> {
     turnsThisBranch: 0,
     lastMetaSig: "",
     lastCompactionCount: 0,
+    beforeCompact: extensions.host.beforeCompact,
     compaction: {
       config: harnessConfig.compaction,
       files: { readFiles: new Set<string>(), modifiedFiles: new Set<string>() },
