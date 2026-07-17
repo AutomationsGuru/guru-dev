@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import {
   findToolParityRow,
   getToolParityRows,
@@ -100,6 +102,28 @@ describe("tool parity map", () => {
     expect(findToolParityRow("ask_question")).toMatchObject({ status: "native-equivalent", verdict: "GREEN" });
   });
 
+  it("should report the complete manage_task background-parity truth", () => {
+    expect(findToolParityRow("manage_task")).toEqual({
+      toolId: "manage_task",
+      category: "base-tool",
+      requirementIds: ["FR-08", "TR-19"],
+      currentGuruHarnessToolIds: ["manage_task"],
+      status: "partial-equivalent",
+      verdict: "YELLOW",
+      ownerModule: "src/tools/builtins/manageTaskTool.ts",
+      notes: "Task-registry management exists through manage_task, but bash has no background-task ingress and GuruHarness has no monitor/stream surface.",
+      nextAction: "Add bounded background ingress and monitoring before claiming native parity."
+    });
+  });
+
+  it("should preserve every non-manage_task parity row", () => {
+    const rows = getToolParityRows().filter((row) => row.toolId !== "manage_task");
+    const digest = createHash("sha256").update(JSON.stringify(rows)).digest("hex");
+
+    expect(rows).toHaveLength(26);
+    expect(digest).toBe("da877d5db16dee3dd32a4e938c9c043af3b314ea035ab7f6bb3756b7eeb464e3");
+  });
+
   it("should keep rows unique and schema-valid", () => {
     const rows = getToolParityRows();
     const ids = rows.map((row) => row.toolId);
@@ -111,7 +135,7 @@ describe("tool parity map", () => {
   });
 
   it("should summarize RED/YELLOW/GREEN counts", () => {
-    // No RED rows remain; perplexity + repo + schedule stay YELLOW partials.
-    expect(getToolParityVerdictCounts()).toEqual({ GREEN: 23, YELLOW: 4, RED: 0 });
+    // No RED rows remain; perplexity + repo + schedule + service health + manage_task stay YELLOW partials.
+    expect(getToolParityVerdictCounts()).toEqual({ GREEN: 22, YELLOW: 5, RED: 0 });
   });
 });
