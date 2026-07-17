@@ -1,4 +1,5 @@
-import { chmodSync, mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -200,19 +201,21 @@ describe("TypeScript language-server lifecycle", () => {
       }
     ]);
 
+    const canonicalRoot = await realpath(repoRoot);
+    const canonicalFile = await realpath(filePath);
     expect(connection.requests.map(({ method }) => method)).toEqual([
       "initialize",
       "textDocument/definition",
       "shutdown"
     ]);
-    expect(connection.requests[0]?.params).toMatchObject({ rootUri: pathToLspFileUri(realpathSync(repoRoot)) });
+    expect(connection.requests[0]?.params).toMatchObject({ rootUri: pathToLspFileUri(canonicalRoot) });
     expect(connection.notifications).toEqual([
       { method: "initialized", params: {} },
       {
         method: "textDocument/didOpen",
         params: {
           textDocument: {
-            uri: pathToLspFileUri(filePath),
+            uri: pathToLspFileUri(canonicalFile),
             languageId: "typescriptreact",
             version: 1,
             text: "export const value = 1;\n"
