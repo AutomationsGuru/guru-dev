@@ -455,6 +455,25 @@ function defaultConnect(
   return connectContentLengthJsonRpc(options);
 }
 
+async function sameLspFileUri(left: string, right: string, platform: NodeJS.Platform = process.platform): Promise<boolean> {
+  if (left === right) return true;
+  try {
+    const leftPath = lspFileUriToPath(left, platform);
+    const rightPath = lspFileUriToPath(right, platform);
+    if (leftPath === rightPath) return true;
+    const [leftReal, rightReal] = await Promise.all([
+      realpath(leftPath).catch(() => leftPath),
+      realpath(rightPath).catch(() => rightPath)
+    ]);
+    if (platform === "win32") {
+      return leftReal.toLowerCase() === rightReal.toLowerCase();
+    }
+    return leftReal === rightReal;
+  } catch {
+    return false;
+  }
+}
+
 async function waitForMatchingDiagnostics(
   subscription: ContentLengthJsonRpcNotificationSubscription,
   uri: string,
@@ -465,7 +484,9 @@ async function waitForMatchingDiagnostics(
   for (let count = 0; count < MAX_DIAGNOSTIC_NOTIFICATIONS; count += 1) {
     const remaining = Math.max(1, deadline - Date.now());
     const notification = asRecord(await subscription.next(waitOptions(signal, remaining)));
-    if (notification?.uri === uri) return notification;
+    if (typeof notification?.uri === "string" && await sameLspFileUri(notification.uri, uri)) {
+      return notification;
+    }
   }
   throw new Error("LSP diagnostics exceeded the unmatched-notification cap.");
 }
