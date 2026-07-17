@@ -17,7 +17,22 @@ describe("base tools", () => {
 
   afterEach(async () => {
     resetBackgroundTasks();
-    await rm(repoRoot, { recursive: true, force: true });
+    // Windows CI can briefly hold the temp dir after background child teardown (EBUSY).
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      try {
+        await rm(repoRoot, { recursive: true, force: true });
+        return;
+      } catch (error) {
+        lastError = error;
+        const code = (error as NodeJS.ErrnoException | undefined)?.code;
+        if (code !== "EBUSY" && code !== "EPERM" && code !== "ENOTEMPTY") {
+          throw error;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
+      }
+    }
+    throw lastError;
   });
 
   it("should read with offset and limit", async () => {
