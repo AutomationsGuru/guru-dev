@@ -5,15 +5,18 @@ import { join } from "node:path";
 import { createToolRegistry, executeRegisteredTool } from "../../src/tools/registry.js";
 import { createBaseTools } from "../../src/tools/builtins/baseToolFactory.js";
 import { createPiBashTool } from "../../src/tools/builtins/bashTool.js";
+import { resetBackgroundTasks } from "../../src/tools/builtins/backgroundTaskRegistry.js";
 
 describe("base tools", () => {
   let repoRoot: string;
 
   beforeEach(async () => {
+    resetBackgroundTasks();
     repoRoot = await mkdtemp(join(tmpdir(), "guruharness-pibase-"));
   });
 
   afterEach(async () => {
+    resetBackgroundTasks();
     await rm(repoRoot, { recursive: true, force: true });
   });
 
@@ -82,13 +85,161 @@ describe("base tools", () => {
   });
 
   it("should run bash through an injected executor", async () => {
-    const registry = createToolRegistry(createBaseTools({ bash: { shellAllowlist: ["node"], executor: async () => ({ exitCode: 0, stdout: "ok", stderr: "", durationMs: 1 }) } }));
+    let backgroundStarts = 0;
+    const registry = createToolRegistry(createBaseTools({
+      bash: {
+        shellAllowlist: ["node"],
+        executor: async () => ({ exitCode: 0, stdout: "ok", stderr: "", durationMs: 1 }),
+        startBackground: () => {
+          backgroundStarts += 1;
+          return "unexpected";
+        }
+      }
+    }));
     const observation = await executeRegisteredTool(registry, "bash", { repoRoot, command: "node", args: ["script.js"], dryRun: false });
-    expect(observation.output).toMatchObject({ executed: true, exitCode: 0, stdout: "ok" });
+    expect(observation.output).toMatchObject({ executed: true, background: false, exitCode: 0, stdout: "ok" });
+    expect(backgroundStarts).toBe(0);
+  });
+
+  it("starts a background bash task that the default manage_task tool can list and inspect", async () => {
+    const registry = createToolRegistry(createBaseTools({ bash: { shellAllowlist: [process.execPath] } }));
+    const launched = await executeRegisteredTool(registry, "bash", {
+      repoRoot,
+      command: process.execPath,
+      args: ["-e", "setTimeout(() => {}, 10_000)"],
+      background: true,
+      dryRun: false
+    });
+    const launchOutput = launched.output as {
+      readonly executed?: boolean;
+      readonly background?: boolean;
+      readonly taskId?: string;
+      readonly command?: readonly string[];
+      readonly exitCode?: number | null;
+      readonly stdout?: string;
+      readonly stderr?: string;
+    };
+
+    expect(launched.status).toBe("succeeded");
+    expect(launchOutput).toMatchObject({
+      executed: true,
+      background: true,
+      taskId: expect.stringMatching(/^task-/u),
+      command: [process.execPath, "-e", "setTimeout(() => {}, 10_000)"]
+    });
+    expect(launchOutput).not.toHaveProperty("exitCode");
+    expect(launchOutput).not.toHaveProperty("stdout");
+    expect(launchOutput).not.toHaveProperty("stderr");
+
+    const listed = await executeRegisteredTool(registry, "manage_task", { Action: "list" });
+    const list = (listed.output as { result: readonly { id: string }[] }).result;
+    expect(list).toHaveLength(1);
+    expect(list.some((task) => task.id === launchOutput.taskId)).toBe(true);
+
+    const status = await executeRegisteredTool(registry, "manage_task", { Action: "status", TaskId: launchOutput.taskId });
+    expect(status.output).toMatchObject({ result: { id: launchOutput.taskId, state: "running" } });
+    await executeRegisteredTool(registry, "manage_task", { Action: "kill", TaskId: launchOutput.taskId });
   });
 });
 
 describe("bash full-command-line handling (shakedown fixes)", () => {
+  it("launches the quote-aware normalized argv through the injected background starter only", async () => {
+    const backgroundCalls: Array<{ readonly command: readonly string[]; readonly cwd: string }> = [];
+    let foregroundCalls = 0;
+    const tool = createPiBashTool({
+      shellAllowlist: ["node"],
+      executor: async () => {
+        foregroundCalls += 1;
+        return { exitCode: 0, stdout: "unexpected", stderr: "", durationMs: 1 };
+      },
+      startBackground: (command, cwd) => {
+        backgroundCalls.push({ command: [...command], cwd });
+        return "task-test";
+      }
+    });
+
+    const output = await tool.execute({
+      repoRoot: process.cwd(),
+      command: 'node -e "console.log(1)"',
+      args: [],
+      background: true,
+      timeoutMs: 5000,
+      maxOutputBytes: 64000,
+      dryRun: false
+    }, {});
+
+    expect(backgroundCalls).toEqual([{ command: ["node", "-e", "console.log(1)"], cwd: process.cwd() }]);
+    expect(foregroundCalls).toBe(0);
+    expect(output).toMatchObject({
+      executed: true,
+      dryRun: false,
+      background: true,
+      command: ["node", "-e", "console.log(1)"],
+      taskId: "task-test",
+      blockers: []
+    });
+    expect(output).not.toHaveProperty("exitCode");
+    expect(output).not.toHaveProperty("stdout");
+    expect(output).not.toHaveProperty("stderr");
+    expect(output).not.toHaveProperty("durationMs");
+  });
+
+  it("applies every foreground pre-execution policy before a background start", async () => {
+    let backgroundStarts = 0;
+    const tool = createPiBashTool({
+      shellAllowlist: ["node"],
+      startBackground: () => {
+        backgroundStarts += 1;
+        return "must-not-start";
+      }
+    });
+    const registry = createToolRegistry([tool]);
+    const cases: readonly Record<string, unknown>[] = [
+      { repoRoot: process.cwd(), command: "curl https://example.com", background: true, dryRun: false },
+      { repoRoot: process.cwd(), command: "node -e ok", background: true, dryRun: true },
+      { repoRoot: process.cwd(), command: "node -e ok", cwd: "..", background: true, dryRun: false },
+      { repoRoot: process.cwd(), command: "node", args: ["TOKEN=secret-value"], background: true, dryRun: false },
+      { repoRoot: process.cwd(), command: "node -e ok && node -e bypass", background: true, dryRun: false }
+    ];
+
+    for (const input of cases) {
+      const observation = await executeRegisteredTool(registry, "bash", input);
+      expect(observation.status).toBe("succeeded");
+      expect(observation.output).toMatchObject({ executed: false, background: true });
+    }
+    expect(backgroundStarts).toBe(0);
+  });
+
+  it("parses the same argv for foreground and background modes", async () => {
+    let foregroundArgv: readonly string[] = [];
+    let backgroundArgv: readonly string[] = [];
+    const tool = createPiBashTool({
+      shellAllowlist: ["node"],
+      executor: async (command) => {
+        foregroundArgv = [...command];
+        return { exitCode: 0, stdout: "ok", stderr: "", durationMs: 1 };
+      },
+      startBackground: (command) => {
+        backgroundArgv = [...command];
+        return "task-parity";
+      }
+    });
+    const shared = {
+      repoRoot: process.cwd(),
+      command: 'node -e "console.log(1)"',
+      args: [] as string[],
+      timeoutMs: 5000,
+      maxOutputBytes: 64000,
+      dryRun: false
+    };
+
+    await tool.execute({ ...shared, background: false }, {});
+    await tool.execute({ ...shared, background: true }, {});
+
+    expect(backgroundArgv).toEqual(foregroundArgv);
+    expect(foregroundArgv).toEqual(["node", "-e", "console.log(1)"]);
+  });
+
   it("splits a full command line into argv when args are omitted", async () => {
     let seen: readonly string[] = [];
     const tool = createPiBashTool({
