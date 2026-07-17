@@ -4,7 +4,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, relative, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
@@ -27,6 +27,11 @@ interface CliResult {
   readonly stderr: string;
   readonly status: number | null;
   readonly error?: Error;
+}
+
+
+function toNodeImportSpecifier(absolutePath: string): string {
+  return pathToFileURL(absolutePath).href;
 }
 
 function createFixture(gitPresent: boolean): Fixture {
@@ -90,7 +95,8 @@ function createFixture(gitPresent: boolean): Fixture {
 }
 
 function runDryRun(fixture: Fixture, plannerKey?: string): CliResult {
-  const tsxImport = process.env.GURU_TEST_TSX_IMPORT ?? require.resolve("tsx");
+  const tsxImportPath = process.env.GURU_TEST_TSX_IMPORT ?? require.resolve("tsx");
+  const tsxImport = toNodeImportSpecifier(tsxImportPath);
   const externalNodeOptions = process.env.GURU_TEST_NODE_OPTIONS;
   const env: NodeJS.ProcessEnv = {
     PATH: fixture.commandPath,
@@ -143,6 +149,14 @@ function expectSuccessfulPreview(result: CliResult): void {
 }
 
 describe("self-build-run --dry-run wiring honesty", { timeout: 60_000 }, () => {
+  it("converts the Node import path to a file URL", () => {
+    const importPath = join(repoRoot, "node_modules", "tsx", "dist", "loader.mjs");
+    const importSpecifier = toNodeImportSpecifier(importPath);
+
+    expect(new URL(importSpecifier).protocol).toBe("file:");
+    expect(fileURLToPath(importSpecifier)).toBe(importPath);
+  });
+
   it("reflects configured reviewer, smoke, and git availability without executing any of them", () => {
     const fixture = createFixture(true);
     try {
