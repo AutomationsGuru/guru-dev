@@ -17,7 +17,19 @@ describe("base tools", () => {
 
   afterEach(async () => {
     resetBackgroundTasks();
-    await rm(repoRoot, { recursive: true, force: true });
+    // Windows may keep a short lock on the temp cwd after killing a background child.
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      try {
+        await rm(repoRoot, { recursive: true, force: true });
+        return;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if ((code !== "EBUSY" && code !== "EPERM" && code !== "ENOTEMPTY") || attempt === 7) {
+          throw error;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
+      }
+    }
   });
 
   it("should read with offset and limit", async () => {
