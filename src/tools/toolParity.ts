@@ -326,11 +326,11 @@ export const TOOL_PARITY_ROWS: readonly ToolParityRow[] = [
     category: "base-tool",
     requirementIds: ["FR-08", "TR-19"],
     currentGuruHarnessToolIds: ["manage_task"],
-    status: "native-equivalent",
-    verdict: "GREEN",
+    status: "partial-equivalent",
+    verdict: "YELLOW",
     ownerModule: "src/tools/builtins/manageTaskTool.ts",
-    notes: "Added to bridge background task management parity.",
-    nextAction: "Parity met."
+    notes: "Task-registry management exists through manage_task, but bash has no background-task ingress and GuruHarness has no monitor/stream surface.",
+    nextAction: "Add bounded background ingress and monitoring before claiming native parity."
   },
   {
     toolId: "service_health",
