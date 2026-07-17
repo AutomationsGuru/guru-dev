@@ -4,7 +4,7 @@ import { z } from "zod";
 
 import { AgentSession } from "../session/agentSession.js";
 import { onSecretSanitized } from "../safety/secretSafety.js";
-import { createHarnessRuntime, type HarnessRuntime } from "../runtime/session.js";
+import { createHarnessRuntime, type HarnessRuntime, type HarnessRuntimeDependencies } from "../runtime/session.js";
 import type { HarnessSession } from "../runtime/schemas.js";
 import { createDirectProviderCatalog } from "../providers/catalog.js";
 import { createMandateStore } from "../mandates/store.js";
@@ -17,6 +17,10 @@ import {
   type RpcForkSessionFactory,
   type RpcSessionGraph
 } from "./rpcSessionGraph.js";
+import {
+  createOperatorQuestionBroker,
+  type OperatorQuestionBroker
+} from "./operatorQuestionBroker.js";
 
 /**
  * The RPC surface (RPC wave, ADR 2026-07-05-rpc-surface, THERE v2 §14 + §17
@@ -44,6 +48,7 @@ export interface RpcContext {
   readonly graph?: RpcSessionGraph;
   readonly emit: RpcEmit;
   readonly routes?: readonly ProviderRouteDescriptor[];
+  readonly operatorQuestions?: OperatorQuestionBroker;
 }
 
 /**
@@ -109,6 +114,11 @@ export async function dispatchRpc(request: RpcRequest, ctx: RpcContext): Promise
       case "operator.answer": {
         const questionId = String(params.questionId ?? "");
         if (questionId.length === 0) return { ...idField, ok: false, error: "questionId required" };
+        if (ctx.operatorQuestions) {
+          const result = ctx.operatorQuestions.answer(questionId, params.answers as string[][]);
+          if (!result.ok) return { ...idField, ok: false, error: result.error };
+          return { ...idField, ok: true, result: { questionId } };
+        }
         if (!session.hasAnswerHandler()) return { ...idField, ok: false, error: "No answer handler wired" };
         try {
           const answer = await session.dispatchAnswer(questionId);
@@ -206,7 +216,7 @@ export interface RunRpcOptions {
   /** Explicit branch factory for injected-session tests. */
   readonly createForkSession?: RpcForkSessionFactory;
   /** Construct the runtime RPC will own when it bootstraps a session. Ignored for an injected session. */
-  readonly createRuntime?: () => HarnessRuntime;
+  readonly createRuntime?: (dependencies?: HarnessRuntimeDependencies) => HarnessRuntime;
   /** Active harness-config loader; injectable for deterministic bootstrap tests. */
   readonly loadConfig?: typeof loadHarnessConfig;
   readonly routes?: readonly ProviderRouteDescriptor[];
@@ -233,8 +243,9 @@ function createAgentSession(
 }
 
 async function bootstrapSession(
-  createRuntime: () => HarnessRuntime,
-  loadConfig: typeof loadHarnessConfig
+  createRuntime: (dependencies?: HarnessRuntimeDependencies) => HarnessRuntime,
+  loadConfig: typeof loadHarnessConfig,
+  operatorQuestions: OperatorQuestionBroker
 ): Promise<{
   session: AgentSession;
   rootSessionId: string;
@@ -242,7 +253,11 @@ async function bootstrapSession(
   routes: readonly ProviderRouteDescriptor[];
   runtime: HarnessRuntime;
 }> {
-  const runtime = createRuntime();
+  const runtime = createRuntime({
+    interactiveCallbacks: {
+      askQuestion: (questions, { sessionId }) => operatorQuestions.ask(sessionId, questions)
+    }
+  });
   try {
     const config = loadConfig().config;
     const routes = createDirectProviderCatalog();
@@ -288,10 +303,12 @@ export async function runRpcMode(options: RunRpcOptions = {}): Promise<void> {
   let createForkSession = options.createForkSession;
   let routes = options.routes;
   let ownedRuntime: HarnessRuntime | undefined;
+  const operatorQuestions = session ? undefined : createOperatorQuestionBroker();
   if (!session) {
     const boot = await bootstrapSession(
       options.createRuntime ?? createHarnessRuntime,
-      options.loadConfig ?? loadHarnessConfig
+      options.loadConfig ?? loadHarnessConfig,
+      operatorQuestions!
     );
     session = boot.session;
     rootSessionId = boot.rootSessionId;
@@ -299,17 +316,50 @@ export async function runRpcMode(options: RunRpcOptions = {}): Promise<void> {
     routes = boot.routes;
     ownedRuntime = boot.runtime;
   }
+  const liveSessions = new Set<AgentSession>([session]);
+  const trackedForkSession = createForkSession
+    ? async () => {
+        const created = await createForkSession!();
+        liveSessions.add(created.session);
+        return created;
+      }
+    : undefined;
   const graph = createRpcSessionGraph({
     rootSessionId,
     rootSession: session,
-    ...(createForkSession ? { createForkSession } : {})
+    ...(trackedForkSession ? { createForkSession: trackedForkSession } : {})
   });
-  const ctx: RpcContext = { session, graph, emit, ...(routes ? { routes } : {}) };
+  const ctx: RpcContext = {
+    session,
+    graph,
+    emit,
+    ...(routes ? { routes } : {}),
+    ...(operatorQuestions ? { operatorQuestions } : {})
+  };
   let unwire = wireRpcEvents(session, emit);
+  const unsubscribeOperatorQuestions = operatorQuestions?.onQuestion((record) => {
+    emit({
+      type: "event",
+      event: "operator.question",
+      questionId: record.questionId,
+      sessionId: record.sessionId,
+      questions: record.questions
+    });
+  });
   const unsubscribeActiveSession = graph.subscribeActiveSession((_sessionId, activeSession) => {
     unwire();
     unwire = wireRpcEvents(activeSession, emit);
   });
+  const closePendingQuestions = (): void => {
+    for (const liveSession of liveSessions) {
+      try {
+        liveSession.closeQuestions();
+      } catch {
+        // best-effort — never block shutdown
+      }
+    }
+    operatorQuestions?.close();
+  };
   try {
     emit({
       type: "event",
@@ -323,7 +373,7 @@ export async function runRpcMode(options: RunRpcOptions = {}): Promise<void> {
         "suit_up",
         "park",
         "models",
-        "operator.answer",
+        ...(operatorQuestions || session.hasAnswerHandler() ? ["operator.answer"] : []),
         "compaction",
         "get_tree",
         "fork",
@@ -369,6 +419,9 @@ export async function runRpcMode(options: RunRpcOptions = {}): Promise<void> {
       const finish = (): void => {
         if (finishing) return;
         finishing = true;
+        // A prompt may itself be waiting on ask_question/waitForAnswer. Close
+        // those waiters before awaiting the prompt chain or EOF can deadlock.
+        closePendingQuestions();
         void promptChain.then(async () => {
           await Promise.allSettled([...pendingDispatches]);
           resolve();
@@ -394,11 +447,8 @@ export async function runRpcMode(options: RunRpcOptions = {}): Promise<void> {
       input.on("close", finish);
     });
   } finally {
-    try {
-      ctx.session.closeQuestions();
-    } catch {
-      // best-effort — never block shutdown
-    }
+    closePendingQuestions();
+    unsubscribeOperatorQuestions?.();
     unsubscribeActiveSession();
     unwire();
     await ownedRuntime?.close();

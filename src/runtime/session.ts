@@ -342,10 +342,8 @@ export function createDefaultHarnessToolRegistry(options: CreateDefaultHarnessTo
       read: { secretAllowList: options.runtimeHardening.secretAllowList },
       // TUI/RPC can inject ask_question; otherwise the tool falls back to its own TTY prompt.
       // When a sessionId is allocated, wrap the callback so it receives the typed context.
-      ...(options.interactiveCallbacks?.askQuestion
-        ? { askQuestion: { onAsk: options.sessionId
-            ? (questions: any) => options.interactiveCallbacks!.askQuestion!(questions, { sessionId: options.sessionId! })
-            : (questions: any) => options.interactiveCallbacks!.askQuestion!(questions, { sessionId: "" }) } }
+      ...(options.interactiveCallbacks?.askQuestion && options.sessionId
+        ? { askQuestion: { onAsk: (questions: any) => options.interactiveCallbacks!.askQuestion!(questions, { sessionId: options.sessionId! }) } }
         : {}),
       ...(scheduleDelivery
         ? {

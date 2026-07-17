@@ -401,13 +401,63 @@ describe("runRpcMode — request ordering", () => {
       "suit_up",
       "park",
       "models",
-      "operator.answer",
       "compaction",
       "get_tree",
       "fork",
       "switch_session"
     ]);
     expect((ready?.methods as string[] | undefined)?.filter((method) => method === "compaction")).toHaveLength(1);
+  });
+
+  it("wires bootstrapped operator questions through RPC without an injected AgentSession", async () => {
+    let askQuestion: NonNullable<
+      NonNullable<Parameters<typeof createHarnessRuntime>[0]>["interactiveCallbacks"]
+    >["askQuestion"];
+    const runtime = {
+      startSession: vi.fn(async () => ({ id: "rpc-live", repo: null, tools: [] })),
+      getSessionTools: vi.fn(() => []),
+      closeSession: vi.fn(async () => true),
+      close: vi.fn(async () => {})
+    } as unknown as ReturnType<typeof createHarnessRuntime>;
+    const createRuntime = vi.fn((dependencies?: Parameters<typeof createHarnessRuntime>[0]) => {
+      askQuestion = dependencies?.interactiveCallbacks?.askQuestion;
+      return runtime;
+    });
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const chunks: string[] = [];
+    output.on("data", (chunk) => chunks.push(String(chunk)));
+    const run = runRpcMode({ input, output, createRuntime });
+    await vi.waitFor(() => {
+      expect(parseRpcOutput(chunks).find((message) => message.event === "ready")?.methods).toContain("operator.answer");
+    });
+
+    const pendingAnswer = askQuestion!([
+      { question: "Proceed?", options: ["yes", "no"], multiSelect: false }
+    ], { sessionId: "rpc-live" });
+    await vi.waitFor(() => {
+      expect(parseRpcOutput(chunks).find((message) => message.event === "operator.question")).toMatchObject({
+        sessionId: "rpc-live",
+        questionId: expect.any(String)
+      });
+    });
+    const question = parseRpcOutput(chunks).find((message) => message.event === "operator.question")!;
+    input.write(`${JSON.stringify({
+      id: 51,
+      method: "operator.answer",
+      params: { questionId: question.questionId, answers: [["yes"]] }
+    })}\n`);
+
+    await expect(waitForRpcResponse(chunks, 51)).resolves.toMatchObject({
+      id: 51,
+      ok: true,
+      result: { questionId: question.questionId }
+    });
+    await expect(pendingAnswer).resolves.toEqual([["yes"]]);
+    input.end();
+    await run;
+    expect(createRuntime).toHaveBeenCalledTimes(1);
+    expect(runtime.close).toHaveBeenCalledTimes(1);
   });
 
   it("passes active disabled compaction config through graph bootstrap sessions", async () => {
@@ -552,6 +602,67 @@ describe("runRpcMode — request ordering", () => {
     await child.prompt("after close");
     expect(parseRpcOutput(chunks)).toHaveLength(countAfterClose);
   });
+
+  it("rejects pending questions on every live graph session during shutdown", async () => {
+    const root = makeSession();
+    root.history.push({ role: "user", content: "branch" });
+    const child = makeSession();
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const chunks: string[] = [];
+    output.on("data", (chunk) => chunks.push(String(chunk)));
+    const run = runRpcMode({
+      session: root,
+      rootSessionId: "root",
+      createForkSession: async () => ({ sessionId: "child", session: child }),
+      input,
+      output
+    });
+    input.write(`${JSON.stringify({ id: 1, method: "fork", params: { throughHistoryIndex: 0 } })}\n`);
+    await expect(waitForRpcResponse(chunks, 1)).resolves.toMatchObject({ ok: true });
+    const rootClosed = expect(root.waitForAnswer("root-question")).rejects.toThrow("Session closed");
+    const childClosed = expect(child.waitForAnswer("child-question")).rejects.toThrow("Session closed");
+
+    input.end();
+    await run;
+
+    await rootClosed;
+    await childClosed;
+  });
+
+  it("closes a question awaited inside the active prompt before waiting for prompt shutdown", async () => {
+    let session!: AgentSession;
+    let pendingQuestion!: Promise<string>;
+    let enteredQuestion!: () => void;
+    const questionStarted = new Promise<void>((resolve) => {
+      enteredQuestion = resolve;
+    });
+    const runner = (async () => {
+      pendingQuestion = session.waitForAnswer("prompt-question");
+      enteredQuestion();
+      await pendingQuestion;
+      return {
+        text: "answered",
+        modelId: "m",
+        routeId: "stub/model",
+        apiFamily: "openai-chat-completions",
+        toolCallCount: 0,
+        toolEvents: []
+      } satisfies AgentTurnResult;
+    }) as TurnRunner;
+    session = makeSession(runner);
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const run = runRpcMode({ session, input, output });
+    input.write(`${JSON.stringify({ id: 1, method: "prompt", params: { text: "wait for operator" } })}\n`);
+    await questionStarted;
+    const questionClosed = expect(pendingQuestion).rejects.toThrow("Session closed");
+
+    input.end();
+
+    await expect(run).resolves.toBeUndefined();
+    await questionClosed;
+  }, 1_000);
 
   it("returns a truthful bounded error when an injected session has no fork factory", async () => {
     const root = makeSession();
@@ -769,7 +880,7 @@ describe("operator.answer (§G708)", () => {
         emitted.push(JSON.parse(line));
       }
     });
-    const s = makeSession();
+    const s = makeSession(undefined, undefined, { answerHandler: async () => "ok" });
     const mode = runRpcMode({ session: s, input, output, createRuntime: () => ({ executeTool: async () => ({ toolId: "read", status: "succeeded", startedAt: "t", endedAt: "t", durationMs: 0 }), close: async () => {} }) as never });
     // Small tick for the ready event to flush
     await new Promise((r) => setTimeout(r, 20));

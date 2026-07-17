@@ -8,6 +8,7 @@ import { z } from "zod";
 
 import {
   createHarnessRuntime,
+  createDefaultHarnessToolRegistry,
   createInMemoryOperationalStore,
   createInMemorySessionPersistenceStore,
   createToolRegistry,
@@ -16,6 +17,7 @@ import {
   type ToolDefinition
 } from "../../src/index.js";
 import { initExtensions } from "../../src/extensions/initExtensions.js";
+import { loadHarnessConfig } from "../../src/config/loadConfig.js";
 import { ensureGuruHome } from "../../src/home/paths.js";
 import { manageBackgroundTask, resetBackgroundTasks } from "../../src/tools/builtins/backgroundTaskRegistry.js";
 
@@ -286,6 +288,26 @@ describe("createHarnessRuntime", () => {
     } finally {
       await runtime.close();
     }
+  });
+
+  it("does not invoke an askQuestion callback with an invented empty session id", async () => {
+    const askQuestion = vi.fn(async () => [["yes"]]);
+    const config = loadHarnessConfig({ cwd: repoRoot }).config;
+    const registry = createDefaultHarnessToolRegistry({
+      skillLoaderOptions: { directories: config.skillDirectories, cwd: repoRoot },
+      operationalStore: createInMemoryOperationalStore(),
+      runtimeHardening: config.runtimeHardening,
+      memoryConfig: config.memory,
+      interactiveCallbacks: { askQuestion }
+    });
+    const tool = registry.get("ask_question");
+
+    const result = await tool!.execute({
+      questions: [{ question: "Proceed?", options: ["yes", "no"], multiSelect: false }]
+    }, {});
+
+    expect(askQuestion).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ interactive: false, answers: [[]] });
   });
 
   it("clears pending scheduled notifications when the runtime closes", async () => {
