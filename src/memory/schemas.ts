@@ -157,6 +157,65 @@ export const MemoryDoctorReportSchema = z
 
 export type MemoryDoctorReport = z.infer<typeof MemoryDoctorReportSchema>;
 
+const MemorySyncContentHashSchema = z.string().regex(/^[a-f0-9]{64}$/u, "memory sync hashes must be lowercase SHA-256 hex");
+
+export const MemorySyncSinkStateSchema = z
+  .object({
+    contentHash: MemorySyncContentHashSchema,
+    syncedAt: z.string().datetime()
+  })
+  .strict();
+export type MemorySyncSinkState = z.infer<typeof MemorySyncSinkStateSchema>;
+
+export const MemorySyncFactStateSchema = z
+  .object({
+    l2: MemorySyncSinkStateSchema.optional(),
+    l3: MemorySyncSinkStateSchema.optional()
+  })
+  .strict();
+export type MemorySyncFactState = z.infer<typeof MemorySyncFactStateSchema>;
+
+/** Per-memory-directory upward replay ledger. L2/L3 advance independently. */
+export const MemorySyncStateSchema = z
+  .object({
+    version: z.literal(1),
+    facts: z.record(MemoryFactNameSchema, MemorySyncFactStateSchema)
+  })
+  .strict();
+export type MemorySyncState = z.infer<typeof MemorySyncStateSchema>;
+
+export const MemorySyncSinkStatusSchema = z.enum(["not-configured", "unchanged", "deduplicated", "synced", "blocked", "failed"]);
+export type MemorySyncSinkStatus = z.infer<typeof MemorySyncSinkStatusSchema>;
+
+export const MemorySyncSinkResultSchema = z
+  .object({
+    status: MemorySyncSinkStatusSchema,
+    summary: z.string().trim().min(1)
+  })
+  .strict();
+export type MemorySyncSinkResult = z.infer<typeof MemorySyncSinkResultSchema>;
+
+export const MemorySyncFactResultSchema = z
+  .object({
+    name: MemoryFactNameSchema,
+    contentHash: MemorySyncContentHashSchema,
+    l2: MemorySyncSinkResultSchema,
+    l3: MemorySyncSinkResultSchema,
+    blockers: z.array(z.string().trim().min(1))
+  })
+  .strict();
+export type MemorySyncFactResult = z.infer<typeof MemorySyncFactResultSchema>;
+
+export const MemorySyncReportSchema = z
+  .object({
+    status: z.enum(["succeeded", "partial", "blocked"]),
+    facts: z.array(MemorySyncFactResultSchema),
+    warnings: z.array(z.string().trim().min(1)),
+    summary: z.string().trim().min(1)
+  })
+  .strict();
+export type MemorySyncReport = z.infer<typeof MemorySyncReportSchema>;
+
 /** Soft cap mirrors the largest fact in the proven live corpus; hard cap blocks. */
 export const MEMORY_BODY_SOFT_CAP = 16 * 1024;
 export const MEMORY_BODY_HARD_CAP = 32 * 1024;
