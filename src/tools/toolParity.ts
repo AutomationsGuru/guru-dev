@@ -329,8 +329,8 @@ export const TOOL_PARITY_ROWS: readonly ToolParityRow[] = [
     status: "partial-equivalent",
     verdict: "YELLOW",
     ownerModule: "src/tools/builtins/manageTaskTool.ts",
-    notes: "Task-registry management exists through manage_task, but bash has no background-task ingress and GuruHarness has no monitor/stream surface.",
-    nextAction: "Add bounded background ingress and monitoring before claiming native parity."
+    notes: "Task-registry management and bounded bash background ingress exist with secret scrub on manage_task views; GuruHarness still lacks a line-stream monitor surface and background-task timeout enforcement.",
+    nextAction: "Add bounded monitoring/stream semantics and background timeout enforcement before claiming native parity."
   },
   {
     toolId: "service_health",

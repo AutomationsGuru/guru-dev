@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 
 import { resolveWindowsGateSpawn } from "../../review/gates.js";
+import { scrubSecretValues } from "../../safety/secretSafety.js";
 
 interface BackgroundTaskRecord {
   readonly id: string;
@@ -29,16 +30,17 @@ function appendTail(current: string, chunk: string): string {
 }
 
 function publicView(task: BackgroundTaskRecord) {
+  // Agent-visible choke point: same secret-shape scrub as foreground bash/output paths.
   return {
     id: task.id,
     kind: task.kind,
     command: [...task.command],
     cwd: task.cwd,
-    ...(task.prompt !== undefined ? { prompt: task.prompt } : {}),
+    ...(task.prompt !== undefined ? { prompt: scrubSecretValues(task.prompt) } : {}),
     state: task.state,
     exitCode: task.exitCode,
-    stdout: task.stdout,
-    stderr: task.stderr,
+    stdout: scrubSecretValues(task.stdout),
+    stderr: scrubSecretValues(task.stderr),
     startedAt: task.startedAt,
     endedAt: task.endedAt ?? null
   };
