@@ -1,7 +1,6 @@
 import { constants as fsConstants } from "node:fs";
 import { access, readFile, realpath, stat } from "node:fs/promises";
 import { basename, extname, isAbsolute, join, posix, relative, resolve, sep, win32 } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { commandExists, resolveWindowsGateSpawn } from "../review/gates.js";
 import {
@@ -182,7 +181,12 @@ function encodeUriPath(path: string): string {
 
 export function pathToLspFileUri(path: string, platform: NodeJS.Platform = process.platform): string {
   if (platform !== "win32") {
-    return pathToFileURL(path).href;
+    // Host-independent: pathToFileURL follows the runner OS and breaks "linux" URIs on Windows CI.
+    const normalized = path.replace(/\\/gu, "/");
+    if (!normalized.startsWith("/")) {
+      throw new Error("POSIX LSP file paths must be absolute.");
+    }
+    return `file://${encodeUriPath(normalized)}`;
   }
   const normalized = path.replace(/\\/gu, "/");
   if (/^[A-Za-z]:\//u.test(normalized)) {
@@ -204,7 +208,12 @@ export function lspFileUriToPath(uri: string, platform: NodeJS.Platform = proces
     throw new Error("LSP location URI is not a file URI.");
   }
   if (platform !== "win32") {
-    return fileURLToPath(parsed);
+    // Host-independent POSIX path decode (fileURLToPath is OS-specific on Windows).
+    const pathname = decodeURIComponent(parsed.pathname);
+    if (parsed.hostname && parsed.hostname !== "" && parsed.hostname !== "localhost") {
+      return `//${parsed.hostname}${pathname}`;
+    }
+    return pathname;
   }
   const pathname = decodeURIComponent(parsed.pathname);
   if (parsed.hostname && parsed.hostname !== "localhost") {
@@ -255,11 +264,16 @@ async function prepareDocument(
   if (!(await stat(canonicalRoot)).isDirectory()) {
     throw new Error("LSP repoRoot must be a directory.");
   }
-  const candidate = resolve(canonicalRoot, isAbsolute(input.filePath) ? input.filePath : input.filePath);
-  if (!isContained(canonicalRoot, candidate)) {
+  // Resolve then realpath before containment checks so Windows short/long path aliases match.
+  const resolvedCandidate = isAbsolute(input.filePath)
+    ? resolve(input.filePath)
+    : resolve(canonicalRoot, input.filePath);
+  let canonicalFile: string;
+  try {
+    canonicalFile = await realpath(resolvedCandidate);
+  } catch {
     throw new Error("LSP file must be contained inside the active repository.");
   }
-  const canonicalFile = await realpath(candidate);
   if (!isContained(canonicalRoot, canonicalFile)) {
     throw new Error("LSP file must be contained inside the active repository after resolving links.");
   }
