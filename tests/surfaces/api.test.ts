@@ -518,6 +518,7 @@ describe("startHarnessApiServer", () => {
     let receivedPlanRequest: unknown;
     let receivedDirectionRequest: unknown;
     let receivedSessionRequest: unknown;
+    let receivedSessionEventsRequest: unknown;
     let receivedSessionListRequest: unknown;
     let receivedSessionInspectRequest: unknown;
     let receivedSessionContinuationRequest: unknown;
@@ -542,6 +543,11 @@ describe("startHarnessApiServer", () => {
           receivedSessionRequest = request;
 
           return { route: "session", request };
+        },
+        sessionEvents: async (request) => {
+          receivedSessionEventsRequest = request;
+
+          return { route: "session-events", request };
         },
         sessionInspect: async (request) => {
           receivedSessionInspectRequest = request;
@@ -614,6 +620,19 @@ describe("startHarnessApiServer", () => {
     expect(sessionListResponse.status).toBe(200);
     expect(sessionListResponse.body).toMatchObject({ route: "session-list", request: { limit: 3 } });
     expect(receivedSessionListRequest).toMatchObject({ limit: 3 });
+
+    const sessionEventsResponse = await getJson(url, "/sessions/session%252Fencoded/events?cursor=2&limit=3");
+    expect(sessionEventsResponse.status).toBe(200);
+    expect(sessionEventsResponse.body).toMatchObject({ route: "session-events", request: { sessionId: "session%2Fencoded", cursor: 2, limit: 3 } });
+    expect(receivedSessionEventsRequest).toEqual({ sessionId: "session%2Fencoded", cursor: 2, limit: 3 });
+
+    const malformedEventsResponse = await getJson(url, "/sessions/session-123/events?cursor=-1&limit=0");
+    expect(malformedEventsResponse.status).toBe(200);
+    expect(receivedSessionEventsRequest).toEqual({ sessionId: "session-123" });
+
+    const nonIntegerEventsResponse = await getJson(url, "/sessions/session-123/events?cursor=1.5&limit=malformed");
+    expect(nonIntegerEventsResponse.status).toBe(200);
+    expect(receivedSessionEventsRequest).toEqual({ sessionId: "session-123" });
 
     const inspectionResponse = await getJson(url, "/sessions/session-123/inspect");
     expect(inspectionResponse.status).toBe(200);
@@ -754,10 +773,47 @@ describe("startHarnessApiServer", () => {
         route: "session-events",
         sessionId,
         summary: { sessionId, eventCount: 2, toolObservations: 1, resumeBreadcrumbs: 0 },
+        cursor: 0,
+        nextCursor: 2,
+        hasMore: false,
+        totalEventCount: 2,
         events: [
           { type: "session.started", sessionId, summary: expect.stringContaining("Session started") },
           { type: "tool.observation", sessionId, summary: "Tool repo.context.resolve succeeded.", metadata: { toolId: "repo.context.resolve", status: "succeeded" } }
         ]
+      });
+
+      const firstEventPage = await getJson(url, `/sessions/${sessionId}/events?cursor=0&limit=1`);
+      expect(firstEventPage.status).toBe(200);
+      expect(firstEventPage.body).toMatchObject({
+        summary: { sessionId, eventCount: 2, toolObservations: 1, resumeBreadcrumbs: 0 },
+        events: [{ type: "session.started", sessionId }],
+        cursor: 0,
+        nextCursor: 1,
+        hasMore: true,
+        totalEventCount: 2
+      });
+
+      const secondEventPage = await getJson(url, `/sessions/${sessionId}/events?cursor=1&limit=1`);
+      expect(secondEventPage.status).toBe(200);
+      expect(secondEventPage.body).toMatchObject({
+        summary: { sessionId, eventCount: 2, toolObservations: 1, resumeBreadcrumbs: 0 },
+        events: [{ type: "tool.observation", sessionId }],
+        cursor: 1,
+        nextCursor: 2,
+        hasMore: false,
+        totalEventCount: 2
+      });
+
+      const terminalEventPage = await getJson(url, `/sessions/${sessionId}/events?cursor=99&limit=1`);
+      expect(terminalEventPage.status).toBe(200);
+      expect(terminalEventPage.body).toMatchObject({
+        summary: { sessionId, eventCount: 2, toolObservations: 1, resumeBreadcrumbs: 0 },
+        events: [],
+        cursor: 2,
+        nextCursor: 2,
+        hasMore: false,
+        totalEventCount: 2
       });
 
       const inspectionResponse = await getJson(url, `/sessions/${sessionId}/inspect`);

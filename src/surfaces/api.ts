@@ -88,6 +88,8 @@ export interface ApiSessionStatusRequest {
 
 export interface ApiSessionEventsRequest {
   sessionId?: string;
+  cursor?: number;
+  limit?: number;
 }
 
 export interface ApiSessionInspectionRequest {
@@ -496,11 +498,19 @@ async function defaultSessionEvents(sessionEvents: Map<string, ApiSessionTimelin
     throw new ApiHttpError(404, `Harness session not found: ${request.sessionId}`);
   }
 
+  const totalEventCount = events.length;
+  const cursor = Math.min(request.cursor ?? 0, totalEventCount);
+  const nextCursor = request.limit === undefined ? totalEventCount : Math.min(cursor + request.limit, totalEventCount);
+
   return {
     route: "session-events",
     sessionId: request.sessionId,
     summary: buildApiSessionTimelineSummary(request.sessionId, events),
-    events
+    events: events.slice(cursor, nextCursor),
+    cursor,
+    nextCursor,
+    hasMore: nextCursor < totalEventCount,
+    totalEventCount
   };
 }
 
@@ -717,7 +727,7 @@ async function routeRequest(
     }
 
     if (method === "GET" && route.startsWith("/sessions/") && route.endsWith("/events")) {
-      return writeJson(response, 200, await handlers.sessionEvents(normalizeSessionEventsRequest(route)));
+      return writeJson(response, 200, await handlers.sessionEvents(normalizeSessionEventsRequest(route, requestUrl.searchParams)));
     }
 
     if (method === "GET" && route.startsWith("/sessions/") && route.endsWith("/events/stream")) {
@@ -821,10 +831,31 @@ function normalizeSessionListRequest(params: URLSearchParams): ApiSessionListReq
   return Number.isInteger(parsedLimit) && parsedLimit > 0 ? { limit: parsedLimit } : {};
 }
 
-function normalizeSessionEventsRequest(route: string): ApiSessionEventsRequest {
+function normalizeSessionEventsRequest(route: string, params: URLSearchParams): ApiSessionEventsRequest {
   const sessionId = route.slice("/sessions/".length, -"/events".length);
+  const request: ApiSessionEventsRequest = sessionId.length > 0 ? { sessionId: decodeURIComponent(sessionId) } : {};
+  const cursor = normalizeIntegerQueryValue(params.get("cursor"), 0);
+  const limit = normalizeIntegerQueryValue(params.get("limit"), 1);
 
-  return sessionId.length > 0 ? { sessionId: decodeURIComponent(sessionId) } : {};
+  if (cursor !== undefined) {
+    request.cursor = cursor;
+  }
+
+  if (limit !== undefined) {
+    request.limit = limit;
+  }
+
+  return request;
+}
+
+function normalizeIntegerQueryValue(value: string | null, minimum: number): number | undefined {
+  if (value === null || !/^\d+$/.test(value)) {
+    return undefined;
+  }
+
+  const parsedValue = Number(value);
+
+  return Number.isSafeInteger(parsedValue) && parsedValue >= minimum ? parsedValue : undefined;
 }
 
 function normalizeSessionEventStreamRequest(route: string): string {
