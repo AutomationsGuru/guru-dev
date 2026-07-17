@@ -134,6 +134,7 @@ export function createGrepTool(): ToolDefinition<typeof GrepToolInputSchema, typ
     description: "Regex search across repo files. Returns typed {file, line, content} matches — cheaper and cleaner than raw grep output.",
     inputSchema: GrepToolInputSchema,
     outputSchema: GrepToolOutputSchema,
+    effect: "read-only",
     execute(input) {
       const rel = containedRel(input.repoRoot, input.path);
       if (rel === null) {
@@ -226,6 +227,7 @@ export function createGlobTool(): ToolDefinition<typeof GlobToolInputSchema, typ
     description: "Glob over repo files (*, **, ?). Returns a typed path list sorted by recency of modification.",
     inputSchema: GlobToolInputSchema,
     outputSchema: GlobToolOutputSchema,
+    effect: "read-only",
     execute(input) {
       const rel = containedRel(input.repoRoot, input.path);
       if (rel === null) {
@@ -298,6 +300,7 @@ export function createLsTool(): ToolDefinition<typeof LsToolInputSchema, typeof 
     description: "Typed directory listing: {name, type, size, modified} per entry, dirs first.",
     inputSchema: LsToolInputSchema,
     outputSchema: LsToolOutputSchema,
+    effect: "read-only",
     execute(input) {
       const rel = containedRel(input.repoRoot, input.path);
       if (rel === null) {

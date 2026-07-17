@@ -27,12 +27,22 @@ export interface ToolObservation<TOutput = unknown> {
   readonly error?: string;
 }
 
+/**
+ * Structural effect marker (G1004 plan-mode runtime gate). Declares whether a
+ * tool only observes repository/process state (`"read-only"`) or mutates it
+ * (`"mutating"`). Omission is untrusted: plan-mode certification accepts only
+ * tools that explicitly declare `effect === "read-only"`, so an unmarked or
+ * mutating definition is rejected even when a caller allowlists its id.
+ */
+export type ToolEffect = "read-only" | "mutating";
+
 export interface ToolDefinition<TInputSchema extends ZodType = ZodType, TOutputSchema extends ZodType = ZodType> {
   readonly id: string;
   readonly title: string;
   readonly description: string;
   readonly inputSchema: TInputSchema;
   readonly outputSchema: TOutputSchema;
+  readonly effect?: ToolEffect;
   execute(input: z.infer<TInputSchema>, context: ToolExecutionContext): Promise<z.infer<TOutputSchema>> | z.infer<TOutputSchema>;
 }
 
