@@ -106,6 +106,7 @@ describe("startHarnessSession", () => {
       "honcho_remember",
       "kill_task",
       "ls",
+      "lsp",
       "maintenance.audit.run",
       "manage_task",
       "mcp_bridge_status",

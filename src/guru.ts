@@ -441,7 +441,9 @@ export const GURU_CHAT_TOOL_IDS: ReadonlySet<string> = new Set([
   "pyautogui_keyboard",
   // Cursor-parity local tools (gap analysis 2026-07-10)
   "read_diagnostics",
-  "manage_task"
+  "manage_task",
+  // LSP code intelligence (G576)
+  "lsp"
 ]);
 
 export const READ_ONLY_TOOL_IDS: ReadonlySet<string> = new Set([
@@ -472,7 +474,8 @@ export const READ_ONLY_TOOL_IDS: ReadonlySet<string> = new Set([
   "operational.state.list",
   "operational.backlog.list",
   "github.pr.status",
-  "read_diagnostics"
+  "read_diagnostics",
+  "lsp"
 ]);
 
 /** Access text for `/tools`: reflect the mode actually active in this session. */

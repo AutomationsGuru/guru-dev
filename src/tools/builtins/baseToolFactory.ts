@@ -8,6 +8,7 @@ import { createAskQuestionTools, type AskQuestionOptions } from "./askQuestionTo
 import { createScheduleTool, type ScheduleToolOptions } from "./scheduleTool.js";
 import { createManageTaskTool, type ManageTaskToolOptions } from "./manageTaskTool.js";
 import { createReadDiagnosticsTool, type ReadDiagnosticsToolOptions } from "./readDiagnosticsTool.js";
+import { createLspTool, type LspToolOptions } from "./lspTool.js";
 import { manageBackgroundTask } from "./backgroundTaskRegistry.js";
 
 export interface BaseToolFactoryOptions {
@@ -19,6 +20,7 @@ export interface BaseToolFactoryOptions {
   readonly schedule?: ScheduleToolOptions;
   readonly manageTask?: ManageTaskToolOptions;
   readonly readDiagnostics?: ReadDiagnosticsToolOptions;
+  readonly lsp?: LspToolOptions;
 }
 
 export function createBaseTools(options: BaseToolFactoryOptions = {}): readonly ToolDefinition<any, any>[] {
@@ -40,6 +42,7 @@ export function createBaseTools(options: BaseToolFactoryOptions = {}): readonly 
   tools.push(createScheduleTool(options.schedule ?? {}));
   tools.push(createManageTaskTool(options.manageTask ?? { onManage: manageBackgroundTask }));
   tools.push(createReadDiagnosticsTool(options.readDiagnostics ?? {}));
+  tools.push(createLspTool(options.lsp ?? {}));
 
   return tools;
 }
