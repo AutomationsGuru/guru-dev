@@ -4,7 +4,7 @@
 ![guru harness](https://img.shields.io/badge/guru%20harness-AI%20agent%20harness-8C11E1?labelColor=1A1130&style=flat-square)
 ![node](https://img.shields.io/badge/node-%E2%89%A522-B56EF1?labelColor=1A1130&style=flat-square)
 ![tests](https://img.shields.io/badge/tests-1480%20passing-31C48D?labelColor=1A1130&style=flat-square)
-![package](https://img.shields.io/badge/package-v1.5.1-E958BE?labelColor=1A1130&style=flat-square)
+![package](https://img.shields.io/badge/package-v1.5.2-E958BE?labelColor=1A1130&style=flat-square)
 ![maturity](https://img.shields.io/badge/maturity-dogfood-F59E0B?labelColor=1A1130&style=flat-square)
 ![license](https://img.shields.io/badge/license-MIT-31C48D?labelColor=1A1130&style=flat-square)
 

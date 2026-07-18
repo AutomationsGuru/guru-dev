@@ -13,10 +13,44 @@ All notable changes to GuruHarness are documented here.
   Matthew make an explicit release/migration decision.
 - **Stay on `1.5.x` until Matthew is happy with how Guru works.** Patch numbers
   may climb without limit (`1.5.1` … `1.5.n` — even absurdly high is fine). The
-  next gated patch target after **1.5.1** is **`1.5.2`**. Do **not** create, tag,
+  next gated patch target after **1.5.2** is **`1.5.3`**. Do **not** create, tag,
   or publish `1.6.0` or higher until Matthew explicitly accepts Guru as working
   well enough to advance. CI (`scripts/verify-repo.ps1`) and the tag-triggered
   release workflow refuse package versions outside `1.5.x`.
+
+## [1.5.2] - 2026-07-18
+
+Dogfood patch release: fold post-1.5.1 product merges on `main` (PRs **#44–#57**)
+into an explicit package version (still **1.5.x** pre-GA). Does not authorize `1.6.0+`.
+
+### Added
+
+- **G853** API live SSE session events (`apiEventStream`) (#48).
+- **G788** RPC active-session model switch ordering (#48).
+- **G102** self-build checkpoint/resume (#48).
+- **G576** LSP transport + `lsp` tool (#48).
+- **G920** Honcho memory sync-up reconciliation (#49).
+- **G647** restore package writer + inventory (#49).
+- **G1004** read-only plan mode core (#50).
+- **G851/G885** extension compaction veto hooks (#51).
+- **G939** virtual `@session` / `@memory` / staged-diff / terminal references (#53).
+- **G800** review-stage token drawdown into dev-cycle budget (#54).
+- **G1120** API session event cursor pagination (#55).
+- **G993** `monitor` tool for bounded background-task line pages (#56).
+- **G1055** net-spend classifier: fail-closed on expansion-derived shell spend edges (#57).
+- **G555** background bash ingress with spawn hardening (#46).
+- **G918** honest dev-cycle `--dry-run` wiring (#47).
+
+### Fixed
+
+- **Secret scrub on background tasks (GHCR-20260717-001):** `manage_task` views apply `scrubSecretValues` (#52).
+- **RPC close questions before EOF wait** (#44).
+- **G936 parity truth:** `manage_task` partial/YELLOW + G1005 verdict-count reconcile (#45).
+- Windows LSP path/URI host-independence and temp cleanup retries (G576 / G993 CI).
+
+### Changed
+
+- Release line remains **1.5.x**; package identity advances **1.5.1 → 1.5.2**.
 
 ## [1.5.1] - 2026-07-16
 
