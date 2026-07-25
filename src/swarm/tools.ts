@@ -34,12 +34,13 @@ export function createSwarmTools(options: SwarmToolFactoryOptions): readonly Too
       // turn context; when absent (parent session spawning top-level) we default 0.
       // manager.spawn fires SwarmDepthExceededError past maxSpawnDepth.
       const record = manager.spawn(input.prompt, input.mode, input.label, {
-        ...(input.depth !== undefined ? { depth: input.depth } : {})
+        ...(input.depth !== undefined ? { depth: input.depth } : {}),
+        ...(input.taskShape !== undefined ? { taskShape: input.taskShape } : {})
       });
       return {
         taskId: record.id,
         state: record.state,
-        summary: `Worker ${record.id} (${record.mode}) ${record.state} — ${manager.effectiveConcurrency()} concurrent max. Poll get_task_output.`
+        summary: `Worker ${record.id} (${record.mode}, ${record.taskShape}) ${record.state} — ${manager.effectiveConcurrency()} concurrent max. Poll get_task_output.`
       };
     }
   };
@@ -55,15 +56,26 @@ export function createSwarmTools(options: SwarmToolFactoryOptions): readonly Too
       if (!record) {
         return { found: false, summary: `No task '${input.taskId}'.` };
       }
+      // IDEA-A2: a finished worker whose shape completion is unmet is INCOMPLETE —
+      // surface that honestly so the parent never treats bare dispatch as done.
+      const incomplete = record.state === "done" && record.incompleteReason !== undefined;
+      const reportPath = record.completion?.shape === "scout" ? record.completion.reportPath : undefined;
       return {
         found: true,
         state: record.state,
         label: record.label,
+        taskShape: record.taskShape,
         ...(record.resultText !== undefined ? { resultText: record.resultText } : {}),
         ...(record.error !== undefined ? { error: record.error } : {}),
         toolCallCount: record.toolCallCount,
         ...(record.budgetExceeded ? { budgetExceeded: true } : {}),
-        summary: `Task ${record.id} (${record.label}): ${record.state}${record.budgetExceeded ? " · budget_exceeded (partial output)" : ""}${record.state === "running" || record.state === "queued" ? " — poll again shortly" : ""}.`
+        ...(incomplete ? { incomplete: true, incompleteReason: record.incompleteReason } : {}),
+        ...(reportPath !== undefined ? { reportPath } : {}),
+        summary:
+          `Task ${record.id} (${record.label}, ${record.taskShape}): ${record.state}` +
+          `${record.budgetExceeded ? " · budget_exceeded (partial output)" : ""}` +
+          `${incomplete ? ` · INCOMPLETE — ${record.incompleteReason}` : ""}` +
+          `${record.state === "running" || record.state === "queued" ? " — poll again shortly" : ""}.`
       };
     }
   };
