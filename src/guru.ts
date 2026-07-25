@@ -74,6 +74,7 @@ import { listManifests, loadManifest, parkManifest } from "./garage/store.js";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { AgentSession, type TurnDriver} from "./session/agentSession.js";
 import { runRpcMode } from "./surfaces/rpc.js";
+import { runPrintMode } from "./surfaces/printReceipt.js";
 import { runBootRitual, type BootRitualHooks, type PhaseOutput } from "./boot/ritual.js";
 import { incrementSessionCounter } from "./boot/sessionCounter.js";
 import { evaluateAndClose, loadGapRecords, makeGapRecord, saveGapRecords, upsertGapRecords } from "./garage/gapRecords.js";
@@ -5087,6 +5088,14 @@ export async function runGuru(): Promise<void> {
   const modeIndex = process.argv.indexOf("--mode");
   if (modeIndex >= 0 && process.argv[modeIndex + 1] === "rpc") {
     await runRpcMode();
+    return;
+  }
+
+  // Headless single-shot surface: one AgentSession prompt, one JSON receipt.
+  const printIndex = process.argv.findIndex((argument) => argument === "--print" || argument === "-p");
+  if (printIndex >= 0) {
+    const promptText = process.argv.slice(printIndex + 1).filter((token) => !token.startsWith("-")).join(" ");
+    await runPrintMode({ prompt: promptText });
     return;
   }
 
