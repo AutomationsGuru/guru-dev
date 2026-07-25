@@ -9,8 +9,9 @@
  *   - `fileMatch` → selected iff `ctx.activePath` matches any glob pattern
  *   - `auto`      → selected iff `ctx.userQuery` mentions a description keyword
  *
- * The output preserves the input order across modes. Docs whose `mode` is
- * invalid are skipped defensively.
+ * The output preserves the input order across modes. Within a single doc the
+ * reason is the FIRST rule that selected it (modes are evaluated in the order
+ * above). Docs whose `mode` is invalid are skipped defensively.
  */
 import {
   InclusionModeSchema,
@@ -141,7 +142,7 @@ function matchAutoKeyword(description: string | undefined, normalizedQuery: stri
 }
 
 function stripPunctuation(word: string): string {
-  // Trim common punctuation that wouldn't survive an `includes()` substring
+  // Trim common punctuation that wouldn't survive a `includes()` substring
   // match against natural-language queries anyway.
   return word.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "");
 }
