@@ -1,8 +1,8 @@
 import {
   parseFrontMatter,
   type SteeringDoc
-} from "../../src/context/steeringInclusionSchema.js";
-import { resolveSteering } from "../../src/context/steeringInclusion.js";
+} from '../../src/context/steeringInclusionSchema.js';
+import { resolveSteering } from '../../src/context/steeringInclusion.js';
 
 function makeDoc(overrides: Partial<SteeringDoc> & Pick<SteeringDoc, "id" | "mode">): SteeringDoc {
   const content = overrides.content ?? `# ${overrides.id}\n\nBody for ${overrides.id}.\n`;
