@@ -33,12 +33,13 @@ describe("auditSse (IDEA-F270-AUDIT-SSE-01)", () => {
 
     const events = getAuditEvents();
     expect(events).toHaveLength(3);
-    expect(events[0].type).toBe("intent");
-    expect(events[1].type).toBe("tool");
-    expect(events[2].type).toBe("approval");
+    const [e0, e1, e2] = events;
+    expect(e0?.type).toBe("intent");
+    expect(e1?.type).toBe("tool");
+    expect(e2?.type).toBe("approval");
     // timestamps should be non-decreasing (same ms possible)
-    expect(events[0].ts <= events[1].ts).toBe(true);
-    expect(events[1].ts <= events[2].ts).toBe(true);
+    expect((e0?.ts ?? 0) <= (e1?.ts ?? 0)).toBe(true);
+    expect((e1?.ts ?? 0) <= (e2?.ts ?? 0)).toBe(true);
   });
 
   it("supports live subscription callbacks and preserves order", () => {
