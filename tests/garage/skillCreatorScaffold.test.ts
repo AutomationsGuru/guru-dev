@@ -57,7 +57,8 @@ describe("scaffoldSkill — skill-creator scaffold (IDEA-F199-SKILL-CREATE)", ()
     });
 
     expect(written.ok).toBe(true);
-    expect(memory.get("/virtual/skills/audit-ledger/SKILL.md") ?? "").toMatch(/^---\nname:\s*audit-ledger\s*$/m);
+    const virtualSkillPath = join("/virtual/skills", "audit-ledger", "SKILL.md");
+    expect(memory.get(virtualSkillPath) ?? "").toMatch(/^---\nname:\s*audit-ledger\s*$/m);
   });
 
   it("creates the target subdirectory when it does not exist", () => {
