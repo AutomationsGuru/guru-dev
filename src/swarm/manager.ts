@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import { SwarmConfigSchema, SwarmDepthExceededError, type SwarmConfig, type SwarmTaskRecord, type SwarmWorkerMode } from "./schema.js";
+import { evaluateCompletion, resolveTaskShape, type TaskCompletion, type TaskShape } from "./taskShape.js";
 
 /**
  * Swarm manager — a bounded scheduler over the agent-turn unit (contract:
@@ -48,6 +49,11 @@ export type SwarmSnapshotProvider = () => unknown;
 export interface SwarmSpawnOptions {
   /** Recursion depth (default 0). A worker spawning a worker passes its own depth + 1. */
   readonly depth?: number;
+  /**
+   * Explicit ship/scout shape (IDEA-A2). When omitted, resolved from mode:
+   * read-only → scout, all → ship.
+   */
+  readonly taskShape?: TaskShape;
 }
 
 export interface SwarmManager {
@@ -59,6 +65,12 @@ export interface SwarmManager {
   get(taskId: string): SwarmTaskRecord | undefined;
   kill(taskId: string): SwarmTaskRecord | undefined;
   list(): readonly SwarmTaskRecord[];
+  /**
+   * Attach completion evidence to a FINISHED worker and re-run the fail-closed
+   * completion gate (IDEA-A2). Returns the updated record. A worker whose shape
+   * requirements stay unmet remains incomplete — dispatch alone is never done.
+   */
+  complete(taskId: string, completion: TaskCompletion): SwarmTaskRecord | undefined;
   /** Effective concurrency after the ultraSwarm crank. */
   effectiveConcurrency(): number;
   /** Test/support: resolves when every non-queued task settles. */
@@ -121,6 +133,16 @@ export function createSwarmManager(rawConfig: Partial<SwarmConfig> = {}): SwarmM
           if (record.state !== "killed") {
             record.state = "done";
             record.resultText = result.text;
+            // IDEA-A2 fail-closed: a finished worker is not COMPLETE until its
+            // shape's evidence requirement is met. A scout that left no report (or
+            // a ship with no verification/skip) is marked incomplete here; the
+            // parent must supply evidence via manager.complete(...) to close it.
+            const check = evaluateCompletion(record.taskShape, record.completion);
+            if (!check.complete) {
+              record.incompleteReason = check.reason;
+            } else {
+              delete record.incompleteReason;
+            }
           }
           // killed-while-running: mark-and-detach — the result is discarded.
         })
@@ -160,11 +182,15 @@ export function createSwarmManager(rawConfig: Partial<SwarmConfig> = {}): SwarmM
         throw new Error(`Swarm session task cap reached (${config.maxTasksPerSession}).`);
       }
       spawnedTotal += 1;
+      // IDEA-A2: resolve ship vs scout at spawn. Explicit wins; read-only/explore
+      // defaults to scout (must leave a report); otherwise ship (backward compat).
+      const taskShape = resolveTaskShape(options?.taskShape, mode);
       const record: SwarmTaskRecord = {
         id: randomUUID().slice(0, 8),
         label: label ?? prompt.replace(/\s+/gu, " ").slice(0, 40),
         promptPreview: prompt.replace(/\s+/gu, " ").slice(0, 120),
         mode,
+        taskShape,
         depth,
         state: "queued",
         toolCallCount: 0,
@@ -179,6 +205,22 @@ export function createSwarmManager(rawConfig: Partial<SwarmConfig> = {}): SwarmM
     },
     get(taskId) {
       return tasks.get(taskId);
+    },
+    complete(taskId, completion) {
+      const record = tasks.get(taskId);
+      if (!record) {
+        return undefined;
+      }
+      record.completion = completion;
+      // Fail-closed re-check: shape-mismatched or insufficient evidence leaves the
+      // worker incomplete (and reports why), never silently "done."
+      const check = evaluateCompletion(record.taskShape, completion);
+      if (check.complete) {
+        delete record.incompleteReason;
+      } else {
+        record.incompleteReason = check.reason;
+      }
+      return record;
     },
     kill(taskId) {
       const record = tasks.get(taskId);
