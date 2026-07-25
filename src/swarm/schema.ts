@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+import { TaskCompletionSchema, TaskShapeSchema, type TaskCompletion, type TaskShape } from "./taskShape.js";
+
 /**
  * Swarm v1 (Phase F, 2026-07-04) — the bounded contract per
  * docs/decisions/2026-07-04-swarm-contract.md. Ceilings are configuration,
@@ -44,11 +46,17 @@ export type SwarmWorkerMode = z.infer<typeof SwarmWorkerModeSchema>;
 export const SwarmTaskStateSchema = z.enum(["queued", "running", "done", "failed", "killed"]);
 export type SwarmTaskState = z.infer<typeof SwarmTaskStateSchema>;
 
+// Re-export the task-shape contract so schema.ts stays the single import surface.
+export { TaskShapeSchema, TaskCompletionSchema };
+export type { TaskShape, TaskCompletion };
+
 export interface SwarmTaskRecord {
   readonly id: string;
   readonly label: string;
   readonly promptPreview: string;
   readonly mode: SwarmWorkerMode;
+  /** Ship vs scout (IDEA-A2): resolved at spawn, drives completion requirements. */
+  readonly taskShape: TaskShape;
   /** Recursion depth of this spawn (0 = spawned by the parent session). */
   readonly depth: number;
   state: SwarmTaskState;
@@ -57,6 +65,13 @@ export interface SwarmTaskRecord {
   toolCallCount: number;
   /** True when the worker hit its tool-call budget — its output may be partial. */
   budgetExceeded?: boolean;
+  /**
+   * Completion evidence (scout report ref / ship verification). A worker whose
+   * shape requirements are unmet stays INCOMPLETE even if its run finished.
+   */
+  completion?: TaskCompletion;
+  /** Why a finished worker is not complete (surfaced in get_task_output). */
+  incompleteReason?: string;
   readonly startedAt: string;
   endedAt?: string;
 }
@@ -66,6 +81,12 @@ export const SpawnAgentInputSchema = z
     prompt: z.string().trim().min(1),
     /** read-only scouts by default: the worker physically cannot mutate. */
     mode: SwarmWorkerModeSchema.default("read-only"),
+    /**
+     * Ship vs scout (IDEA-A2). Optional — when omitted the manager resolves it:
+     * read-only/explore workers default to `scout` (must leave a report); otherwise
+     * `ship` (backward-compatible, mutation-capable under mandate).
+     */
+    taskShape: TaskShapeSchema.optional(),
     label: z.string().trim().min(1).max(60).optional(),
     /**
      * Recursion depth of this spawn (0 = parent session; a worker spawning passes
@@ -92,11 +113,23 @@ export const TaskOutputResultSchema = z
     found: z.boolean(),
     state: SwarmTaskStateSchema.optional(),
     label: z.string().optional(),
+    /** Ship vs scout (IDEA-A2). */
+    taskShape: TaskShapeSchema.optional(),
     resultText: z.string().optional(),
     error: z.string().optional(),
     toolCallCount: z.number().int().nonnegative().optional(),
     /** The worker hit its tool-call budget — treat resultText as partial. */
     budgetExceeded: z.boolean().optional(),
+    /**
+     * True when the worker FINISHED but its shape's completion requirements are
+     * unmet (scout left no report; ship left no verification/skip). Dispatch alone
+     * is never done — poll/inspect this before treating a finished task as complete.
+     */
+    incomplete: z.boolean().optional(),
+    /** Why a finished worker is incomplete. */
+    incompleteReason: z.string().optional(),
+    /** Durable scout report path when the worker left one. */
+    reportPath: z.string().optional(),
     summary: z.string()
   })
   .strict();
