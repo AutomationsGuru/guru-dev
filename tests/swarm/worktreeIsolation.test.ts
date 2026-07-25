@@ -14,6 +14,16 @@ import {
   type WorktreeIsolation
 } from "../../src/swarm/worktreeIsolation.js";
 
+/** Compare paths across Windows short (8.3) vs long forms. */
+function sameFsPath(a: string | null, b: string): boolean {
+  if (a === null) return false;
+  try {
+    return realpathSync(a).toLowerCase() === realpathSync(b).toLowerCase();
+  } catch {
+    return resolve(a).toLowerCase() === resolve(b).toLowerCase();
+  }
+}
+
 /**
  * Bounded temp-repo fixture. Each test gets a fresh git repo in a tmpdir so we
  * never touch the operator checkout, never hit the network, and never leak
@@ -77,7 +87,7 @@ describe("detectGitRepo", () => {
   });
 
   it("returns the repo root for a git directory", () => {
-    expect(detectGitRepo(repo.root)).toBe(realpathSync(resolve(repo.root)));
+    expect(sameFsPath(detectGitRepo(repo.root), repo.root)).toBe(true);
   });
 
   it("returns null for a non-git directory", () => {
@@ -137,7 +147,7 @@ describe("createWorktreeIsolation — bounded project-local worktrees", () => {
     // The operator checkout is NOT the worktree path.
     expect(handle.path).not.toBe(resolve(repo.root));
     // The worktree is a real git worktree (has .git pointer).
-    expect(detectGitRepo(handle.path)).toBe(realpathSync(resolve(handle.path)));
+    expect(sameFsPath(detectGitRepo(handle.path), handle.path)).toBe(true);
   });
 
   it("never deletes operator branches: dispose removes only its own worktree, not the main checkout", () => {
@@ -148,7 +158,7 @@ describe("createWorktreeIsolation — bounded project-local worktrees", () => {
     // Worktree path is gone.
     expect(detectGitRepo(wtPath)).toBeNull();
     // Operator checkout still a live repo with its branch intact.
-    expect(detectGitRepo(repo.root)).toBe(realpathSync(resolve(repo.root)));
+    expect(sameFsPath(detectGitRepo(repo.root), repo.root)).toBe(true);
     const branch = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: repo.root, encoding: "utf8" }).trim();
     expect(branch).toBe("main");
   });
