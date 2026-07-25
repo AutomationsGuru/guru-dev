@@ -1,0 +1,9 @@
+{
+  "name": "valid-bundle",
+  "version": "1.0.0",
+  "files": {
+    "mcp/my-mcp.ts": "f2052e03cd2365ace832976b17c1be5f77a404ce2863499a60cf5fbfb280ba6a",
+    "steering/default.yaml": "97e470f107f7b292b0d654fef9d4f27ad7aafa55bf11dfec13127b2b05aa37d7",
+    "hooks/on-start.ts": "03300f7e9d6cc449f3572dd5402bdca9c6f4e9ec44f2107fe97cc152cd86b740"
+  }
+}
