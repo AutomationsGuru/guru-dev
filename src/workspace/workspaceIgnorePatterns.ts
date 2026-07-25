@@ -1,203 +1,179 @@
-import * as path from "path";
+/**
+ * Workspace ignore patterns -- gitignore-style glob matching for project files.
+ *
+ * Loads patterns from a gitignore-like file (line-oriented globs), then answers
+ * isIgnored(path) for any relative path. Supports the common gitignore syntax
+ * subset: comments, negation, wildcards (* ** ?), anchored root patterns,
+ * directory-only trailing slash, and basename-only matching.
+ *
+ * This is NOT a full gitignore reimplementation -- it is a glob-set matcher
+ * suitable for workspace-level file exclusion.
+ */
+
+/** A compiled set of ignore patterns. */
+export interface WorkspaceIgnorePatterns {
+  /**
+   * Returns true when path matches an active ignore pattern and is NOT
+   * un-ignored by a later negation.
+   *
+   * Path must be a relative path. Backslashes are normalized to forward
+   * slashes. Trailing slashes on the input path are preserved so callers
+   * can distinguish directory paths.
+   */
+  readonly isIgnored: (path: string) => boolean;
+}
+
+/** A single compiled pattern. */
+interface CompiledPattern {
+  readonly regex: RegExp;
+  /** True for ! negation patterns that re-include a previously excluded path. */
+  readonly negated: boolean;
+  /** The original pattern text (for diagnostics, not exposed yet). */
+  readonly source: string;
+}
 
 /**
- * Compiles a gitignore glob-style pattern string into a RegExp body.
+ * Parse gitignore-style lines into a compiled WorkspaceIgnorePatterns.
+ *
+ * Empty lines and lines starting with # are skipped. Lines starting with !
+ * are negation patterns that un-ignore paths excluded by earlier patterns
+ * (last-match-wins order).
  */
-function compilePattern(pattern: string): string {
-  let regexStr = "";
-  for (let at = 0; at < pattern.length; at += 1) {
-    const char = pattern[at] as string;
-    if (char === "*") {
-      if (pattern[at + 1] === "*") {
-        const hasSlashBefore = at > 0 && pattern[at - 1] === "/";
-        const hasSlashAfter = at + 2 < pattern.length && pattern[at + 2] === "/";
+export function fromLines(lines: readonly string[]): WorkspaceIgnorePatterns {
+  const patterns = compilePatterns(lines);
 
-        if (hasSlashBefore && hasSlashAfter) {
-          // e.g., 'foo/**/bar' -> 'foo/(?:.*/)?bar'
-          regexStr += "(?:.*/)?";
-          at += 2; // skip second '*' and the '/'
-        } else if (hasSlashAfter) {
-          // e.g., '**/bar' -> '(?:.*/)?bar'
-          regexStr += "(?:.*/)?";
-          at += 2; // skip second '*' and the '/'
-        } else if (hasSlashBefore) {
-          // e.g., 'foo/**' -> 'foo/.*'
-          regexStr += ".*";
-          at += 1; // skip second '*'
-        } else {
-          // standalone '**' -> '.*'
-          regexStr += ".*";
-          at += 1; // skip second '*'
+  return {
+    isIgnored(path: string): boolean {
+      // Normalize Windows backslashes to forward slashes.
+      const normalized = path.replaceAll("\\", "/");
+
+      // Start from the end -- gitignore uses last-match-wins semantics.
+      for (const p of [...patterns].reverse()) {
+        if (p.regex.test(normalized)) {
+          return !p.negated;
         }
-      } else {
-        // single '*' -> matches non-slash characters
-        regexStr += "[^/]*";
       }
-    } else if (char === "?") {
-      regexStr += "[^/]";
-    } else if (char === "/") {
-      regexStr += "/";
-    } else {
-      // Escape all RegExp special characters
-      regexStr += char.replace(/[.+^${}()|[\]\\]/gu, "\\$&");
+
+      return false;
     }
-  }
-  return regexStr;
+  };
 }
 
-export interface IgnorePattern {
-  regex: RegExp;
-  isNegated: boolean;
-  hasTrailingSlash: boolean;
-  raw: string;
-}
+// -- compilation -----------------------------------------------------------
 
-/**
- * A highly robust, self-contained gitignore-style pattern matcher.
- * Supports standard gitignore basics: comments, empty lines,
- * directory-only matching, and root-relative anchoring.
- */
-export class WorkspaceIgnorePatterns {
-  private patterns: IgnorePattern[] = [];
+function compilePatterns(lines: readonly string[]): readonly CompiledPattern[] {
+  const out: CompiledPattern[] = [];
 
-  constructor(lines: string[]) {
-    for (const rawLine of lines) {
-      // Trim leading/trailing whitespace
-      const line = rawLine.trim();
+  for (const raw of lines) {
+    const trimmed = raw.trim();
 
-      // Ignore empty lines and comments
-      if (line === "" || line.startsWith("#")) {
+    // Skip blanks and full-line comments.
+    if (!trimmed || trimmed.startsWith("#")) {
+      continue;
+    }
+
+    let negated = false;
+    let pattern = trimmed;
+
+    if (pattern.startsWith("!")) {
+      negated = true;
+      pattern = pattern.slice(1).trimStart();
+      // A bare "!" line is invalid -- skip it.
+      if (!pattern) {
         continue;
       }
-
-      let patternStr = line;
-      let isNegated = false;
-
-      // Handle negation
-      if (patternStr.startsWith("!")) {
-        isNegated = true;
-        patternStr = patternStr.slice(1).trim();
-      }
-
-      let isAnchored = false;
-      let hasTrailingSlash = false;
-
-      // Handle leading slash anchoring
-      if (patternStr.startsWith("/")) {
-        isAnchored = true;
-        patternStr = patternStr.slice(1);
-      }
-
-      // Handle trailing slash (directory matching only)
-      if (patternStr.endsWith("/")) {
-        hasTrailingSlash = true;
-        patternStr = patternStr.slice(0, -1);
-      }
-
-      // Handle explicit '**/', which means match at any level (unanchored)
-      if (patternStr.startsWith("**/")) {
-        isAnchored = false;
-        patternStr = patternStr.slice(3);
-      } else if (patternStr.includes("/")) {
-        // If it contains an internal slash, it is anchored to the root
-        isAnchored = true;
-      }
-
-      const compiled = compilePattern(patternStr);
-      let regexStr = "";
-
-      if (isAnchored) {
-        regexStr = `^${compiled}$`;
-      } else {
-        regexStr = `^(?:.*/)?${compiled}$`;
-      }
-
-      this.patterns.push({
-        regex: new RegExp(regexStr, "u"),
-        isNegated,
-        hasTrailingSlash,
-        raw: line,
-      });
     }
+
+    out.push({ regex: globToRegex(pattern), negated, source: trimmed });
   }
 
-  /**
-   * Helper static builder.
-   */
-  static fromLines(lines: string[]): WorkspaceIgnorePatterns {
-    return new WorkspaceIgnorePatterns(lines);
-  }
-
-  /**
-   * Returns true if the given workspace-relative path matches the ignore patterns.
-   * Path evaluation handles directory ancestry matching in accordance with gitignore rules:
-   * if a parent directory of a path is ignored, all of its contents are ignored and cannot
-   * be re-included.
-   */
-  isIgnored(relativePath: string): boolean {
-    if (this.patterns.length === 0) {
-      return false;
-    }
-
-    // Normalize path slashes to forward-slashes
-    let normalized = relativePath.replace(/\\/g, "/");
-
-    // Remove leading './' or '/'
-    if (normalized.startsWith("./")) {
-      normalized = normalized.slice(2);
-    }
-    if (normalized.startsWith("/")) {
-      normalized = normalized.slice(1);
-    }
-
-    // Remove trailing slash
-    if (normalized.endsWith("/")) {
-      normalized = normalized.slice(0, -1);
-    }
-
-    if (normalized === "") {
-      return false;
-    }
-
-    const segments = normalized.split("/");
-    let currentSubpath = "";
-
-    // Evaluate subpaths hierarchically from top to bottom
-    for (let i = 0; i < segments.length; i += 1) {
-      const segment = segments[i] as string;
-      currentSubpath = currentSubpath ? `${currentSubpath}/${segment}` : segment;
-
-      const isLast = i === segments.length - 1;
-      const isDirectory = !isLast;
-
-      let isSubpathIgnored = false;
-
-      for (const pattern of this.patterns) {
-        // In gitignore, directory-only patterns (with trailing slash) can only match directories.
-        // A segment is a directory if it's not the final segment (isLast is false),
-        // OR if we are evaluating the final segment of a path representing a directory.
-        // For robustness, since isIgnored can be called on folders directly (e.g. "node_modules"),
-        // we treat the final segment as potentially a directory when matching directory-only patterns.
-        const isDirMatchEligible = isDirectory || pattern.hasTrailingSlash;
-
-        // Directory-only pattern check
-        if (pattern.hasTrailingSlash && !isDirMatchEligible) {
-          continue;
-        }
-
-        if (pattern.regex.test(currentSubpath)) {
-          isSubpathIgnored = !pattern.isNegated;
-        }
-      }
-
-      // If an ancestor directory is ignored, stop immediately and return true (ignored)
-      // Since we iterate from top to bottom, this correctly implements the rule that
-      // files under an ignored directory cannot be re-included.
-      if (isSubpathIgnored) {
-        return true;
-      }
-    }
-
-    return false;
-  }
+  return out;
 }
+
+// -- glob to regex conversion ----------------------------------------------
+
+/**
+ * Convert a single gitignore-style glob to a RegExp.
+ *
+ * Handles: * ** ? leading-slash anchor trailing-slash dir-marker, and the
+ * special case where patterns with no interior slash match as path components
+ * anywhere.
+ */
+function globToRegex(pattern: string): RegExp {
+  let dirOnly = false;
+  let p = pattern;
+
+  // Trailing slash = match directories only.
+  if (p.endsWith("/")) {
+    dirOnly = true;
+    p = p.slice(0, -1);
+    if (!p) {
+      return NEVER_MATCH;
+    }
+  }
+
+  // Leading slash anchors to the root.
+  let anchored = false;
+  if (p.startsWith("/")) {
+    anchored = true;
+    p = p.slice(1);
+  }
+
+  // Strip trailing /** -- the suffix already provides (?:/.*)?$ behaviour.
+  if (p.endsWith("/**")) {
+    p = p.slice(0, -3);
+  }
+
+  // Convert the glob body to a regex fragment.
+  const body = globBodyToRegex(p);
+
+  // All non-anchored patterns match as a path component anywhere.
+  const prefix = anchored ? "^" : "(?:^|.*/)";
+
+  // Non-dirOnly: match the exact name OR anything beneath it.
+  // DirOnly: a / MUST follow the body (it is a directory, not a file).
+  const suffix = dirOnly ? "/.*$" : "(?:/.*)?$";
+
+  return new RegExp(`${prefix}${body}${suffix}`, "u");
+}
+
+/**
+ * Escape regex-special characters EXCEPT * and ? (which are glob
+ * metacharacters handled separately by globBodyToRegex).
+ */
+function escapeRegexChars(s: string): string {
+  return s.replaceAll(/[.+^${}()|[\]\\]/g, "\\$&");
+}
+
+// Sentinels for ** transformations.
+// **/  (zero-or-more dirs prefix)
+const DS_PREFIX = "\x00P\x00";
+// /**/ (zero-or-more dirs between slashes)
+const DS_BETWEEN = "\x00B\x00";
+
+/**
+ * Convert the body of a glob pattern (anchors, dir-only marker, and trailing
+ * slash-double-star already stripped) to a regex fragment.
+ */
+function globBodyToRegex(body: string): string {
+  // Escape regex-special chars first, leaving * and ? untouched.
+  let result = escapeRegexChars(body);
+
+  // **/ at the very start of the body (no leading slash to consume).
+  result = result.replace(/^\*\*\//u, DS_PREFIX);
+  // /**/ between two path segments -- consume the leading /.
+  result = result.replaceAll("/**/", `/${DS_BETWEEN}`);
+
+  // Remaining * and ? are single-segment metacharacters.
+  result = result.replaceAll("*", "[^/]*");
+  result = result.replaceAll("?", "[^/]");
+
+  // Restore sentinels.
+  result = result.replaceAll(DS_PREFIX, "(?:.*/)?");
+  result = result.replaceAll(DS_BETWEEN, "(?:.*/)?");
+
+  return result;
+}
+
+/** A regex that never matches -- sentinel for degenerate patterns. */
+const NEVER_MATCH = /(?!)u/;
