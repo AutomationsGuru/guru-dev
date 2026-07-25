@@ -14,6 +14,7 @@ import type { McpServerConfig, McpServerStatus } from "../mcp/schemas.js";
 import { createInMemoryOperationalStore, type OperationalStore } from "../operational/store.js";
 import { createBlockedPlannerRunReport, runPlannerExecution, type PlannerModel } from "../planner/runtime.js";
 import { createCertifiedPlanModePolicy, executePlanModeTool as runPlanModeTool, type PlanModePolicy } from "../planner/planMode.js";
+import { evaluatePlanModeGate, type WorkApprovalAxes } from "../planner/workApprovalAxes.js";
 import {
   createOperationalSessionPersistenceStore,
   type PersistedSessionEvent,
@@ -41,7 +42,7 @@ import {
 } from "../tools/builtins/operationalStoreTools.js";
 import { createRepoContextTool } from "../tools/builtins/repoContextTool.js";
 import { createBaseTools } from "../tools/builtins/baseToolFactory.js";
-import { resetBackgroundTasks, resetSessionBackgroundTasks, scheduleBackgroundNotification, spawnBackgroundTask } from "../tools/builtins/backgroundTaskRegistry.js";
+import { resetBackgroundTasks, scheduleBackgroundNotification } from "../tools/builtins/backgroundTaskRegistry.js";
 import { createReviewGatesTool } from "../tools/builtins/reviewGatesTool.js";
 import { createListSkillsTool, createLoadSkillTool } from "../tools/builtins/skillLoaderTools.js";
 import { createShellExecTool } from "../tools/builtins/shellExecTool.js";
@@ -102,8 +103,20 @@ export interface HarnessRuntime {
    * turn abort like {@link executeTool}. Refusals (non-certified tool ids)
    * return a failed observation WITHOUT invoking the underlying tool, general
    * extension execution hooks, or a planner/provider call.
+   *
+   * The optional `axes` carry the dual work/approval posture (IDEA-A1). When
+   * omitted they fail closed to `{ workMode: "plan", approvalPosture: "ask" }`.
+   * In plan mode a non-certified tool is denied with the stable
+   * PLAN_MODE_TOOL_DENIED code; the `approvalPosture` axis can NEVER widen the
+   * plan floor, so `full` posture still refuses a non-certified tool.
    */
-  executePlanModeTool(sessionId: string, toolId: string, input: unknown, signal?: AbortSignal): Promise<ToolObservation>;
+  executePlanModeTool(
+    sessionId: string,
+    toolId: string,
+    input: unknown,
+    signal?: AbortSignal,
+    axes?: WorkApprovalAxes | { readonly workMode?: unknown; readonly approvalPosture?: unknown }
+  ): Promise<ToolObservation>;
   /** MCP readiness/discovery results for a live session. Unknown or closed sessions return an empty list. */
   getSessionMcpStatuses(sessionId: string): readonly McpServerStatus[];
   /** Close retained MCP clients and forget one live session. Returns false when the id is not live. */
@@ -290,7 +303,7 @@ export function createHarnessRuntime(dependencies: HarnessRuntimeDependencies = 
     getSessionPlanModeTools(sessionId) {
       return sessions.get(sessionId)?.planModePolicy.listTools() ?? [];
     },
-    async executePlanModeTool(sessionId, toolId, input, signal) {
+    async executePlanModeTool(sessionId, toolId, input, signal, axes) {
       const builtSession = sessions.get(sessionId);
 
       if (!builtSession) {
@@ -301,9 +314,13 @@ export function createHarnessRuntime(dependencies: HarnessRuntimeDependencies = 
 
       // Refusal floor: a non-certified tool id is rejected BEFORE any execution
       // or extension hook fires, so plan mode never invokes a mutating tool or
-      // its general extension execution hooks.
-      if (!policy.getTool(toolId)) {
-        return createFailedRuntimeObservation(toolId, `Tool is not allowlisted for plan mode: ${toolId}`);
+      // its general extension execution hooks. The dual-axis gate (IDEA-A1)
+      // consults the work/approval posture with fail-closed defaults; the
+      // approvalPosture axis is never consulted to widen the plan floor, so a
+      // `full` posture cannot turn this refusal into an allow.
+      const gate = evaluatePlanModeGate(axes ?? {}, toolId, policy.getTool(toolId) !== undefined);
+      if (!gate.allowed) {
+        return createFailedRuntimeObservation(toolId, gate.reason);
       }
 
       initExtensions().host.sendMessage("tool:execute", { toolId, input });
@@ -339,7 +356,6 @@ export function createHarnessRuntime(dependencies: HarnessRuntimeDependencies = 
       }
 
       sessions.delete(sessionId);
-      resetSessionBackgroundTasks(sessionId);
       await builtSession.mcpAttachment.closeAll();
       return true;
     },
@@ -396,8 +412,7 @@ export function createDefaultHarnessToolRegistry(options: CreateDefaultHarnessTo
         ...(options.commandExecutor ? { executor: options.commandExecutor } : {}),
         shellAllowlist: options.runtimeHardening.shellAllowlist,
         secretAllowList: options.runtimeHardening.secretAllowList,
-        ...(options.bashOptimizer ? { optimizer: options.bashOptimizer } : {}),
-        ...(options.sessionId !== undefined ? { startBackground: (command: readonly string[], cwd: string) => spawnBackgroundTask(command, cwd, options.sessionId) } : {})
+        ...(options.bashOptimizer ? { optimizer: options.bashOptimizer } : {})
       },
       read: { secretAllowList: options.runtimeHardening.secretAllowList },
       // TUI/RPC can inject ask_question; otherwise the tool falls back to its own TTY prompt.
@@ -425,8 +440,7 @@ export function createDefaultHarnessToolRegistry(options: CreateDefaultHarnessTo
                 return scheduleBackgroundNotification(
                   delaySeconds,
                   input.Prompt,
-                  scheduleDelivery,
-                  options.sessionId
+                  scheduleDelivery
                 );
               }
             }
