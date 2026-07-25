@@ -160,8 +160,12 @@ export function createOperationalSessionPersistenceStore(
   return new OperationalSessionPersistenceStore(operationalStore, projectSlug);
 }
 
-class InMemorySessionPersistenceStore implements SessionPersistenceStore {
-  private readonly events: PersistedSessionEvent[] = [];
+export class InMemorySessionPersistenceStore implements SessionPersistenceStore {
+  private events: PersistedSessionEvent[] = [];
+
+  clear() {
+    this.events = [];
+  }
 
   async recordSessionStarted(session: HarnessSession): Promise<PersistedSessionEvent> {
     const event = createSessionEvent(session.id, "session.started", HarnessSessionSchema.parse(session));

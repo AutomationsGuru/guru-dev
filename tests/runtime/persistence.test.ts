@@ -7,13 +7,13 @@ import {
   buildSessionObservabilitySummary,
   createHarnessRuntime,
   createInMemoryOperationalStore,
-  createInMemorySessionPersistenceStore,
+  InMemorySessionPersistenceStore,
   createOperationalSessionPersistenceStore,
   runSelfBuildExecutor,
   type PlannerModel,
   type PlannerModelRequest
-} from "../../src/index.js";
-import type { CommandExecutor } from "../../src/review/gates.js";
+} from '../../src/index.js';
+import type { CommandExecutor } from '../../src/review/gates.js';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 
@@ -30,8 +30,13 @@ class FixedPlannerModel implements PlannerModel {
 }
 
 describe("session persistence", () => {
+  const sessionPersistenceStore = new InMemorySessionPersistenceStore();
+
+  afterEach(() => {
+    sessionPersistenceStore.clear();
+  });
   it("should persist and resume started sessions", async () => {
-    const sessionPersistenceStore = createInMemorySessionPersistenceStore();
+    const sessionPersistenceStore = new InMemorySessionPersistenceStore();
     const runtime = createHarnessRuntime({ sessionPersistenceStore });
     const session = await runtime.startSession({ cwd: repoRoot });
 
@@ -44,7 +49,7 @@ describe("session persistence", () => {
   });
 
   it("should rebuild a resumed session registry and execute tools", async () => {
-    const sessionPersistenceStore = createInMemorySessionPersistenceStore();
+    const sessionPersistenceStore = new InMemorySessionPersistenceStore();
     const firstRuntime = createHarnessRuntime({ sessionPersistenceStore });
     const session = await firstRuntime.startSession({ cwd: repoRoot });
     const secondRuntime = createHarnessRuntime({ sessionPersistenceStore });
@@ -56,7 +61,7 @@ describe("session persistence", () => {
   });
 
   it("should list recent persisted sessions with compact summaries", async () => {
-    const sessionPersistenceStore = createInMemorySessionPersistenceStore();
+    const sessionPersistenceStore = new InMemorySessionPersistenceStore();
     const runtime = createHarnessRuntime({ sessionPersistenceStore });
     const firstSession = await runtime.startSession({ cwd: repoRoot });
     const secondSession = await runtime.startSession({ cwd: repoRoot });
@@ -76,7 +81,7 @@ describe("session persistence", () => {
   });
 
   it("should persist direct tool observations and planner runs", async () => {
-    const sessionPersistenceStore = createInMemorySessionPersistenceStore();
+    const sessionPersistenceStore = new InMemorySessionPersistenceStore();
     const model = new FixedPlannerModel({
       objective: "Resolve repo context.",
       summary: "Use one tool.",
@@ -142,7 +147,7 @@ describe("session persistence", () => {
   });
 
   it("should record progress beacons and summarize session recovery state", async () => {
-    const sessionPersistenceStore = createInMemorySessionPersistenceStore();
+    const sessionPersistenceStore = new InMemorySessionPersistenceStore();
     const runtime = createHarnessRuntime({ sessionPersistenceStore });
     const session = await runtime.startSession({ cwd: repoRoot });
 
@@ -168,7 +173,7 @@ describe("session persistence", () => {
   });
 
   it("should plan and record operator recovery actions from a blocked timeline", async () => {
-    const sessionPersistenceStore = createInMemorySessionPersistenceStore();
+    const sessionPersistenceStore = new InMemorySessionPersistenceStore();
     const runtime = createHarnessRuntime({ sessionPersistenceStore });
     const session = await runtime.startSession({ cwd: repoRoot });
 
@@ -204,7 +209,7 @@ describe("session persistence", () => {
   });
 
   it("should reject unavailable operator recovery actions without mutating the timeline", async () => {
-    const sessionPersistenceStore = createInMemorySessionPersistenceStore();
+    const sessionPersistenceStore = new InMemorySessionPersistenceStore();
     const runtime = createHarnessRuntime({ sessionPersistenceStore });
     const session = await runtime.startSession({ cwd: repoRoot });
 
@@ -225,7 +230,7 @@ describe("session persistence", () => {
   });
 
   it("should persist self-build executor done packets", async () => {
-    const sessionPersistenceStore = createInMemorySessionPersistenceStore();
+    const sessionPersistenceStore = new InMemorySessionPersistenceStore();
     const model = new FixedPlannerModel({ objective: "Execute task.", summary: "No tools needed.", steps: [] });
 
     const report = await runSelfBuildExecutor({
