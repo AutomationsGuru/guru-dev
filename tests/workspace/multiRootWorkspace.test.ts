@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 
 import { createWorkspace, type MultiRootWorkspace } from '../../src/workspace/multiRootWorkspace.js';
 import { normalizePathForCompare } from '../helpers/paths.js';
@@ -92,7 +92,7 @@ describe("multiRootWorkspace", () => {
     });
 
     it("should return false for a path outside the root", () => {
-      expect(ws.isInside("/tmp/completely-different")).toBe(false);
+      expect(ws.isInside(join(root, "..", "..", "outside-of-workspace-xyz"))).toBe(false);
     });
 
     it("should return false for a sibling directory", () => {
@@ -167,7 +167,7 @@ describe("multiRootWorkspace", () => {
       expect(ws.roots).toHaveLength(2);
       // Both entries must be absolute after resolution.
       for (const r of ws.roots) {
-        expect(r).toMatch(/^\//); // POSIX absolute
+        expect(isAbsolute(r)).toBe(true); // POSIX absolute
       }
     });
   });
