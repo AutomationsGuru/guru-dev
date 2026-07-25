@@ -35,6 +35,7 @@ export * from "./selfbuild/selectTask.js";
 export * from "./runtime/schemas.js";
 export * from "./runtime/session.js";
 export * from "./session/agentSession.js";
+export * from "./session/systemReminderInjector.js";
 export * from "./surfaces/api.js";
 export * from "./surfaces/rpc.js";
 export * from "./surfaces/tui.js";
