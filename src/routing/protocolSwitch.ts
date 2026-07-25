@@ -40,7 +40,7 @@ function inferProvider(routeId: string): string {
 
 export function switchProtocol(routeId: string, protocol: Protocol): SwitchReceipt {
   const provider = inferProvider(routeId);
-  const supported = providerProtocolSupport[provider] ?? providerProtocolSupport.default;
+  const supported = providerProtocolSupport[provider] ?? providerProtocolSupport.default ?? [];
 
   if (!supported.includes(protocol)) {
     throw new Error(`Unsupported protocol '${protocol}' for provider '${provider}'`);
