@@ -1,11 +1,11 @@
 import { z } from "zod";
+import type { ToolDefinition } from "./registry.js";
 
 /**
  * Shell suggest buffer (IDEA-F283-SHELL-SUGGEST-01).
- *
- * A suggestion is text for the operator's buffer, not an execution request.
- * This module deliberately has no process, filesystem, or network side effects;
- * an approved command must be handed to a separate shell execution tool.
+ * Maps NL description → suggested shell command text for human buffer/review.
+ * Contract: suggest(nl) → commandText. NEVER executes. Read-only effect.
+ * Execution (if approved later) is handled by separate shellExec / bash tools.
  */
 
 export const ShellSuggestBufferInputSchema = z
@@ -16,12 +16,43 @@ export const ShellSuggestBufferInputSchema = z
 
 export type ShellSuggestBufferInput = z.infer<typeof ShellSuggestBufferInputSchema>;
 
-/** Return reviewable command text without executing or otherwise mutating state. */
+export const ShellSuggestBufferOutputSchema = z
+  .object({
+    suggestedCommand: z.string(),
+    explanation: z.string().optional()
+  })
+  .strict();
+
+export type ShellSuggestBufferOutput = z.infer<typeof ShellSuggestBufferOutputSchema>;
+
+/** Core suggest(nl) → commandText (pure, no exec, no side-effects). */
 export function suggest(nl: string): string {
-  return ShellSuggestBufferInputSchema.parse({ nl }).nl;
+  const input = ShellSuggestBufferInputSchema.parse({ nl });
+  // Returns normalized text intended for buffer / human paste.
+  // Model delegation or richer heuristics belong at call site or future extension.
+  return input.nl;
 }
 
-/** Compatibility name for shell integrations that call the buffer operation directly. */
-export function suggestToBuffer(nl: string): string {
-  return suggest(nl);
+export function createShellSuggestBufferTool(): ToolDefinition<
+  typeof ShellSuggestBufferInputSchema,
+  typeof ShellSuggestBufferOutputSchema
+> {
+  return {
+    id: "shell.suggest.buffer",
+    title: "Suggest shell command from natural language",
+    description:
+      "NL → suggested shell command text for human review/buffer. " +
+      "Never executes. Dry-run by design; separate approval required for any run.",
+    inputSchema: ShellSuggestBufferInputSchema,
+    outputSchema: ShellSuggestBufferOutputSchema,
+    effect: "read-only",
+    execute(input) {
+      const commandText = suggest(input.nl);
+      return {
+        suggestedCommand: commandText,
+        explanation: "Suggested for human buffer. Review before any execution."
+      };
+    }
+  };
 }
+
