@@ -1,148 +1,142 @@
-import type { ContextProvider, ContextProviderQuery } from '../../src/context/contextProviderRegistry.js';
+import { describe, expect, it } from "vitest";
+
 import {
   createContextProviderRegistry,
-  collectContextProviders
+  type ContextProvider,
+  type ContextSnippet
 } from '../../src/context/contextProviderRegistry.js';
 
-function createEchoProvider(id: string, priority: number, snippets: readonly string[]): ContextProvider {
-  return {
-    id,
-    priority,
-    async collect(_query: ContextProviderQuery): Promise<readonly string[]> {
-      return snippets;
-    }
-  };
-}
+/**
+ * IDEA-F255-CTX-PROV-REG-01 — context provider registry.
+ *
+ * A context provider registers under a stable name and contributes context
+ * snippets before a model call. The registry preserves registration order, so
+ * multiple providers can layer their snippets deterministically (system-level
+ * context first, role/skill context next, task context last, etc.). `collect`
+ * runs every registered provider and concatenates results in registration
+ * order. A provider that throws does not poison the whole collection — its
+ * snippet is dropped and surfaced as a collection error so the caller can
+ * decide whether to proceed.
+ */
+describe("contextProviderRegistry", () => {
+  function makeSnippet(name: string, body: string): ContextSnippet {
+    return { name, body };
+  }
 
-function createFailingProvider(id: string): ContextProvider {
-  return {
-    id,
-    priority: 0,
-    async collect(): Promise<readonly string[]> {
-      throw new Error(`${id} blew up`);
-    }
-  };
-}
+  describe("register / list", () => {
+    it("registers a named provider and exposes it via list", () => {
+      const registry = createContextProviderRegistry();
+      const provider: ContextProvider = { name: "repo", collect: async () => [makeSnippet("repo", "cwd=/x")] };
 
-describe("createContextProviderRegistry", () => {
-  it("registers providers and lists them sorted by priority ascending then id", () => {
-    const registry = createContextProviderRegistry([
-      createEchoProvider("zeta", 10, ["z"]),
-      createEchoProvider("alpha", 10, ["a"]),
-      createEchoProvider("mu", 5, ["m"])
-    ]);
+      registry.register(provider);
 
-    expect(registry.list().map((provider) => provider.id)).toEqual(["mu", "alpha", "zeta"]);
-    expect(registry.get("alpha")?.id).toBe("alpha");
-    expect(registry.get("missing")).toBeUndefined();
+      expect(registry.list().map((p) => p.name)).toEqual(["repo"]);
+    });
+
+    it("preserves registration order across multiple providers", () => {
+      const registry = createContextProviderRegistry();
+      registry.register({ name: "system", collect: async () => [makeSnippet("system", "s")] });
+      registry.register({ name: "role", collect: async () => [makeSnippet("role", "r")] });
+      registry.register({ name: "task", collect: async () => [makeSnippet("task", "t")] });
+
+      expect(registry.list().map((p) => p.name)).toEqual(["system", "role", "task"]);
+    });
+
+    it("throws on duplicate registration of an existing name", () => {
+      const registry = createContextProviderRegistry();
+      registry.register({ name: "repo", collect: async () => [] });
+
+      expect(() =>
+        registry.register({ name: "repo", collect: async () => [] })
+      ).toThrow(/already registered/i);
+    });
+
+    it("find returns the provider by name", () => {
+      const registry = createContextProviderRegistry();
+      const provider: ContextProvider = { name: "repo", collect: async () => [] };
+      registry.register(provider);
+
+      expect(registry.find("repo")).toBe(provider);
+      expect(registry.find("missing")).toBeUndefined();
+    });
   });
 
-  it("rejects duplicate provider ids during construction", () => {
-    expect(() =>
-      createContextProviderRegistry([
-        createEchoProvider("dupe", 0, ["a"]),
-        createEchoProvider("dupe", 0, ["b"])
-      ])
-    ).toThrow("Context provider already registered: dupe");
-  });
+  describe("collect", () => {
+    it("collects snippets from multiple providers in registration order", async () => {
+      const registry = createContextProviderRegistry();
+      registry.register({
+        name: "system",
+        collect: async () => [makeSnippet("system", "S1"), makeSnippet("system", "S2")]
+      });
+      registry.register({
+        name: "role",
+        collect: async () => [makeSnippet("role", "R1")]
+      });
+      registry.register({
+        name: "task",
+        collect: async () => [makeSnippet("task", "T1")]
+      });
 
-  it("rejects duplicate provider ids added via register()", () => {
-    const registry = createContextProviderRegistry();
+      const result = await registry.collect();
 
-    registry.register(createEchoProvider("solo", 0, ["x"]));
+      expect(result.snippets.map((s) => s.body)).toEqual(["S1", "S2", "R1", "T1"]);
+      expect(result.errors).toEqual([]);
+    });
 
-    expect(() => registry.register(createEchoProvider("solo", 0, ["y"]))).toThrow(
-      "Context provider already registered: solo"
-    );
-  });
-});
+    it("handles providers that return zero snippets", async () => {
+      const registry = createContextProviderRegistry();
+      registry.register({ name: "empty", collect: async () => [] });
+      registry.register({ name: "full", collect: async () => [makeSnippet("full", "F")] });
 
-describe("collectContextProviders", () => {
-  it("collects snippets from every provider in priority order and flattens the result", async () => {
-    const registry = createContextProviderRegistry([
-      createEchoProvider("zeta", 20, ["z1", "z2"]),
-      createEchoProvider("alpha", 10, ["a1"]),
-      createEchoProvider("mu", 30, ["m1"])
-    ]);
+      const result = await registry.collect();
 
-    const snippets = await collectContextProviders(registry, { runId: "run-1" });
+      expect(result.snippets.map((s) => s.body)).toEqual(["F"]);
+      expect(result.errors).toEqual([]);
+    });
 
-    expect(snippets).toEqual(["a1", "z1", "z2", "m1"]);
-  });
+    it("returns empty result when no providers are registered", async () => {
+      const registry = createContextProviderRegistry();
 
-  it("passes the same query object to every provider and records calls in invocation order", async () => {
-    const received: Array<{ id: string; query: ContextProviderQuery }> = [];
-    const registry = createContextProviderRegistry([
-      {
-        id: "recorder-a",
-        priority: 0,
-        async collect(query) {
-          received.push({ id: "recorder-a", query });
-          return ["a"];
+      const result = await registry.collect();
+
+      expect(result.snippets).toEqual([]);
+      expect(result.errors).toEqual([]);
+    });
+
+    it("drops a failing provider without poisoning the others and reports the error", async () => {
+      const registry = createContextProviderRegistry();
+      registry.register({ name: "ok-before", collect: async () => [makeSnippet("a", "A")] });
+      registry.register({
+        name: "boom",
+        collect: async () => {
+          throw new Error("provider exploded");
         }
-      },
-      {
-        id: "recorder-b",
-        priority: 1,
-        async collect(query) {
-          received.push({ id: "recorder-b", query });
-          return ["b"];
+      });
+      registry.register({ name: "ok-after", collect: async () => [makeSnippet("c", "C")] });
+
+      const result = await registry.collect();
+
+      expect(result.snippets.map((s) => s.body)).toEqual(["A", "C"]);
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0]?.providerName).toBe("boom");
+      expect(result.errors[0]?.message).toMatch(/provider exploded/);
+    });
+
+    it("passes the collection context to each provider", async () => {
+      const registry = createContextProviderRegistry();
+      const seen: string[] = [];
+      registry.register({
+        name: "repo",
+        collect: async (ctx) => {
+          seen.push(ctx.cwd ?? "<no-cwd>");
+          return [makeSnippet("repo", `cwd=${ctx.cwd}`)];
         }
-      }
-    ]);
+      });
 
-    const query: ContextProviderQuery = { runId: "run-7", cwd: "/tmp" };
-    const snippets = await collectContextProviders(registry, query);
+      const result = await registry.collect({ cwd: "/work" });
 
-    expect(snippets).toEqual(["a", "b"]);
-    expect(received.map((entry) => entry.id)).toEqual(["recorder-a", "recorder-b"]);
-    expect(received.every((entry) => entry.query === query)).toBe(true);
-  });
-
-  it("skips providers that throw and continues collecting from the others", async () => {
-    const registry = createContextProviderRegistry([
-      createFailingProvider("boom"),
-      createEchoProvider("ok", 0, ["good"]),
-      createFailingProvider("boom-2")
-    ]);
-
-    const snippets = await collectContextProviders(registry, {});
-
-    expect(snippets).toEqual(["good"]);
-  });
-
-  it("returns an empty array when no providers are registered", async () => {
-    const registry = createContextProviderRegistry();
-
-    const snippets = await collectContextProviders(registry, {});
-
-    expect(snippets).toEqual([]);
-  });
-
-  it("awaits providers even when their snippet list is empty", async () => {
-    let invocations = 0;
-    const registry = createContextProviderRegistry([
-      {
-        id: "empty-a",
-        priority: 0,
-        async collect() {
-          invocations += 1;
-          return [];
-        }
-      },
-      {
-        id: "empty-b",
-        priority: 1,
-        async collect() {
-          invocations += 1;
-          return [];
-        }
-      }
-    ]);
-
-    const snippets = await collectContextProviders(registry, {});
-
-    expect(snippets).toEqual([]);
-    expect(invocations).toBe(2);
+      expect(result.snippets.map((s) => s.body)).toEqual(["cwd=/work"]);
+      expect(seen).toEqual(["/work"]);
+    });
   });
 });
