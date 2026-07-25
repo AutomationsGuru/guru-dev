@@ -24,11 +24,9 @@ describe("specTaskStatusTracker (IDEA-F158-TASK-STATUS-01) — per-task status +
     expect(() => SpecTaskStatusSchema.parse("nope")).toThrow();
   });
 
-  it("registers a task on first setStatus", () => {
+  it("registers a task as pending by default on first setStatus of any status", () => {
     const tracker = createSpecTaskStatusTracker();
-
     tracker.setStatus("task-1", "in-progress");
-
     expect(tracker.getStatus("task-1")).toBe("in-progress");
   });
 
@@ -44,9 +42,7 @@ describe("specTaskStatusTracker (IDEA-F158-TASK-STATUS-01) — per-task status +
 
   it("records blocked with an optional reason", () => {
     const tracker = createSpecTaskStatusTracker();
-
     tracker.setStatus("task-2", "blocked", { reason: "waiting on upstream" });
-
     expect(tracker.getStatus("task-2")).toBe("blocked");
   });
 
@@ -63,7 +59,6 @@ describe("specTaskStatusTracker (IDEA-F158-TASK-STATUS-01) — per-task status +
 
   it("rejects an invalid status", () => {
     const tracker = createSpecTaskStatusTracker();
-
     expect(() => tracker.setStatus("task-1", "nope" as never)).toThrow();
   });
 
@@ -85,7 +80,7 @@ describe("specTaskStatusTracker (IDEA-F158-TASK-STATUS-01) — per-task status +
     tracker.setStatus("a", "done", { wave: "wave-1" });
     tracker.setStatus("b", "in-progress", { wave: "wave-1" });
     tracker.setStatus("c", "blocked", { wave: "wave-2" });
-    tracker.setStatus("d", "pending");
+    tracker.setStatus("d", "pending"); // no wave
 
     const summary = tracker.summary();
     expect(summary.total).toBe(4);
