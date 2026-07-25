@@ -1,121 +1,82 @@
-/**
- * Portable skill author lint (§F410).
- *
- * Scans a skill body for vendor-locked path tokens — references to a specific AI
- * harness vendor's home-directory config (e.g. `~/.claude`, `~/.codex`) — so
- * authors can rewrite them as portable paths before publishing.
- *
- * A vendor-locked path ties a skill to one harness; a portable skill uses
- * `~/.guruharness` (GuruHarness's own home) or generic paths.  This lint is a
- * development-time authoring aid, not a runtime gate.
- */
-
-/** A single vendor-locked path warning with enough context for the author to fix it. */
-export interface VendorPathWarning {
-  /** The matched vendor path token (e.g. "~/.claude"). */
-  readonly path: string;
-  /** The vendor this path locks the skill to. */
-  readonly vendor: string;
-  /** Human-readable warning message citing the path and vendor. */
-  readonly message: string;
-  /** A suggested portable replacement (e.g. "~/.guruharness"). */
-  readonly suggestion: string;
-}
-
-/** One registered vendor-path pattern and its metadata. */
-interface VendorEntry {
-  readonly regex: RegExp;
-  readonly vendor: string;
-  readonly path: string;
-  readonly suggestion: string;
-}
-
-const GURUHARNESS_HOME = "~/.guruharness";
+import { z } from "zod";
 
 /**
- * Registered vendor-locked path patterns.
- *
- * Each entry matches a path token that ties a skill body to one specific AI
- * harness vendor.  Patterns use `\b` word-boundary at the end so `~/.claude`
- * flags but `~/.claudette` does not.
- *
- * Add new entries here when another vendor's config path appears in the wild.
- * Never add `~/.guruharness` — that is the portable target, not a lock.
+ * Portable skill author lint: reject vendor-locked path tokens in skill bodies.
+ * A skill that ships with a vendor-specific home path should use generic
+ * references or relative paths instead.
  */
-const VENDOR_ENTRIES: readonly VendorEntry[] = [
-  // Anthropic Claude — various forms
+
+// Vendor-locked path patterns.
+
+/**
+ * Each entry matches a case-insensitive vendor configuration root in a skill
+ * body. A match warns because the author can remap the path.
+ */
+const VENDOR_PATH_TOKENS: ReadonlyArray<{
+  readonly pattern: RegExp;
+  readonly vendor: string;
+  readonly hint: string;
+}> = [
   {
-    regex: /~\/\.claude\b/,
-    vendor: "Anthropic Claude",
-    path: "~/.claude",
-    suggestion: GURUHARNESS_HOME,
+    pattern: /~\/\.claude(?:\/|$)/gim,
+    vendor: "Claude Code",
+    hint: "Replace ~/.claude with a portable relative path or a tool-relative reference."
   },
   {
-    regex: /\$HOME\/\.claude\b/,
-    vendor: "Anthropic Claude",
-    path: "$HOME/.claude",
-    suggestion: GURUHARNESS_HOME,
-  },
-  {
-    regex: /~\/\.config\/claude\b/,
-    vendor: "Anthropic Claude",
-    path: "~/.config/claude",
-    suggestion: GURUHARNESS_HOME,
-  },
-  // OpenAI Codex — various forms
-  {
-    regex: /~\/\.codex\b/,
+    pattern: /~\/\.codex(?:\/|$)/gim,
     vendor: "OpenAI Codex",
-    path: "~/.codex",
-    suggestion: GURUHARNESS_HOME,
+    hint: "Replace ~/.codex with a portable relative path or a tool-relative reference."
   },
   {
-    regex: /~\/\.config\/codex\b/,
-    vendor: "OpenAI Codex",
-    path: "~/.config/codex",
-    suggestion: GURUHARNESS_HOME,
+    pattern: /~\/\.cursor(?:\/|$)/gim,
+    vendor: "Cursor IDE",
+    hint: "Replace ~/.cursor with a portable relative path or a tool-relative reference."
   },
-  // Anthropic general
   {
-    regex: /~\/\.anthropic\b/,
-    vendor: "Anthropic",
-    path: "~/.anthropic",
-    suggestion: GURUHARNESS_HOME,
-  },
-  // OpenAI general
-  {
-    regex: /~\/\.openai\b/,
-    vendor: "OpenAI",
-    path: "~/.openai",
-    suggestion: GURUHARNESS_HOME,
-  },
+    pattern: /~\/\.windsurf(?:\/|$)/gim,
+    vendor: "Windsurf IDE",
+    hint: "Replace ~/.windsurf with a portable relative path or a tool-relative reference."
+  }
 ];
 
-/**
- * Lint a skill body for vendor-locked path tokens.
- *
- * Returns zero or more warnings, one per unique vendor path found.  Repeated
- * mentions of the same vendor path are deduplicated so the author sees each
- * lock once.
- */
-export function lintPortableSkill(body: string): VendorPathWarning[] {
-  const seen = new Set<string>();
-  const warnings: VendorPathWarning[] = [];
+// ── schemas ─────────────────────────────────────────────────────────────────
 
-  for (const entry of VENDOR_ENTRIES) {
-    if (entry.regex.test(body)) {
-      if (seen.has(entry.path)) {
-        continue;
-      }
-      seen.add(entry.path);
-      warnings.push({
-        path: entry.path,
-        vendor: entry.vendor,
-        message: `Vendor-locked path "${entry.path}" (${entry.vendor}) found in skill body — replace with a portable path such as "${entry.suggestion}".`,
-        suggestion: entry.suggestion,
-      });
+export const LintWarningSchema = z
+  .object({
+    vendor: z.string().min(1).describe("Which vendor/harness the path locks the skill to."),
+    token: z.string().min(1).describe("The matched vendor-path substring."),
+    hint: z.string().min(1).describe("Actionable guidance for the skill author.")
+  })
+  .strict();
+export type LintWarning = z.infer<typeof LintWarningSchema>;
+
+export const PortableSkillLintResultSchema = z
+  .object({
+    ok: z.boolean().describe("true when zero vendor-path warnings were found."),
+    warnings: z.array(LintWarningSchema).describe("Vendor-locked path tokens found in the skill body.")
+  })
+  .strict();
+export type PortableSkillLintResult = z.infer<typeof PortableSkillLintResultSchema>;
+
+// ── lint ────────────────────────────────────────────────────────────────────
+
+/** Scan a skill body for vendor-locked path tokens. */
+export function lintSkillBody(body: string): PortableSkillLintResult {
+  const warnings: LintWarning[] = [];
+
+  for (const { pattern, vendor, hint } of VENDOR_PATH_TOKENS) {
+    // Reset regex state (global flag caches lastIndex).
+    pattern.lastIndex = 0;
+
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(body)) !== null) {
+      const token = match[0]!.trim();
+      warnings.push({ vendor, token, hint });
     }
   }
 
-  return warnings;
+  return PortableSkillLintResultSchema.parse({
+    ok: warnings.length === 0,
+    warnings
+  });
 }
