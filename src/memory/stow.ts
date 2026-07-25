@@ -56,7 +56,8 @@ export const StowLearningInputSchema = z
     currentSession: z.number().int().nonnegative().default(0)
   })
   .strict();
-export type StowLearningInput = z.infer<typeof StowLearningInputSchema>;
+/** Call-site input: fields with defaults may be omitted (parsed by schema). */
+export type StowLearningInput = z.input<typeof StowLearningInputSchema>;
 
 export const StowReceiptSchema = z
   .object({
