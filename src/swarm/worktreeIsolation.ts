@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 /**
@@ -54,7 +54,8 @@ export function detectGitRepo(cwd: string): string | null {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"]
     }).trim();
-    return top.length > 0 ? resolve(top) : null;
+    // realpath collapses Windows 8.3 short paths (RUNNER~1) to the long form.
+    return top.length > 0 ? realpathSync(resolve(top)) : null;
   } catch {
     return null;
   }

@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -77,7 +77,7 @@ describe("detectGitRepo", () => {
   });
 
   it("returns the repo root for a git directory", () => {
-    expect(detectGitRepo(repo.root)).toBe(resolve(repo.root));
+    expect(detectGitRepo(repo.root)).toBe(realpathSync(resolve(repo.root)));
   });
 
   it("returns null for a non-git directory", () => {
@@ -137,7 +137,7 @@ describe("createWorktreeIsolation — bounded project-local worktrees", () => {
     // The operator checkout is NOT the worktree path.
     expect(handle.path).not.toBe(resolve(repo.root));
     // The worktree is a real git worktree (has .git pointer).
-    expect(detectGitRepo(handle.path)).toBe(resolve(handle.path));
+    expect(detectGitRepo(handle.path)).toBe(realpathSync(resolve(handle.path)));
   });
 
   it("never deletes operator branches: dispose removes only its own worktree, not the main checkout", () => {
@@ -148,7 +148,7 @@ describe("createWorktreeIsolation — bounded project-local worktrees", () => {
     // Worktree path is gone.
     expect(detectGitRepo(wtPath)).toBeNull();
     // Operator checkout still a live repo with its branch intact.
-    expect(detectGitRepo(repo.root)).toBe(resolve(repo.root));
+    expect(detectGitRepo(repo.root)).toBe(realpathSync(resolve(repo.root)));
     const branch = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: repo.root, encoding: "utf8" }).trim();
     expect(branch).toBe("main");
   });
