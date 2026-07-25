@@ -1,134 +1,162 @@
-import { z } from "zod";
+import { scrubSecretValues } from "../safety/secretSafety.js";
 
 /**
- * Session Audit SSE (IDEA-F270-AUDIT-SSE-01)
+ * Opt-in session audit SSE channel.
  *
- * Opt-in Server-Sent Events channel for emitting and subscribing to
- * session audit events (intent, tool calls, approvals). Default OFF
- * to avoid unintended telemetry. Events are strictly ordered.
- *
- * This is a lightweight, self-contained module. Enable explicitly
- * for a session when audit trail is requested. No secrets ever emitted.
- * Fits the frozen extension seam and P1 reliability goals.
+ * The channel is deliberately independent from the API event stream: callers
+ * can use it as a small session-local extension seam and later map these
+ * metadata-only frames into the bounded API stream. It never exports intent or
+ * tool contents, and it is disabled until the owner explicitly enables it.
  */
 
-// Hard limit guard: never auto-enable; explicit opt-in only.
-let auditEnabled = false;
-const auditEvents: AuditEvent[] = [];
-const listeners: Array<(event: AuditEvent) => void> = [];
+export type AuditEventType = "intent" | "tool" | "approval";
 
-export const AuditEventTypeSchema = z.enum(["intent", "tool", "approval"]);
-export type AuditEventType = z.infer<typeof AuditEventTypeSchema>;
+export interface AuditEvent {
+  readonly id: number;
+  readonly timestamp: string;
+  readonly type: AuditEventType;
+  readonly sessionId?: string;
+  readonly metadata: Readonly<Record<string, string | number | boolean | null>>;
+}
 
-export const AuditEventSchema = z.object({
-  ts: z.string().datetime(),
-  type: AuditEventTypeSchema,
-  sessionId: z.string().optional(),
-  payload: z.unknown(),
-});
-export type AuditEvent = z.infer<typeof AuditEventSchema>;
+export interface AuditEventInput {
+  readonly type: AuditEventType;
+  readonly sessionId?: string;
+  readonly metadata: Readonly<Record<string, unknown>>;
+}
 
-/**
- * Enable the audit SSE channel. Must be called explicitly; default remains off.
- * Idempotent. Returns true if newly enabled.
- */
+export type AuditEventListener = (event: AuditEvent) => void;
+export type AuditSseListener = (frame: string) => void;
+
+let enabled = false;
+let nextId = 1;
+const events: AuditEvent[] = [];
+const listeners = new Set<AuditEventListener>();
+const sseListeners = new Set<AuditSseListener>();
+
+/** Enable audit publication. Repeated calls are harmless and return false. */
 export function enableAuditSse(): boolean {
-  if (auditEnabled) return false;
-  auditEnabled = true;
+  if (enabled) {
+    return false;
+  }
+  enabled = true;
   return true;
 }
 
-/** Returns whether audit SSE is currently enabled. */
-export function isAuditSseEnabled(): boolean {
-  return auditEnabled;
+/** Disable publication and detach all live listeners. */
+export function disableAuditSse(): void {
+  enabled = false;
+  listeners.clear();
+  sseListeners.clear();
 }
 
-/**
- * Emit an audit event. No-op when disabled (default).
- * Events are appended in call order and fan-out to any active subscribers.
- */
-export function emitAuditEvent(input: {
-  type: AuditEventType;
-  payload: unknown;
-  sessionId?: string;
-}): void {
-  if (!auditEnabled) return;
+export function isAuditSseEnabled(): boolean {
+  return enabled;
+}
 
+/** Emit one metadata-only event, preserving call order while enabled. */
+export function emitAuditEvent(input: AuditEventInput): void {
+  if (!enabled) {
+    return;
+  }
+
+  const metadata = sanitizeMetadata(input.metadata);
   const event: AuditEvent = {
-    ts: new Date().toISOString(),
+    id: nextId++,
+    timestamp: new Date().toISOString(),
     type: input.type,
-    sessionId: input.sessionId,
-    payload: input.payload,
+    ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
+    metadata
   };
+  events.push(event);
 
-  // Validate shape (defensive; keeps events clean)
-  const parsed = AuditEventSchema.safeParse(event);
-  if (!parsed.success) return; // drop invalid silently (never leak)
-
-  auditEvents.push(parsed.data);
-  for (const listener of listeners) {
+  for (const listener of [...listeners]) {
     try {
-      listener(parsed.data);
+      listener(event);
     } catch {
-      // listener errors must not break emission or ordering
+      // A consumer cannot interrupt publication or change event ordering.
+    }
+  }
+
+  const frame = encodeAuditSseFrame(event);
+  for (const listener of [...sseListeners]) {
+    try {
+      listener(frame);
+    } catch {
+      // A broken transport is isolated from the audit publisher.
     }
   }
 }
 
-/** Retrieve a snapshot of emitted events in order (for tests / inspection). */
 export function getAuditEvents(): readonly AuditEvent[] {
-  return [...auditEvents];
+  return events.map((event) => ({ ...event, metadata: { ...event.metadata } }));
 }
 
-/** Clear events (test helper; does not affect enabled state). */
+/** Test/lifecycle reset; does not opt the channel in or out. */
 export function clearAuditEvents(): void {
-  auditEvents.length = 0;
+  events.length = 0;
+  nextId = 1;
 }
 
-/**
- * Subscribe to live audit events via callback.
- * Returns unsubscribe function. Only receives events after subscription.
- * For full SSE stream consumption, wrap the callback or use createAuditSseStream.
- */
-export function subscribeAuditEvents(
-  onEvent: (event: AuditEvent) => void
-): () => void {
-  listeners.push(onEvent);
-  return () => {
-    const idx = listeners.indexOf(onEvent);
-    if (idx >= 0) listeners.splice(idx, 1);
-  };
+export function subscribeAuditEvents(listener: AuditEventListener): () => void {
+  if (!enabled) {
+    return () => undefined;
+  }
+  listeners.add(listener);
+  return () => listeners.delete(listener);
 }
 
-/**
- * Create an SSE-compatible ReadableStream for opt-in consumption.
- * Emits "data: <json>\n\n" events. Starts buffering from subscription time
- * or replays prior if desired (here: live only for simplicity).
- * Consumer is responsible for enabling first.
- */
+/** Subscribe to already-framed SSE audit events. */
+export function subscribeAuditSse(listener: AuditSseListener): () => void {
+  if (!enabled) {
+    return () => undefined;
+  }
+  sseListeners.add(listener);
+  return () => sseListeners.delete(listener);
+}
+
+/** Create a live SSE stream. Disabled channels return an already-closed stream. */
 export function createAuditSseStream(): ReadableStream<string> {
-  if (!auditEnabled) {
-    // Return empty stream when disabled (explicit opt-in expected upstream)
-    return new ReadableStream({
+  if (!enabled) {
+    return new ReadableStream<string>({
       start(controller) {
         controller.close();
-      },
+      }
     });
   }
 
-  return new ReadableStream({
+  let unsubscribe: (() => void) | undefined;
+  return new ReadableStream<string>({
     start(controller) {
-      const unsubscribe = subscribeAuditEvents((event) => {
-        const line = `data: ${JSON.stringify(event)}\n\n`;
-        controller.enqueue(line);
+      unsubscribe = subscribeAuditSse((frame) => {
+        try {
+          controller.enqueue(frame);
+        } catch {
+          unsubscribe?.();
+        }
       });
-
-      // Store unsubscribe for potential abort; in practice caller manages lifetime
-      // For this impl we keep simple; real usage would tie to request signal.
-      (controller as any)._unsub = unsubscribe;
     },
     cancel() {
-      // best-effort cleanup omitted for minimal surface
-    },
+      unsubscribe?.();
+      unsubscribe = undefined;
+    }
   });
+}
+
+function encodeAuditSseFrame(event: AuditEvent): string {
+  return `id: ${event.id}\nevent: audit\ndata: ${JSON.stringify(event)}\n\n`;
+}
+
+function sanitizeMetadata(input: Readonly<Record<string, unknown>>): Readonly<Record<string, string | number | boolean | null>> {
+  const metadata: Record<string, string | number | boolean | null> = {};
+  for (const [key, value] of Object.entries(input)) {
+    if (value === null || typeof value === "number" || typeof value === "boolean") {
+      metadata[key] = value;
+      continue;
+    }
+    if (typeof value === "string") {
+      metadata[key] = scrubSecretValues(value);
+    }
+  }
+  return metadata;
 }
