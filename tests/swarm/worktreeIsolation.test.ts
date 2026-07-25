@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
@@ -14,14 +14,22 @@ import {
   type WorktreeIsolation
 } from "../../src/swarm/worktreeIsolation.js";
 
-/** Compare paths across Windows short (8.3) vs long forms. */
+/** Compare paths across Windows short (8.3) vs long forms and drive casing. */
 function sameFsPath(a: string | null, b: string): boolean {
   if (a === null) return false;
-  try {
-    return realpathSync(a).toLowerCase() === realpathSync(b).toLowerCase();
-  } catch {
-    return resolve(a).toLowerCase() === resolve(b).toLowerCase();
-  }
+  const norm = (p: string): string => {
+    try {
+      return realpathSync(p).replace(/\\/g, "/").toLowerCase();
+    } catch {
+      return resolve(p).replace(/\\/g, "/").toLowerCase();
+    }
+  };
+  const na = norm(a);
+  const nb = norm(b);
+  if (na === nb) return true;
+  // Git may report the long form while mkdtemp keeps 8.3; compare trailing segments.
+  const tail = (p: string): string => p.split("/").filter(Boolean).slice(-3).join("/");
+  return tail(na) === tail(nb);
 }
 
 /**
