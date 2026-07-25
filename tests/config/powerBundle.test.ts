@@ -1,4 +1,4 @@
-import { installBundle } from '../../src/config/powerBundle';
+import { installBundle } from '../../src/config/powerBundle.js';
 import * as path from 'path';
 
 describe('installBundle', () => {
