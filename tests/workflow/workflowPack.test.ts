@@ -66,9 +66,9 @@ function scriptedExecutor(script: (command: readonly string[], call: number) => 
   };
 }
 
-function stubSessionFactory(outputs: readonly string[]): { factory: WorkflowPackSessionFactory; prompts: string[]; setups: { toolAllowlist?: readonly string[]; model?: string }[] } {
+function stubSessionFactory(outputs: readonly string[]): { factory: WorkflowPackSessionFactory; prompts: string[]; setups: { toolAllowlist?: readonly string[] | undefined; model?: string | undefined }[] } {
   const prompts: string[] = [];
-  const setups: { toolAllowlist?: readonly string[]; model?: string }[] = [];
+  const setups: { toolAllowlist?: readonly string[] | undefined; model?: string | undefined }[] = [];
   let attempt = 0;
   const factory: WorkflowPackSessionFactory = (setup) => {
     setups.push({ toolAllowlist: setup.toolAllowlist, model: setup.model });
