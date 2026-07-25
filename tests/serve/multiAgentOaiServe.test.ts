@@ -80,7 +80,7 @@ describe("multiAgentOaiServe", () => {
         }),
       });
       expect(res.status).toBe(200);
-      const json = await res.json();
+      const json = (await res.json()) as { id?: string; choices?: Array<{ message?: { content?: string } }> };
       expect(json).toHaveProperty("id");
       expect(json.choices?.[0]?.message?.content).toContain("fleet-alpha-7");
     });
@@ -95,7 +95,7 @@ describe("multiAgentOaiServe", () => {
         body: JSON.stringify({ model: "gpt-5", messages: [] }),
       });
       expect(res.status).toBe(400);
-      const json = await res.json();
+      const json = (await res.json()) as { error?: string };
       expect(json.error).toMatch(/unknown agent/i);
     });
   });
