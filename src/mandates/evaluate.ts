@@ -897,6 +897,10 @@ export interface MandateContext {
   readonly state: MandateState;
   /** True when the operator has declared YOLO for the session. */
   readonly yolo: boolean;
+  /** Optional agent id for per-agent scoped policy lookup (falls back to global). */
+  readonly agentId?: string;
+  /** Optional role for future agent role-based policy. */
+  readonly role?: string;
 }
 
 function pathCovers(grantPath: string, target: string): boolean {
@@ -975,6 +979,20 @@ export function evaluateToolMandate(toolId: string, input: unknown, ctx: Mandate
     return { outcome: "escalate", reason: `hard edge (${hardEdge}) requires explicit confirmation in every mode — even YOLO`, verbs };
   }
 
+  // Narrow agent-scoped policy lookup (after deny-wins + hard-edge, before YOLO).
+  // Falls back to global state if ctx.agentId absent or no per-agent entry present.
+  // Preserves all precedence, deny-wins, HARD_EDGE, YOLO, pathCovers invariants.
+  // Uses optional non-persisted extension on MandateState for agentGrants/agentDenies.
+  const agentGrants = (ctx.agentId && (ctx.state as any)?.agentGrants?.[ctx.agentId]?.grants) || ctx.state.grants;
+  const agentDenies = (ctx.agentId && (ctx.state as any)?.agentGrants?.[ctx.agentId]?.denies) || ctx.state.denies;
+
+  // Re-check denies for agent-scoped (support per-agent deny overrides)
+  for (const deny of agentDenies) {
+    if (verbs.includes(deny.verb) && (!deny.path || pathCovers(deny.path, targetPath))) {
+      return { outcome: "deny", reason: `denied by rule (${deny.verb}${deny.path ? ` in ${deny.path}` : ""})`, verbs };
+    }
+  }
+
   // YOLO lifts every ordinary PERMISSION gate (the self-mutation constitution +
   // secret output law live elsewhere and are unaffected).
   if (ctx.yolo) {
@@ -983,7 +1001,8 @@ export function evaluateToolMandate(toolId: string, input: unknown, ctx: Mandate
 
   // A covering grant that carries every required verb allows the call.
   // SPACE scope is checked against the operation TARGET, not only cwd.
-  for (const grant of ctx.state.grants) {
+  // Use agent-scoped grants if present (fallback already resolved above).
+  for (const grant of agentGrants) {
     const inScope =
       grant.scope === "machine" || (grant.scope === "space" && grant.path !== undefined && pathCovers(grant.path, targetPath));
     if (inScope && verbs.every((verb) => grant.verbs.includes(verb))) {
