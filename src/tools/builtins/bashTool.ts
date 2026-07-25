@@ -6,6 +6,7 @@ import { executeCommand, requiresWindowsCommandShim, type CommandExecutor } from
 import { guardContent } from "../../safety/policyGuard.js";
 import type { ToolDefinition } from "../registry.js";
 import { optimizeBashOutput, DEFAULT_BASH_OPTIMIZER_CONFIG, type BashOptimizerConfig } from "../bashOptimizer.js";
+import { TOOL_ERROR_CODES, renderOutputSummary, summarizeLines, truncateUtf8 } from "../ergonomics.js";
 import { spawnBackgroundTask } from "./backgroundTaskRegistry.js";
 
 export const PiBashToolInputSchema = z
@@ -31,6 +32,13 @@ export const PiBashToolOutputSchema = z
     exitCode: z.number().int().nullable().optional(),
     stdout: z.string().optional(),
     stderr: z.string().optional(),
+    /** Original pre-truncation sizes so the model sees the aggregate, not the dump. */
+    stdoutBytes: z.number().int().nonnegative().optional(),
+    stderrBytes: z.number().int().nonnegative().optional(),
+    stdoutLines: z.number().int().nonnegative().optional(),
+    stderrLines: z.number().int().nonnegative().optional(),
+    /** Stable machine-readable failure code; null on a clean run. */
+    errorCode: z.string().nullable().default(null),
     truncated: z.boolean().default(false),
     /** True when the child was KILLED (timeout/abort); stdout/stderr are partial. */
     cancelled: z.boolean().default(false),
@@ -84,10 +92,10 @@ export function createPiBashTool(options: PiBashToolOptions = { shellAllowlist: 
         ...buildBlockers(command, cwd, repoRoot, options)
       ];
       if (blockers.length > 0) {
-        return { executed: false, dryRun: input.dryRun, background: input.background === true, command: redactCommand(command), truncated: false, cancelled: false, blockers, summary: `Bash command blocked by ${blockers.length} policy check(s).` };
+        return { executed: false, dryRun: input.dryRun, background: input.background === true, command: redactCommand(command), errorCode: TOOL_ERROR_CODES.POLICY_BLOCKED, truncated: false, cancelled: false, blockers, summary: `Bash command blocked by ${blockers.length} policy check(s).` };
       }
       if (input.dryRun) {
-        return { executed: false, dryRun: true, background: input.background === true, command, truncated: false, cancelled: false, blockers: [], summary: "Dry run only; command was not executed." };
+        return { executed: false, dryRun: true, background: input.background === true, command, errorCode: null, truncated: false, cancelled: false, blockers: [], summary: "Dry run only; command was not executed." };
       }
       if (input.background === true) {
         const taskId = await startBackground(command, cwd);
@@ -97,6 +105,7 @@ export function createPiBashTool(options: PiBashToolOptions = { shellAllowlist: 
           background: true,
           command,
           taskId,
+          errorCode: null,
           truncated: false,
           cancelled: false,
           blockers: [],
@@ -126,8 +135,12 @@ export function createPiBashTool(options: PiBashToolOptions = { shellAllowlist: 
       const optimizerConfig = options.optimizer ?? DEFAULT_BASH_OPTIMIZER_CONFIG;
       const optimized = optimizeBashOutput(result.stdout, command, optimizerConfig);
       const stdoutSource = optimized.optimized && optimized.note ? `${optimized.note}\n${optimized.output}` : optimized.output;
-      const stdout = truncate(stdoutSource, input.maxOutputBytes);
-      const stderr = truncate(result.stderr, input.maxOutputBytes);
+      // Ergonomics (IDEA-E2): oversized streams are AGGREGATED, not raw-flooded —
+      // the kept payload leads with a line/repetition/width profile so the model
+      // sees counts and repeated lines instead of an opaque byte cut. Small
+      // outputs pass through untouched.
+      const stdout = capStream(stdoutSource, input.maxOutputBytes);
+      const stderr = capStream(result.stderr, input.maxOutputBytes);
       const decision = guardContent(
         [
           { name: "stdout", value: stdout.value },
@@ -137,6 +150,8 @@ export function createPiBashTool(options: PiBashToolOptions = { shellAllowlist: 
       );
       const redacted = !decision.allowed;
       const cancelled = result.cancelled === true;
+      const truncated = stdout.truncated || stderr.truncated;
+      const profileNote = truncated ? ` Output truncated from ${stdout.originalBytes + stderr.originalBytes} byte(s) (stdout ${stdout.originalBytes}, stderr ${stderr.originalBytes}); payloads carry an aggregate profile.` : "";
       return {
         executed: true,
         dryRun: false,
@@ -145,17 +160,22 @@ export function createPiBashTool(options: PiBashToolOptions = { shellAllowlist: 
         exitCode: result.exitCode,
         stdout: redacted ? "[redacted: sensitive output detected]" : stdout.value,
         stderr: redacted ? "[redacted: sensitive output detected]" : stderr.value,
-        truncated: stdout.truncated || stderr.truncated,
+        stdoutBytes: stdout.originalBytes,
+        stderrBytes: stderr.originalBytes,
+        stdoutLines: stdout.lineCount,
+        stderrLines: stderr.lineCount,
+        errorCode: null,
+        truncated,
         cancelled,
         durationMs: result.durationMs,
         blockers: [...decision.blockers],
         summary: cancelled
-          ? "Command was KILLED (timeout/abort) — stdout/stderr contain the partial output captured before the kill."
+          ? `Command was KILLED (timeout/abort) — stdout/stderr contain the partial output captured before the kill.${profileNote}`
           : redacted
             ? "Command completed, but output was redacted."
             : result.exitCode === 0
-              ? "Command completed successfully."
-              : "Command completed with a non-zero or null exit code."
+              ? `Command completed successfully.${profileNote}`
+              : `Command completed with a non-zero or null exit code.${profileNote}`
       };
     }
   };
@@ -191,29 +211,30 @@ async function runWithTimeout<T>(promise: Promise<T>, timeoutMs: number): Promis
   }
 }
 
-function truncate(value: string, maxBytes: number): { readonly value: string; readonly truncated: boolean } {
-  const buffer = Buffer.from(value, "utf8");
-  if (buffer.length <= maxBytes) return { value, truncated: false };
-  // Walk back to the last complete UTF-8 char boundary (review 2026-07-08): a raw
-  // subarray cut mid-multibyte sequence left orphaned lead/continuation bytes,
-  // which decode to U+FFFD and corrupt the tail of non-ASCII (CJK/emoji) output.
-  let cut = maxBytes;
-  // A continuation byte has the high bits 10xxxxxx (0x80–0xBF). The byte AT the
-  // cut must be a lead byte (start of a char); back up while it's a continuation.
-  while (cut > 0 && (buffer[cut]! & 0xc0) === 0x80) {
-    cut -= 1;
+interface CappedStream {
+  readonly value: string;
+  readonly truncated: boolean;
+  readonly originalBytes: number;
+  readonly lineCount: number;
+}
+
+/**
+ * Cap one output stream ergonomically (IDEA-E2): within budget the value passes
+ * through byte-identical; over budget the payload becomes an aggregate profile
+ * (line/byte/repetition/width counts + bounded head excerpt) instead of a raw
+ * byte dump. The UTF-8 boundary walk lives in ergonomics.truncateUtf8 (review
+ * 2026-07-08 rule: never cut mid-sequence).
+ */
+function capStream(value: string, maxBytes: number): CappedStream {
+  const profile = summarizeLines(value);
+  const originalBytes = Buffer.from(value, "utf8").length;
+  if (originalBytes <= maxBytes) {
+    return { value, truncated: false, originalBytes, lineCount: profile.lineCount };
   }
-  // If we backed onto a LEAD byte of a multibyte char whose full sequence wouldn't
-  // fit in maxBytes, drop that partial char too (its lead byte is 11xxxxxx).
-  if (cut > 0 && (buffer[cut - 1]! & 0xc0) === 0xc0) {
-    // Check the lead byte's declared length vs remaining room.
-    const lead = buffer[cut - 1]!;
-    const seqLen = lead >= 0xf0 ? 4 : lead >= 0xe0 ? 3 : lead >= 0xc0 ? 2 : 1;
-    if (cut - 1 + seqLen > maxBytes) {
-      cut -= 1;
-    }
-  }
-  return { value: buffer.subarray(0, cut).toString("utf8"), truncated: true };
+  const excerpt = truncateUtf8(value, Math.max(1, Math.floor(maxBytes / 2)));
+  const aggregated = renderOutputSummary(profile, originalBytes, excerpt.value);
+  const capped = truncateUtf8(aggregated, maxBytes);
+  return { value: capped.value, truncated: true, originalBytes, lineCount: profile.lineCount };
 }
 
 const SHELL_SYNTAX_BLOCKER =
