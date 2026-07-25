@@ -1,68 +1,126 @@
 /**
- * protocolSwitch.ts
- * F76: Protocol Route Switch - focused TDD stub implementation
- * Per build plan: Protocol enum + adapter interface stub + switchProtocol validates per provider + F70 sessionId in receipt
+ * Protocols that can carry a logical model route's request.
+ *
+ * The protocol is deliberately separate from the provider and model ids: one
+ * logical route may expose more than one wire shape without rebuilding the
+ * operator's session.
  */
+export type Protocol = "openai-compat" | "anthropic" | "gemini-shape";
 
-export type Protocol = 'openai-compat' | 'anthropic' | 'gemini-shape';
+export const PROTOCOLS: readonly Protocol[] = ["openai-compat", "anthropic", "gemini-shape"];
 
+export interface ModelRoute {
+  readonly id: string;
+  readonly provider: string;
+  readonly model: string;
+  readonly protocol: Protocol;
+}
+
+/** Minimal adapter seam for a protocol-specific request implementation. */
 export interface ProtocolAdapter {
-  name: string;
-  // Stub for adapter; expand in later iterations per build plan
-  supports?: Protocol[];
+  readonly protocol: Protocol;
+  readonly name?: string;
+  readonly supports?: readonly Protocol[];
+}
+
+export interface SwitchDeps {
+  readonly getRoute: (routeId: string) => ModelRoute | undefined;
+  readonly getSupportedProtocols: (provider: string) => readonly Protocol[];
+  /** Apply the validated protocol to the live route registry, when available. */
+  readonly setRouteProtocol?: (routeId: string, protocol: Protocol) => void;
+  /** F70 transcript identity; the switch must not allocate a new session. */
+  readonly sessionId?: string;
+  /** Backwards-compatible name used by the first F70 composition. */
+  readonly preserveSessionId?: string;
+  readonly now?: () => Date;
 }
 
 export interface SwitchReceipt {
-  routeId: string;
-  from: Protocol;
-  to: Protocol;
-  sessionId: string; // F70 transcript preservation composed here
-  timestamp: string;
-  adapter?: ProtocolAdapter;
+  readonly success: boolean;
+  readonly routeId: string;
+  readonly fromProtocol: Protocol;
+  readonly toProtocol: Protocol;
+  /** Canonical protocol id recorded on every receipt. */
+  readonly protocol: Protocol;
+  readonly timestamp: string;
+  readonly sessionId?: string;
+  readonly error?: string;
 }
 
-// Provider protocol support matrix (stubbed per build plan validation rule)
-const providerProtocolSupport: Record<string, Protocol[]> = {
-  openai: ['openai-compat'],
-  anthropic: ['anthropic'],
-  gemini: ['gemini-shape'],
-  // default catch-all for test routes that don't encode provider explicitly
-  default: ['openai-compat', 'anthropic', 'gemini-shape'],
-};
-
-function inferProvider(routeId: string): string {
-  const lower = routeId.toLowerCase();
-  if (lower.includes('openai')) return 'openai';
-  if (lower.includes('anthropic')) return 'anthropic';
-  if (lower.includes('gemini')) return 'gemini';
-  return 'default';
+function sessionIdOf(deps: SwitchDeps): string | undefined {
+  return deps.sessionId ?? deps.preserveSessionId;
 }
 
-export function switchProtocol(routeId: string, protocol: Protocol): SwitchReceipt {
-  const provider = inferProvider(routeId);
-  const supported = providerProtocolSupport[provider] ?? providerProtocolSupport.default ?? [];
+function receipt(
+  routeId: string,
+  fromProtocol: Protocol,
+  toProtocol: Protocol,
+  deps: SwitchDeps,
+  result: Pick<SwitchReceipt, "success" | "error">,
+): SwitchReceipt {
+  const sessionId = sessionIdOf(deps);
+  return {
+    ...result,
+    routeId,
+    fromProtocol,
+    toProtocol,
+    protocol: toProtocol,
+    timestamp: (deps.now ?? (() => new Date()))().toISOString(),
+    ...(sessionId === undefined ? {} : { sessionId }),
+  };
+}
 
-  if (!supported.includes(protocol)) {
-    throw new Error(`Unsupported protocol '${protocol}' for provider '${provider}'`);
+export function isProtocol(value: string): value is Protocol {
+  return (PROTOCOLS as readonly string[]).includes(value);
+}
+
+/**
+ * Validate and apply a protocol change for one logical route.
+ *
+ * The operation is intentionally injected through `SwitchDeps`: the routing
+ * registry owns route state, while this seam owns protocol validation and the
+ * auditable receipt. Validation happens before the optional mutation callback,
+ * so an unsupported switch cannot partially update a route. Transcript state
+ * is not copied or replaced; the existing session id is carried in the receipt.
+ */
+export function switchProtocol(
+  routeId: string,
+  targetProtocol: Protocol,
+  deps: SwitchDeps,
+): SwitchReceipt {
+  const route = deps.getRoute(routeId);
+  const sessionId = sessionIdOf(deps);
+
+  if (!route) {
+    return receipt(routeId, targetProtocol, targetProtocol, deps, {
+      success: false,
+      error: `Route not found: ${routeId}`,
+    });
   }
 
-  // Compose F70 transcript preservation: embed sessionId in receipt
-  const sessionId = `sess-${routeId}`;
+  if (!isProtocol(targetProtocol)) {
+    return receipt(routeId, route.protocol, targetProtocol, deps, {
+      success: false,
+      error: `Unknown protocol: ${String(targetProtocol)}`,
+    });
+  }
 
-  // Determine a plausible 'from' for the switch receipt (stub logic)
-  const from: Protocol = protocol === 'openai-compat' ? 'anthropic' : 'openai-compat';
+  const supported = deps.getSupportedProtocols(route.provider);
+  if (!supported.includes(targetProtocol)) {
+    return receipt(routeId, route.protocol, targetProtocol, deps, {
+      success: false,
+      error: `Protocol ${targetProtocol} not supported for provider ${route.provider}`,
+    });
+  }
 
-  const adapter: ProtocolAdapter = {
-    name: `${protocol}-adapter`,
-    supports: [protocol],
-  };
+  try {
+    deps.setRouteProtocol?.(routeId, targetProtocol);
+  } catch (error) {
+    return receipt(routeId, route.protocol, targetProtocol, deps, {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
 
-  return {
-    routeId,
-    from,
-    to: protocol,
-    sessionId,
-    timestamp: new Date().toISOString(),
-    adapter,
-  };
+  return receipt(routeId, route.protocol, targetProtocol, deps, { success: true });
 }
