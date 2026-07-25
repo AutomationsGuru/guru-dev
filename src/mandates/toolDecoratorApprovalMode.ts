@@ -1,26 +1,22 @@
 import type { ToolDefinition } from "../tools/registry.js";
-import { verbsForCall } from "./evaluate.js";
 import { HARD_EDGE_VERBS } from "./schema.js";
+import { verbsForCall } from "./evaluate.js";
 
-/**
- * A tool's preferred approval posture. Hard-edge calls always override this
- * declaration and require explicit operator approval.
- */
-export type ToolApprovalMode = "always_require" | "never_require" | "ask";
-
-/**
- * Tool metadata added by {@link withToolApproval}. Kept as module augmentation
- * so registries can carry the declaration without a second tool type.
- */
+// Module augmentation to extend ToolDefinition with the approvalMode metadata
 declare module "../tools/registry.js" {
   interface ToolDefinition {
-    readonly approvalMode?: ToolApprovalMode;
+    readonly approvalMode?: "always_require" | "never_require" | "ask";
   }
 }
 
+export type ToolApprovalMode = "always_require" | "never_require" | "ask";
+
 /**
- * Attach approval metadata to an existing tool definition without changing its
- * execution behavior or object identity.
+ * Decorates a tool definition with approvalMode metadata.
+ *
+ * @param tool - The tool definition to decorate.
+ * @param mode - The desired approval mode: "always_require" | "never_require" | "ask".
+ * @returns The decorated tool definition.
  */
 export function withToolApproval<
   TInputSchema extends import("zod").ZodType = import("zod").ZodType,
@@ -30,20 +26,34 @@ export function withToolApproval<
   mode: ToolApprovalMode
 ): ToolDefinition<TInputSchema, TOutputSchema> & { readonly approvalMode: ToolApprovalMode } {
   Object.defineProperty(tool, "approvalMode", {
-    configurable: true,
-    enumerable: true,
     value: mode,
-    writable: false
+    writable: false,
+    configurable: true,
+    enumerable: true
   });
-  return tool as ToolDefinition<TInputSchema, TOutputSchema> & { readonly approvalMode: ToolApprovalMode };
+  return tool as any;
 }
 
 /**
- * Resolve a tool's mode for one invocation. Hard-edge verbs are evaluated from
- * the actual call and always win over declared metadata, including
- * `never_require` (Constitution §3).
+ * Resolves the effective approval mode for a tool call.
+ * If the tool call exercises any hard-limit verb, it escalates to "always_require"
+ * regardless of the declared mode, enforcing the system's hard limits (Constitution §3).
+ *
+ * @param tool - The tool definition.
+ * @param input - The tool input/arguments.
+ * @returns The effective approval mode for this call.
  */
-export function getEffectiveApprovalMode(tool: ToolDefinition, input: unknown): ToolApprovalMode {
-  const hasHardEdge = verbsForCall(tool.id, input).some((verb) => HARD_EDGE_VERBS.has(verb));
-  return hasHardEdge ? "always_require" : (tool.approvalMode ?? "ask");
+export function getEffectiveApprovalMode(
+  tool: ToolDefinition,
+  input: unknown
+): ToolApprovalMode {
+  // A call is a hard limit if it exercises any hard-edge verb
+  const verbs = verbsForCall(tool.id, input);
+  const isHardLimit = verbs.some((v) => HARD_EDGE_VERBS.has(v));
+
+  if (isHardLimit) {
+    return "always_require";
+  }
+
+  return tool.approvalMode ?? "ask";
 }
