@@ -6,17 +6,17 @@ import {
   yoloMandatePolicy,
   type SelfBuildExecutorFn,
   type StageRunner
-} from "../../src/selfbuild/runDevCycle.js";
-import type { SelfBuildExecutorReport } from "../../src/executor/selfBuildExecutor.js";
-import type { CommandExecutor } from "../../src/review/gates.js";
-import type { Clock, DevStage, StageOutcome } from "../../src/selfbuild/devCycle.js";
-import type { DevCycleCheckpoint } from "../../src/selfbuild/devCycleCheckpoint.js";
-import type { DevCycleCheckpointController } from "../../src/selfbuild/runDevCycle.js";
-import type { GateFailureNote } from "../../src/selfbuild/parseGateFailure.js";
-import type { LearnedFact } from "../../src/selfbuild/learn.js";
-import { makeSmokeDeps } from "../../src/selfbuild/smokeDeps.js";
-import { createApprovalLedger } from "../../src/selfbuild/approvalLedger.js";
-import type { AskModel } from "../../src/review/nativeCriticPanel.js";
+} from '../../src/selfbuild/runDevCycle.js';
+import type { SelfBuildExecutorReport } from '../../src/executor/selfBuildExecutor.js';
+import type { CommandExecutor } from '../../src/review/gates.js';
+import type { Clock, DevStage, StageOutcome } from '../../src/selfbuild/devCycle.js';
+import type { DevCycleCheckpoint } from '../../src/selfbuild/devCycleCheckpoint.js';
+import type { DevCycleCheckpointController } from '../../src/selfbuild/runDevCycle.js';
+import type { GateFailureNote } from '../../src/selfbuild/parseGateFailure.js';
+import type { LearnedFact } from '../../src/selfbuild/learn.js';
+import { makeSmokeDeps } from '../../src/selfbuild/smokeDeps.js';
+import { createApprovalLedger } from '../../src/selfbuild/approvalLedger.js';
+import type { AskModel } from '../../src/review/nativeCriticPanel.js';
 
 type RepairFn = (note: GateFailureNote) => Promise<{ repaired: boolean; evidence: string }>;
 
@@ -190,6 +190,82 @@ describe("runDevCycle (P7 spine) — gate + budget injection", () => {
     const report = await runDevCycle({ executor, clock, budget: { wallClockMs: 100 }, stages: greenGating });
     expect(executor).not.toHaveBeenCalled();
     expect(report.terminal).toBe("blocked");
+    expect(report.stages[0]!.evidence).toMatch(/wall-clock/u);
+  });
+
+  it("kills a hung stage in-flight when the wall-clock deadline fires", async () => {
+    vi.useFakeTimers();
+    try {
+      // Clock shows 0 elapsed through the first 3 iterations (SELECT, BUILD, TEST),
+      // then 1_000_000ms at the SMOKE runWithDeadline snapshot so remainingMs > 0
+      // but the setTimeout fires when we advance timers past it.
+      let calls = 0;
+      const clock: Clock = { now: () => (calls++, calls <= 9 ? 0 : 1_000_000) };
+      const hungSmoke = vi.fn<StageRunner>(
+        async () =>
+          new Promise(() => {
+            // never resolves — simulates a hung subprocess/model call
+          })
+      );
+      const ship = vi.fn<StageRunner>(async () => ({ verdict: "GREEN", evidence: "ship" }));
+      const runPromise = runDevCycle({
+        executor: async () => fakeReport(),
+        clock,
+        budget: { wallClockMs: 1_800_000 },
+        stages: {
+          test: async () => ({ verdict: "GREEN", evidence: "t" }),
+          smoke: hungSmoke,
+          review: async () => ({ verdict: "GREEN", evidence: "r" }),
+          ship,
+          learn: async () => ({ verdict: "GREEN", evidence: "learn" })
+        }
+      });
+      // Advance past the smoke stage deadline — setTimeout fires, DeadlineExceededError is raised.
+      await vi.advanceTimersByTimeAsync(2_000_000);
+      const report = await runPromise;
+      expect(report.terminal).toBe("blocked");
+      expect(report.stages.some((s) => s.stage === "smoke")).toBe(true);
+      const smokeOutcome = report.stages.find((s) => s.stage === "smoke");
+      expect(smokeOutcome?.verdict).toBe("RED");
+      expect(smokeOutcome?.evidence).toMatch(/wall-clock deadline hit during smoke/);
+      // SHIP never ran — the deadline killed the cycle in-flight.
+      expect(ship).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a fast stage that finishes before the deadline proceeds normally", async () => {
+    const clock: Clock = { now: () => 0 };
+    const testStage = vi.fn<StageRunner>(async () => ({ verdict: "GREEN", evidence: "quick-test" }));
+    const report = await runDevCycle({
+      executor: async () => fakeReport(),
+      clock,
+      budget: { wallClockMs: 10_000 },
+      stages: {
+        test: testStage,
+        smoke: async () => ({ verdict: "GREEN", evidence: "s" }),
+        review: async () => ({ verdict: "GREEN", evidence: "r" }),
+        ship: async () => ({ verdict: "GREEN", evidence: "sh" })
+      }
+    });
+    expect(report.terminal).toBe("done");
+    expect(testStage).toHaveBeenCalled();
+    const testOutcome = report.stages.find((s) => s.stage === "test");
+    expect(testOutcome?.verdict).toBe("GREEN");
+  });
+
+  it("wall-clock exhaustion between stages still blocks (existing behavior)", async () => {
+    // Same clock pattern as the existing "refuses to run the executor" test
+    // at the top of this block: the between-stage budget check fires on the
+    // first iteration before any stage runs, and the cycle halts.
+    let calls = 0;
+    const clock: Clock = { now: () => (calls++ === 0 ? 0 : 10_000) };
+    const executor = vi.fn<SelfBuildExecutorFn>(async () => fakeReport());
+    const report = await runDevCycle({ executor, clock, budget: { wallClockMs: 100 }, stages: greenGating });
+    expect(executor).not.toHaveBeenCalled();
+    expect(report.terminal).toBe("blocked");
+    // The loop detects budget exhaustion at the stage it was about to enter.
     expect(report.stages[0]!.evidence).toMatch(/wall-clock/u);
   });
 
@@ -827,5 +903,99 @@ describe("runDevCycle (G102) — checkpoint and safe resume", () => {
       runDevCycle({ checkpoint: controller, executorOptions: { taskId: "different-task" }, stages: greenGating })
     ).rejects.toThrow(/task/i);
     expect(saved).toEqual([]);
+  });
+});
+
+describe("runDevCycle (HARDENING [3]) — end-to-end token budget drawdown", () => {
+  it("draws down the token budget across multiple stages and halts BEFORE the stage that would exceed it", async () => {
+    // BUILD returns 5 tokens (under a 12 ceiling), SMOKE returns 8 (total 13 > 12).
+    // Exhaustion is checked BEFORE the next stage runs, so REVIEW never executes.
+    const review = vi.fn<StageRunner>(async () => ({ verdict: "GREEN", evidence: "must not run" }));
+    const report = await runDevCycle({
+      executor: async () =>
+        fakeReport({ plannerUsage: { inputTokens: 3, outputTokens: 2, totalTokens: 5 } }),
+      budget: { tokenBudget: 12 },
+      stages: {
+        test: async () => ({ verdict: "GREEN", evidence: "t" }),
+        smoke: async () => ({ verdict: "GREEN", evidence: "smoke tokens", tokens: 8 }),
+        review
+      }
+    });
+
+    expect(review).not.toHaveBeenCalled();
+    expect(report.terminal).toBe("blocked");
+    expect(report.budget.tokens).toBe(13);
+    expect(report.stages.at(-1)).toMatchObject({
+      stage: "review",
+      verdict: "RED",
+      evidence: expect.stringContaining("token budget exhausted")
+    });
+    expect(report.stages.map((s) => s.stage)).toEqual(["select", "build", "test", "smoke", "review"]);
+  });
+
+  it("populates plannerUsage with distinct non-zero token counts from the executor report", async () => {
+    // Verify the executor report's plannerUsage flows through to budget with all
+    // fields (inputTokens, outputTokens, totalTokens) populated as distinct values.
+    const report = await runDevCycle({
+      executor: async () =>
+        fakeReport({
+          plannerUsage: { inputTokens: 4200, outputTokens: 1800, totalTokens: 6000 }
+        }),
+      stages: greenGating
+    });
+
+    expect(report.budget.tokens).toBe(6000);
+    // The executor report is returned on the cycle report so callers can inspect
+    // the full breakdown.
+    expect(report.executor?.plannerUsage).toMatchObject({
+      inputTokens: 4200,
+      outputTokens: 1800,
+      totalTokens: 6000
+    });
+  });
+
+  it("records repair tokens from the default DEBUG path, draws down budget, and continues to re-test", async () => {
+    // TEST fails once (generates a parsed failure note), DEBUG calls the
+    // injected repair fn (returns tokens), budget records them, then the
+    // loop re-runs TEST (passes this time) and continues to done.
+    let round = 0;
+    const commandExecutor: CommandExecutor = async (_c, ctx) => ({
+      exitCode: ctx.gate.name === "test" && round++ === 0 ? 1 : 0,
+      stdout: "",
+      stderr: "FAIL tests/x.test.ts",
+      durationMs: 0
+    });
+    const repair = vi.fn<RepairFn>(async () => ({
+      repaired: true,
+      evidence: "applied repair",
+      tokens: 15
+    }));
+
+    const report = await runDevCycle({
+      executor: async () => fakeReport(),
+      executorOptions: { commandExecutor },
+      budget: { tokenBudget: 100 },
+      stages: {
+        review: async () => ({ verdict: "GREEN", evidence: "r" }),
+        ship: async () => ({ verdict: "GREEN", evidence: "sh" })
+      },
+      repair
+    });
+
+    expect(repair).toHaveBeenCalledTimes(1);
+    expect(repair.mock.calls[0]![0].gate).toBe("test");
+    expect(report.budget.tokens).toBe(15); // repair tokens recorded
+    expect(report.terminal).toBe("done");
+    expect(report.stages.map((s) => s.stage)).toEqual([
+      "select",
+      "build",
+      "test",
+      "debug",
+      "test",
+      "smoke",
+      "review",
+      "ship",
+      "learn"
+    ]);
   });
 });
