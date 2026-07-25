@@ -8,6 +8,7 @@ import { BashOptimizerConfigSchema } from "../tools/bashOptimizer.js";
 import { McpServerConfigSchema } from "../mcp/schemas.js";
 
 import { PlannerModelConfigSchema } from "../model/schemas.js";
+import { SelfCheckPassConfigSchema } from "../review/selfCheckSchema.js";
 
 export const ValidationCommandSchema = z
   .object({
@@ -220,7 +221,14 @@ export const HarnessConfigSchema = z
     /** MCP servers to ATTACH (never-stuck resolver): stdio JSON-RPC; empty = none. */
     mcpServers: z.array(McpServerConfigSchema).default([]),
     /** Durable fact storage plus optional Honcho context enrichment. */
-    memory: MemoryConfigSchema.default(() => MemoryConfigSchema.parse({}))
+    memory: MemoryConfigSchema.default(() => MemoryConfigSchema.parse({})),
+    /**
+     * Optional post-mutate self-check pass (IDEA-F84). Default OFF; recommended
+     * for the ship quality tier. Pure, deterministic, no model — it is NOT a
+     * replacement for the native critic panel, only a cheap screen that runs
+     * BEFORE the builder claims done.
+     */
+    selfCheckPass: SelfCheckPassConfigSchema.default(() => SelfCheckPassConfigSchema.parse({}))
   })
   .strict();
 export type HarnessConfig = z.infer<typeof HarnessConfigSchema>;
