@@ -10,6 +10,7 @@
  */
 
 import type { ProviderRouteDescriptor, RouteStatus, CredentialSourceType } from "../providers/schemas.js";
+import { renderModelCost } from "../routing/costDisplay.js";
 import type {
   TuiCapability,
   TuiCredentialSourceType,
@@ -235,18 +236,26 @@ export function mapRoutesToProviders(
           }
         : undefined;
 
-    const cost =
-      route.cost.inputPerMillionTokens !== undefined || route.cost.outputPerMillionTokens !== undefined
-        ? {
-            lane: route.cost.currency,
-            ...(route.cost.inputPerMillionTokens !== undefined
-              ? { inputPerMillionUsd: route.cost.inputPerMillionTokens }
-              : {}),
-            ...(route.cost.outputPerMillionTokens !== undefined
-              ? { outputPerMillionUsd: route.cost.outputPerMillionTokens }
-              : {})
-          }
-        : undefined;
+    // IDEA-C4 / R-CW-COST: keep the lane whenever the route declares a currency
+    // or pricing notes, even with no rates — a rate-less lane renders as
+    // "cost unknown" downstream instead of being silently dropped. Unknown
+    // cost is never free (hard limit §3.2).
+    const hasCostSignal =
+      route.cost.inputPerMillionTokens !== undefined ||
+      route.cost.outputPerMillionTokens !== undefined ||
+      route.cost.currency.length > 0 ||
+      route.cost.notes.length > 0;
+    const cost = hasCostSignal
+      ? {
+          lane: route.cost.currency,
+          ...(route.cost.inputPerMillionTokens !== undefined
+            ? { inputPerMillionUsd: route.cost.inputPerMillionTokens }
+            : {}),
+          ...(route.cost.outputPerMillionTokens !== undefined
+            ? { outputPerMillionUsd: route.cost.outputPerMillionTokens }
+            : {})
+        }
+      : undefined;
 
     const model: TuiModelEntry = {
       modelId: route.modelId,
@@ -368,7 +377,8 @@ export function renderProviderPicker(providers: readonly TuiProviderEntry[], the
     for (const model of [...provider.models].sort((a, b) => directFirstRank(a.routeType) - directFirstRank(b.routeType))) {
       const badges = model.capabilities.join(",");
       const limits = model.limits?.contextWindow !== undefined ? ` · ${Math.round(model.limits.contextWindow / 1000)}k ctx` : "";
-      lines.push(`     - ${model.label} (${model.routeType}) [${badges}]${limits}`);
+      // Honest cost (IDEA-C4 / R-CW-COST): unknown pricing renders "unknown", never $0.
+      lines.push(`     - ${model.label} (${model.routeType}) [${badges}]${limits}${renderModelCost(model.cost)}`);
     }
   }
   return lines;
