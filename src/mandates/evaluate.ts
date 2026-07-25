@@ -3,6 +3,24 @@ import { resolve } from "node:path";
 import { HARD_EDGE_VERBS, type MandateState, type MandateVerb } from "./schema.js";
 
 /**
+ * Project-law write holds (IDEA-B1, R-CW-HOLD) live in `./writeHolds.js` and
+ * are applied AFTER {@link evaluateToolMandate} as a tighten-only transform:
+ * they can only move a decision toward more friction (allow → escalate →
+ * deny), never less. Re-exported here so every approval path — TUI main turn,
+ * swarm workers, and the AgentSession engine — applies holds from the same
+ * mandate module, identically, in every mode including YOLO. The mandate
+ * evaluator itself is unchanged: holds are an independent, additive gate.
+ */
+export {
+  applyWriteHolds,
+  evaluateWriteHold,
+  resolveWriteHoldTarget,
+  matchWriteHold,
+  type WriteHoldAudit,
+  type WriteHoldVerdict
+} from "./writeHolds.js";
+
+/**
  * Maps a tool id + input to the verbs it exercises. Read-only tools imply no
  * gated verb (they are always allowed). Everything else declares what it does so
  * the mandate can reason about it.
