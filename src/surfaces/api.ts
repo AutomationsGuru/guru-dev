@@ -177,6 +177,7 @@ export interface ApiRunRequest {
   resumeSessionId?: string;
   includeReviewGate?: boolean;
   git?: ApiRunGitOptions;
+  mandate?: MandateState;
 }
 
 export interface ApiToolRunRequest {
@@ -1096,6 +1097,12 @@ function normalizeRunRequest(value: unknown, options: { readonly allowRunSafetyO
       ...(git.baseBranch && typeof git.baseBranch === "string" && git.baseBranch.length > 0 ? { baseBranch: git.baseBranch } : {}),
       ...(Array.isArray(git.paths) ? { paths: git.paths.filter((path: unknown): path is string => typeof path === "string") } : {})
     };
+  }
+  if (isPlainObject(value.mandate)) {
+    const parsed = MandateStateSchema.safeParse(value.mandate);
+    if (parsed.success) {
+      request.mandate = parsed.data;
+    }
   }
 
   return normalizeKnownPathFields(request);
