@@ -1,106 +1,110 @@
 import { describe, expect, it } from "vitest";
-import { z } from "zod";
 
-import type { ToolDefinition } from '../../src/tools/registry.js';
 import {
-  mapChatClientAsAgent,
-  type ChatClientToolLike
+  ChatClientAgentOptionsSchema,
+  GuruAgentConfigSchema,
+  mapChatClientToGuruAgentConfig
 } from '../../src/runtime/chatClientAsAgentFacade.js';
 
-describe("mapChatClientAsAgent", () => {
-  it("maps name and instructions into a system prompt", () => {
-    const config = mapChatClientAsAgent({
-      name: "Greeter",
-      instructions: "Be concise and friendly."
+describe("mapChatClientToGuruAgentConfig", () => {
+  it("maps name, instructions, and tools to a Guru agent config", () => {
+    const config = mapChatClientToGuruAgentConfig({
+      name: "repo-assistant",
+      instructions: "You answer questions about this repository.",
+      tools: [
+        { id: "repo-context" },
+        { id: "shell-exec", description: "Run shell commands" }
+      ]
     });
 
-    expect(config.name).toBe("Greeter");
-    expect(config.systemPrompt).toBe("You are Greeter.\n\nBe concise and friendly.");
+    expect(config.name).toBe("repo-assistant");
+    expect(config.systemPrompt).toBe("You answer questions about this repository.");
+    expect(config.toolIds).toEqual(["repo-context", "shell-exec"]);
+    expect(config.source).toBe("chat-client-agent-facade");
   });
 
-  it("uses a default name and omits the body when instructions are absent", () => {
-    const config = mapChatClientAsAgent({});
-
-    expect(config.name).toBe("agent");
-    expect(config.systemPrompt).toBe("You are agent.");
-  });
-
-  it("falls back to the default name when the provided name is blank", () => {
-    const config = mapChatClientAsAgent({ name: "   ", instructions: "do work" });
-
-    expect(config.name).toBe("agent");
-    expect(config.systemPrompt).toBe("You are agent.\n\ndo work");
-  });
-
-  it("treats whitespace-only instructions as absent", () => {
-    const config = mapChatClientAsAgent({ name: "Bot", instructions: "   " });
-
-    expect(config.systemPrompt).toBe("You are Bot.");
-  });
-
-  it("coerces chat-client-shaped tools into owned tool definitions", () => {
-    const likeTools: ChatClientToolLike[] = [
-      { name: "search", description: "Search the web" },
-      { id: "calc", title: "Calculator", description: "Do math", inputSchema: z.object({ q: z.string() }) }
-    ];
-
-    const config = mapChatClientAsAgent({ name: "A", tools: likeTools });
-
-    expect(config.tools).toHaveLength(2);
-    expect(config.tools[0]?.id).toBe("search");
-    expect(config.tools[0]?.title).toBe("search");
-    expect(config.tools[0]?.description).toBe("Search the web");
-    expect(config.tools[1]?.id).toBe("calc");
-    expect(config.tools[1]?.title).toBe("Calculator");
-  });
-
-  it("passes already-owned tool definitions through by identity", () => {
-    const owned: ToolDefinition = {
-      id: "owned.read",
-      title: "Read",
-      description: "Read a file",
-      inputSchema: z.object({ path: z.string() }),
-      outputSchema: z.unknown(),
-      execute: async () => ({ ok: true })
-    };
-
-    const config = mapChatClientAsAgent({ name: "A", tools: [owned] });
-
-    expect(config.tools).toHaveLength(1);
-    // Identity preserved — no proxy wrapper.
-    expect(config.tools[0]).toBe(owned);
-  });
-
-  it("de-duplicates tools by id, keeping first-seen order", () => {
-    const a: ChatClientToolLike = { id: "dup", description: "first" };
-    const b: ChatClientToolLike = { name: "dup", description: "second" };
-    const c: ChatClientToolLike = { id: "unique", description: "third" };
-
-    const config = mapChatClientAsAgent({ name: "A", tools: [a, b, c] });
-
-    expect(config.tools.map((t) => t.id)).toEqual(["dup", "unique"]);
-    expect(config.tools[0]?.description).toBe("first");
-  });
-
-  it("drops tools that resolve to no id", () => {
-    const config = mapChatClientAsAgent({
-      name: "A",
-      tools: [{ description: "no id, no name" }, { id: "kept", description: "ok" }]
+  it("defaults tools to an empty list when omitted", () => {
+    const config = mapChatClientToGuruAgentConfig({
+      name: "plain-chat",
+      instructions: "Be helpful."
     });
 
-    expect(config.tools.map((t) => t.id)).toEqual(["kept"]);
+    expect(config.toolIds).toEqual([]);
   });
 
-  it("leaves the tools list empty when none are provided", () => {
-    const config = mapChatClientAsAgent({ name: "A" });
-    expect(config.tools).toEqual([]);
+  it("passes an optional model through to the config", () => {
+    const config = mapChatClientToGuruAgentConfig({
+      name: "modeled",
+      instructions: "Be helpful.",
+      model: "gpt-5.6-luna"
+    });
+
+    expect(config.model).toBe("gpt-5.6-luna");
   });
 
-  it("returns a defensive copy of the tools list (mutating the output does not affect re-maps)", () => {
-    const config = mapChatClientAsAgent({ name: "A", tools: [{ id: "t", description: "d" }] });
-    // Owned coerced tools are fresh objects, so the produced array is decoupled
-    // from any caller-supplied structure.
-    expect(config.tools).not.toBe(undefined);
-    expect(config.tools[0]?.id).toBe("t");
+  it("omits model from the config when not provided", () => {
+    const config = mapChatClientToGuruAgentConfig({
+      name: "unmodeled",
+      instructions: "Be helpful."
+    });
+
+    expect("model" in config).toBe(false);
+  });
+
+  it("rejects options with an empty name", () => {
+    expect(() =>
+      mapChatClientToGuruAgentConfig({
+        name: "   ",
+        instructions: "Be helpful."
+      })
+    ).toThrow();
+  });
+
+  it("rejects options with empty instructions", () => {
+    expect(() =>
+      mapChatClientToGuruAgentConfig({
+        name: "no-instructions",
+        instructions: ""
+      })
+    ).toThrow();
+  });
+
+  it("rejects unknown top-level fields (strict options)", () => {
+    expect(() =>
+      mapChatClientToGuruAgentConfig({
+        name: "strict",
+        instructions: "Be helpful.",
+        temperature: 0.2
+      } as never)
+    ).toThrow();
+  });
+
+  it("rejects tools with an empty id", () => {
+    expect(() =>
+      mapChatClientToGuruAgentConfig({
+        name: "bad-tool",
+        instructions: "Be helpful.",
+        tools: [{ id: "" }]
+      })
+    ).toThrow();
+  });
+
+  it("produces a config that satisfies GuruAgentConfigSchema", () => {
+    const config = mapChatClientToGuruAgentConfig({
+      name: "schema-check",
+      instructions: "Be helpful.",
+      tools: [{ id: "file-edit" }]
+    });
+
+    expect(() => GuruAgentConfigSchema.parse(config)).not.toThrow();
+  });
+
+  it("exposes ChatClientAgentOptionsSchema for caller-side validation", () => {
+    const parsed = ChatClientAgentOptionsSchema.parse({
+      name: "direct",
+      instructions: "Be helpful."
+    });
+
+    expect(parsed.tools).toEqual([]);
   });
 });
