@@ -24,7 +24,8 @@ export interface BackgroundTaskLinePage {
 
 interface BackgroundTaskRecord {
   readonly id: string;
-  readonly kind?: "process" | "scheduled";
+  readonly kind: "process" | "scheduled";
+  readonly sessionId?: string;
   readonly command: readonly string[];
   readonly cwd: string;
   readonly prompt?: string;
@@ -106,7 +107,8 @@ function flushLineBuffers(task: BackgroundTaskRecord): void {
 function publicView(task: BackgroundTaskRecord) {
   return {
     id: task.id,
-    ...(task.kind !== undefined ? { kind: task.kind } : {}),
+    kind: task.kind,
+    ...(task.sessionId !== undefined ? { sessionId: task.sessionId } : {}),
     command: [...task.command],
     cwd: task.cwd,
     ...(task.prompt !== undefined ? { prompt: scrubSecretValues(task.prompt) } : {}),
@@ -135,7 +137,30 @@ export function resetBackgroundTasks(): void {
   counter = 0;
 }
 
-export function spawnBackgroundTask(command: readonly string[], cwd: string): string {
+export function resetSessionBackgroundTasks(sessionId: string): void {
+  const sessionTaskIds: string[] = [];
+  for (const [id, task] of tasks) {
+    if (task.sessionId === sessionId) {
+      sessionTaskIds.push(id);
+    }
+  }
+  for (const id of sessionTaskIds) {
+    const task = tasks.get(id);
+    if (!task) continue;
+    if (task.timer !== undefined) {
+      clearTimeout(task.timer);
+      delete task.timer;
+    }
+    if (task.state === "running" && task.process && !task.process.killed) {
+      task.process.kill("SIGTERM");
+      task.state = "killed";
+      task.endedAt = new Date().toISOString();
+    }
+    tasks.delete(id);
+  }
+}
+
+export function spawnBackgroundTask(command: readonly string[], cwd: string, sessionId?: string): string {
   if (!command[0]?.trim()) {
     throw new Error("Background command is empty.");
   }
@@ -148,8 +173,10 @@ export function spawnBackgroundTask(command: readonly string[], cwd: string): st
   });
   const record: BackgroundTaskRecord = {
     id,
+    kind: "process",
     command,
     cwd,
+    ...(sessionId !== undefined ? { sessionId } : {}),
     state: "running",
     exitCode: null,
     stdout: "",
@@ -262,7 +289,8 @@ export async function manageBackgroundTask(action: string, taskId?: string, inpu
 export function scheduleBackgroundNotification(
   delaySeconds: number,
   prompt: string,
-  deliver: (message: string) => Promise<void>
+  deliver: (message: string) => Promise<void>,
+  sessionId?: string
 ): string {
   if (!Number.isFinite(delaySeconds) || delaySeconds <= 0) {
     throw new Error("DurationSeconds must be a positive finite number.");
@@ -280,6 +308,7 @@ export function scheduleBackgroundNotification(
     command: ["schedule", prompt],
     cwd: process.cwd(),
     prompt,
+    ...(sessionId !== undefined ? { sessionId } : {}),
     state: "running",
     exitCode: null,
     stdout: "",

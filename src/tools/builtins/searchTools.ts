@@ -4,6 +4,13 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { z } from "zod";
 
 import type { ToolDefinition } from "../registry.js";
+import {
+  TOOL_ERROR_CODES,
+  aggregateCounts,
+  buildListSummary,
+  buildMatchSummary,
+  truncateLine
+} from "../ergonomics.js";
 
 /**
  * Typed grep / glob / ls (ADR 2026-07-05-every-session-dividends, gap research
@@ -120,9 +127,22 @@ export const GrepToolInputSchema = z
 
 export const GrepToolOutputSchema = z
   .object({
-    matches: z.array(z.object({ file: z.string(), line: z.number().int().positive(), content: z.string() }).strict()),
+    matches: z.array(
+      z
+        .object({
+          file: z.string(),
+          line: z.number().int().positive(),
+          content: z.string(),
+          /** True when the line was capped; `content` carries the elision marker. */
+          truncated: z.boolean().default(false),
+          elidedChars: z.number().int().nonnegative().default(0)
+        })
+        .strict()
+    ),
     truncated: z.boolean(),
     blockers: z.array(z.string()),
+    /** Stable machine-readable failure code; null on a clean run. */
+    errorCode: z.string().nullable().default(null),
     summary: z.string()
   })
   .strict();
@@ -138,13 +158,13 @@ export function createGrepTool(): ToolDefinition<typeof GrepToolInputSchema, typ
     execute(input) {
       const rel = containedRel(input.repoRoot, input.path);
       if (rel === null) {
-        return { matches: [], truncated: false, blockers: ["Search path escapes the repository root."], summary: "Grep blocked by containment policy." };
+        return { matches: [], truncated: false, blockers: ["Search path escapes the repository root."], errorCode: TOOL_ERROR_CODES.PATH_ESCAPE, summary: "Grep blocked by containment policy." };
       }
       let matcher: RegExp;
       try {
         matcher = new RegExp(input.pattern, input.caseInsensitive ? "iu" : "u");
       } catch (error) {
-        return { matches: [], truncated: false, blockers: [`Invalid pattern: ${error instanceof Error ? error.message : String(error)}`], summary: "Grep blocked by invalid regex." };
+        return { matches: [], truncated: false, blockers: [`Invalid pattern: ${error instanceof Error ? error.message : String(error)}`], errorCode: TOOL_ERROR_CODES.INVALID_PATTERN, summary: "Grep blocked by invalid regex." };
       }
       const include = input.include !== undefined ? globToRegExp(input.include) : null;
       const root = resolve(input.repoRoot);
@@ -157,7 +177,7 @@ export function createGrepTool(): ToolDefinition<typeof GrepToolInputSchema, typ
         }
       })();
       const walk = isFile ? { files: [rel.split(sep).join("/")], truncated: false } : walkFiles(root, rel);
-      const matches: Array<{ file: string; line: number; content: string }> = [];
+      const matches: Array<{ file: string; line: number; content: string; truncated: boolean; elidedChars: number }> = [];
       let truncated = walk.truncated;
       for (const file of walk.files) {
         if (include && !include.test(file)) {
@@ -176,7 +196,8 @@ export function createGrepTool(): ToolDefinition<typeof GrepToolInputSchema, typ
         const lines = contents.split(/\r?\n/u);
         for (let index = 0; index < lines.length; index += 1) {
           if (matcher.test(lines[index] as string)) {
-            matches.push({ file, line: index + 1, content: (lines[index] as string).slice(0, 400) });
+            const capped = truncateLine(lines[index] as string);
+            matches.push({ file, line: index + 1, content: capped.value, truncated: capped.truncated, elidedChars: capped.elidedChars });
             if (matches.length >= input.maxMatches) {
               truncated = true;
               break;
@@ -191,7 +212,8 @@ export function createGrepTool(): ToolDefinition<typeof GrepToolInputSchema, typ
         matches,
         truncated,
         blockers: [],
-        summary: `${matches.length} match(es)${truncated ? " (truncated)" : ""}.`
+        errorCode: null,
+        summary: buildMatchSummary(matches, truncated)
       };
     }
   };
@@ -216,6 +238,8 @@ export const GlobToolOutputSchema = z
     paths: z.array(z.string()),
     truncated: z.boolean(),
     blockers: z.array(z.string()),
+    /** Stable machine-readable failure code; null on a clean run. */
+    errorCode: z.string().nullable().default(null),
     summary: z.string()
   })
   .strict();
@@ -231,7 +255,7 @@ export function createGlobTool(): ToolDefinition<typeof GlobToolInputSchema, typ
     execute(input) {
       const rel = containedRel(input.repoRoot, input.path);
       if (rel === null) {
-        return { paths: [], truncated: false, blockers: ["Search path escapes the repository root."], summary: "Glob blocked by containment policy." };
+        return { paths: [], truncated: false, blockers: ["Search path escapes the repository root."], errorCode: TOOL_ERROR_CODES.PATH_ESCAPE, summary: "Glob blocked by containment policy." };
       }
       const matcher = globToRegExp(input.pattern);
       const root = resolve(input.repoRoot);
@@ -254,11 +278,13 @@ export function createGlobTool(): ToolDefinition<typeof GlobToolInputSchema, typ
       if (scored.length > input.maxResults) {
         truncated = true;
       }
+      const shown = scored.slice(0, input.maxResults).map((entry) => entry.path);
       return {
-        paths: scored.slice(0, input.maxResults).map((entry) => entry.path),
+        paths: shown,
         truncated,
         blockers: [],
-        summary: `${Math.min(scored.length, input.maxResults)} path(s)${truncated ? " (truncated)" : ""}.`
+        errorCode: null,
+        summary: buildListSummary({ noun: "path", shownCount: shown.length, totalCount: scored.length, truncated })
       };
     }
   };
@@ -289,6 +315,8 @@ export const LsToolOutputSchema = z
         .strict()
     ),
     blockers: z.array(z.string()),
+    /** Stable machine-readable failure code; null on a clean run. */
+    errorCode: z.string().nullable().default(null),
     summary: z.string()
   })
   .strict();
@@ -304,14 +332,14 @@ export function createLsTool(): ToolDefinition<typeof LsToolInputSchema, typeof 
     execute(input) {
       const rel = containedRel(input.repoRoot, input.path);
       if (rel === null) {
-        return { entries: [], blockers: ["Path escapes the repository root."], summary: "Ls blocked by containment policy." };
+        return { entries: [], blockers: ["Path escapes the repository root."], errorCode: TOOL_ERROR_CODES.PATH_ESCAPE, summary: "Ls blocked by containment policy." };
       }
       const target = resolve(input.repoRoot, rel);
       let names: string[];
       try {
         names = readdirSync(target);
       } catch (error) {
-        return { entries: [], blockers: [`Cannot read directory: ${error instanceof Error ? error.message : String(error)}`], summary: "Ls failed." };
+        return { entries: [], blockers: [`Cannot read directory: ${error instanceof Error ? error.message : String(error)}`], errorCode: TOOL_ERROR_CODES.IO_ERROR, summary: "Ls failed." };
       }
       const entries = names
         .filter((name) => input.includeHidden || !name.startsWith("."))
@@ -325,7 +353,9 @@ export function createLsTool(): ToolDefinition<typeof LsToolInputSchema, typeof 
           }
         })
         .sort((left, right) => (left.type === right.type ? left.name.localeCompare(right.name) : left.type === "dir" ? -1 : right.type === "dir" ? 1 : 0));
-      return { entries, blockers: [], summary: `${entries.length} entrie(s).` };
+      const byType = aggregateCounts(entries.map((entry) => entry.type));
+      const breakdown = byType.top.map((entry) => `${entry.count} ${entry.key}`).join(", ");
+      return { entries, blockers: [], errorCode: null, summary: `${entries.length} entrie(s)${breakdown.length > 0 ? ` (${breakdown})` : ""}.` };
     }
   };
 }
