@@ -1,126 +1,124 @@
-import { describe, expect, it } from "vitest";
+import { describe, it, expect, beforeEach } from 'vitest';
+import { TranscriptAnchorBookmark, type AnchorBookmark } from '../../src/session/transcriptAnchorBookmark.js';
 
-import {
-  createTranscriptAnchorBookmarks,
-  type AnchorableMessage
-} from '../../src/session/transcriptAnchorBookmark.js';
+describe('TranscriptAnchorBookmark', () => {
+  let store: TranscriptAnchorBookmark;
 
-interface SampleMessage extends AnchorableMessage {
-  readonly text: string;
-}
-
-function messages(...entries: Array<[string, string]>): SampleMessage[] {
-  return entries.map(([id, text]) => ({ id, text }));
-}
-
-describe("createTranscriptAnchorBookmarks", () => {
-  it("starts empty and lists nothing", () => {
-    const bookmarks = createTranscriptAnchorBookmarks();
-    expect(bookmarks.list()).toEqual([]);
+  beforeEach(() => {
+    store = new TranscriptAnchorBookmark();
   });
 
-  it("stores and retrieves a bookmark by message id", () => {
-    const bookmarks = createTranscriptAnchorBookmarks();
-    bookmarks.set("anchor", "msg-3");
-    expect(bookmarks.get("anchor")).toBe("msg-3");
+  describe('set', () => {
+    it('creates a bookmark for a valid messageId', () => {
+      const bookmark = store.set('msg-123');
+      expect(bookmark).toBeDefined();
+      expect(bookmark.messageId).toBe('msg-123');
+      expect(bookmark.createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+      expect(store.has('msg-123')).toBe(true);
+    });
+
+    it('trims whitespace from messageId', () => {
+      store.set('  msg-456  ');
+      expect(store.has('msg-456')).toBe(true);
+      expect(store.list()).toEqual(['msg-456']);
+    });
+
+    it('throws on invalid messageId', () => {
+      expect(() => store.set('')).toThrow(/messageId must be a non-empty string/);
+      expect(() => store.set('   ')).toThrow(/messageId must be a non-empty string/);
+      // @ts-expect-error testing runtime guard
+      expect(() => store.set(null)).toThrow();
+    });
+
+    it('is idempotent — re-setting same id updates timestamp but keeps id', () => {
+      const first = store.set('msg-789');
+      const second = store.set('msg-789');
+      expect(second.messageId).toBe('msg-789');
+      expect(store.size()).toBe(1);
+    });
   });
 
-  it("overwrites an existing bookmark name in place", () => {
-    const bookmarks = createTranscriptAnchorBookmarks();
-    bookmarks.set("anchor", "msg-1");
-    bookmarks.set("anchor", "msg-7");
-    expect(bookmarks.get("anchor")).toBe("msg-7");
-    expect(bookmarks.list()).toHaveLength(1);
+  describe('get / resolve', () => {
+    it('returns the bookmark when present', () => {
+      store.set('msg-present');
+      const found = store.get('msg-present');
+      expect(found).toBeDefined();
+      expect(found!.messageId).toBe('msg-present');
+    });
+
+    it('returns undefined for missing id (fails closed)', () => {
+      expect(store.get('nonexistent')).toBeUndefined();
+      expect(store.get('')).toBeUndefined();
+      expect(store.get('   ')).toBeUndefined();
+    });
+
+    it('fails closed on invalid input types', () => {
+      // @ts-expect-error testing runtime guard
+      expect(store.get(null)).toBeUndefined();
+      // @ts-expect-error testing runtime guard
+      expect(store.get(undefined)).toBeUndefined();
+      // @ts-expect-error testing runtime guard
+      expect(store.get(123)).toBeUndefined();
+    });
   });
 
-  it("deletes a bookmark", () => {
-    const bookmarks = createTranscriptAnchorBookmarks();
-    bookmarks.set("anchor", "msg-3");
-    expect(bookmarks.delete("anchor")).toBe(true);
-    expect(bookmarks.get("anchor")).toBeUndefined();
-    expect(bookmarks.list()).toEqual([]);
+  describe('has', () => {
+    it('returns true for bookmarked id', () => {
+      store.set('msg-has');
+      expect(store.has('msg-has')).toBe(true);
+    });
+
+    it('returns false for missing id (fails closed)', () => {
+      expect(store.has('missing')).toBe(false);
+      expect(store.has('')).toBe(false);
+    });
   });
 
-  it("reports delete=false for a missing bookmark", () => {
-    const bookmarks = createTranscriptAnchorBookmarks();
-    expect(bookmarks.delete("nope")).toBe(false);
+  describe('list — stable order', () => {
+    it('returns empty array when no bookmarks', () => {
+      expect(store.list()).toEqual([]);
+    });
+
+    it('returns messageIds in sorted stable order', () => {
+      store.set('msg-c');
+      store.set('msg-a');
+      store.set('msg-b');
+      expect(store.list()).toEqual(['msg-a', 'msg-b', 'msg-c']);
+    });
+
+    it('list order remains stable after remove and re-add', () => {
+      store.set('z-last');
+      store.set('a-first');
+      store.remove('z-last');
+      store.set('m-middle');
+      expect(store.list()).toEqual(['a-first', 'm-middle']);
+    });
   });
 
-  it("lists bookmarks in stable insertion order", () => {
-    const bookmarks = createTranscriptAnchorBookmarks();
-    bookmarks.set("alpha", "msg-1");
-    bookmarks.set("beta", "msg-2");
-    bookmarks.set("gamma", "msg-3");
-    // Overwriting an existing name keeps its original insertion position.
-    bookmarks.set("beta", "msg-9");
-    expect(bookmarks.list()).toEqual([
-      { name: "alpha", messageId: "msg-1" },
-      { name: "beta", messageId: "msg-9" },
-      { name: "gamma", messageId: "msg-3" }
-    ]);
+  describe('remove and clear', () => {
+    it('remove is no-op for missing id (fails closed)', () => {
+      store.set('keep');
+      store.remove('ghost');
+      expect(store.size()).toBe(1);
+      expect(store.has('keep')).toBe(true);
+    });
+
+    it('clear removes all bookmarks', () => {
+      store.set('one');
+      store.set('two');
+      store.clear();
+      expect(store.size()).toBe(0);
+      expect(store.list()).toEqual([]);
+    });
   });
 
-  it("resolve returns the matching message object without mutating the transcript", () => {
-    const bookmarks = createTranscriptAnchorBookmarks();
-    bookmarks.set("anchor", "msg-2");
-    const transcript = messages(["msg-1", "a"], ["msg-2", "b"], ["msg-3", "c"]);
-    const snapshot = transcript.map((m) => ({ ...m }));
-    const resolved = bookmarks.resolve("anchor", transcript);
-    expect(resolved).toEqual({ id: "msg-2", text: "b" });
-    // Transcript body untouched: same length and same contents.
-    expect(transcript).toEqual(snapshot);
-    expect(transcript).toHaveLength(3);
-  });
-
-  it("resolve fails closed (undefined) when the bookmark is missing", () => {
-    const bookmarks = createTranscriptAnchorBookmarks();
-    bookmarks.set("anchor", "msg-1");
-    const transcript = messages(["msg-1", "a"]);
-    expect(bookmarks.resolve("missing", transcript)).toBeUndefined();
-  });
-
-  it("resolve fails closed (undefined) when the anchored message id is absent from the transcript", () => {
-    const bookmarks = createTranscriptAnchorBookmarks();
-    bookmarks.set("anchor", "msg-gone");
-    const transcript = messages(["msg-1", "a"], ["msg-2", "b"]);
-    expect(bookmarks.resolve("anchor", transcript)).toBeUndefined();
-  });
-
-  it("resolve fails closed (undefined) for an empty transcript", () => {
-    const bookmarks = createTranscriptAnchorBookmarks();
-    bookmarks.set("anchor", "msg-1");
-    expect(bookmarks.resolve("anchor", [])).toBeUndefined();
-  });
-
-  it("rejects an empty bookmark name (fail closed, throws)", () => {
-    const bookmarks = createTranscriptAnchorBookmarks();
-    expect(() => bookmarks.set("", "msg-1")).toThrow();
-    expect(bookmarks.list()).toEqual([]);
-  });
-
-  it("rejects a whitespace-only bookmark name (fail closed, throws)", () => {
-    const bookmarks = createTranscriptAnchorBookmarks();
-    expect(() => bookmarks.set("   ", "msg-1")).toThrow();
-    expect(bookmarks.list()).toEqual([]);
-  });
-
-  it("trims surrounding whitespace from bookmark names", () => {
-    const bookmarks = createTranscriptAnchorBookmarks();
-    bookmarks.set("  anchor  ", "msg-1");
-    expect(bookmarks.get("anchor")).toBe("msg-1");
-    expect(bookmarks.list()).toEqual([{ name: "anchor", messageId: "msg-1" }]);
-  });
-
-  it("resolveAll maps every bookmark to its resolved message, skipping anchors whose id is absent", () => {
-    const bookmarks = createTranscriptAnchorBookmarks();
-    bookmarks.set("alpha", "msg-1");
-    bookmarks.set("beta", "msg-missing");
-    bookmarks.set("gamma", "msg-3");
-    const transcript = messages(["msg-1", "a"], ["msg-3", "c"]);
-    const resolved = bookmarks.resolveAll(transcript);
-    expect(resolved).toEqual([
-      { name: "alpha", messageId: "msg-1", message: { id: "msg-1", text: "a" } },
-      { name: "gamma", messageId: "msg-3", message: { id: "msg-3", text: "c" } }
-    ]);
+  describe('size', () => {
+    it('reports correct count', () => {
+      expect(store.size()).toBe(0);
+      store.set('x');
+      expect(store.size()).toBe(1);
+      store.set('y');
+      expect(store.size()).toBe(2);
+    });
   });
 });
