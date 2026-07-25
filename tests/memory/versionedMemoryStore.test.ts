@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
+import { normalize as pathNormalize, sep as pathSep } from "node:path";
 import {
   exportToDir,
   importFromDir,
@@ -11,14 +12,18 @@ import {
 class MockFs implements InjectableFs {
   public files = new Map<string, string>();
 
+  private norm(p: string): string {
+    return pathNormalize(p);
+  }
+
   async mkdir(path: string, options?: { recursive?: boolean }): Promise<void> {}
 
   async writeFile(path: string, data: string, options?: { encoding?: "utf8" }): Promise<void> {
-    this.files.set(path, data);
+    this.files.set(this.norm(path), data);
   }
 
   async readFile(path: string, options: { encoding: "utf8" }): Promise<string> {
-    const data = this.files.get(path);
+    const data = this.files.get(this.norm(path));
     if (data === undefined) {
       const err = new Error("ENOENT");
       (err as any).code = "ENOENT";
@@ -30,7 +35,9 @@ class MockFs implements InjectableFs {
   async readdir(path: string): Promise<string[]> {
     // simplified readdir: only matches files exactly starting with path/
     // (for tests, we don't need full posix hierarchy matching, but let's make it work for root)
-    const normalizedPath = path.endsWith("/") ? path : path + "/";
+    const n = this.norm(path);
+    const sep = pathSep;
+    const normalizedPath = n.endsWith(sep) ? n : n + sep;
     const result = new Set<string>();
 
     for (const key of this.files.keys()) {
