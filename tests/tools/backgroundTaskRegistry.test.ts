@@ -7,8 +7,10 @@ import {
   manageBackgroundTask,
   readBackgroundTaskLines,
   resetBackgroundTasks,
+  resetSessionBackgroundTasks,
+  scheduleBackgroundNotification,
   spawnBackgroundTask
-} from "../../src/tools/builtins/backgroundTaskRegistry.js";
+} from '../../src/tools/builtins/backgroundTaskRegistry.js';
 
 interface TaskStatus {
   readonly id: string;
@@ -197,4 +199,208 @@ describe("background task registry", () => {
     expect(source).toContain("resolveWindowsGateSpawn(command)");
     expect(source).toMatch(/shell:\s*false/u);
   });
+
+  describe("task type classification", () => {
+    it("reports kind: process for spawned tasks", async () => {
+      const id = spawnBackgroundTask([process.execPath, "-e", "console.log('ok')"], process.cwd());
+      const status = (await manageBackgroundTask("status", id)) as TaskStatus & { kind?: string };
+      expect(status.kind).toBe("process");
+    });
+
+    it("reports kind: scheduled for scheduled notifications", async () => {
+      const id = scheduleBackgroundNotification(3600, "test-scheduled-kind", async () => {});
+      const listed = (await manageBackgroundTask("list")) as readonly ({ id: string; kind?: string })[];
+      const found = listed.find((t) => t.id === id);
+      expect(found).toBeDefined();
+      expect(found!.kind).toBe("scheduled");
+    });
+
+    it("always includes kind in list views", async () => {
+      spawnBackgroundTask([process.execPath, "-e", "console.log('ok')"], process.cwd());
+      const id2 = scheduleBackgroundNotification(7200, "test-always-kind", async () => {});
+      const listed = (await manageBackgroundTask("list")) as readonly ({ id: string; kind?: string })[];
+      expect(listed.length).toBeGreaterThanOrEqual(2);
+      for (const entry of listed) {
+        expect(entry).toHaveProperty("kind");
+        expect(entry.kind).toMatch(/^(?:process|scheduled)$/u);
+      }
+    });
+
+    it("reports correct kind per task in a mixed process+scheduled list", async () => {
+      const pid = spawnBackgroundTask([process.execPath, "-e", "console.log('ok')"], process.cwd());
+      const sid = scheduleBackgroundNotification(7200, "test-mixed", async () => {});
+      const listed = (await manageBackgroundTask("list")) as readonly ({ id: string; kind?: string })[];
+      const kinds: Record<string, string | undefined> = {};
+      for (const entry of listed) {
+        kinds[entry.id] = entry.kind;
+      }
+      expect(kinds[pid]).toBe("process");
+      expect(kinds[sid]).toBe("scheduled");
+    });
+
+    it("preserves kind after the task completes", async () => {
+      const id = spawnBackgroundTask([process.execPath, "-e", "console.log('ok')"], process.cwd());
+      const status = await waitForTerminal(id);
+      // status is typed as TaskStatus which has no kind, so use a type assertion
+      const withKind = status as TaskStatus & { kind?: string };
+      expect(withKind.kind).toBe("process");
+      expect(withKind.state).toBe("completed");
+    });
+
+    it("does not leak kind into monitor line pages", async () => {
+      const id = spawnBackgroundTask([process.execPath, "-e", "console.log('ok')"], process.cwd());
+      await waitForTerminal(id);
+      const page = readBackgroundTaskLines(id, 0, 10);
+      const serialized = JSON.stringify(page);
+      expect(serialized).not.toContain("kind");
+    });
+  });
+
+  describe("session isolation", () => {
+    it("stores sessionId on tasks when provided", async () => {
+      const id = spawnBackgroundTask([process.execPath, "-e", "setInterval(() => {}, 1000)"], process.cwd(), "session-a");
+      const status = (await manageBackgroundTask("status", id)) as TaskStatus & { sessionId?: string };
+      expect(status.sessionId).toBe("session-a");
+    });
+
+    it("omits sessionId from the public view when not provided", async () => {
+      const id = spawnBackgroundTask([process.execPath, "-e", "setInterval(() => {}, 1000)"], process.cwd());
+      const status = (await manageBackgroundTask("status", id)) as TaskStatus & { sessionId?: string };
+      expect(status).not.toHaveProperty("sessionId");
+    });
+
+    it("exposes sessionId on scheduled task status view", async () => {
+      const id = scheduleBackgroundNotification(3600, "test-session-scheduled", async () => {}, "session-b");
+      const status = (await manageBackgroundTask("status", id)) as TaskStatus & { sessionId?: string; kind?: string };
+      expect(status.sessionId).toBe("session-b");
+      expect(status.kind).toBe("scheduled");
+    });
+
+    it("resetSessionBackgroundTasks kills only the given session's tasks", async () => {
+      const idA = spawnBackgroundTask([process.execPath, "-e", "setInterval(() => {}, 1000)"], process.cwd(), "session-a");
+      const idB = spawnBackgroundTask([process.execPath, "-e", "setInterval(() => {}, 1000)"], process.cwd(), "session-b");
+      const idNone = spawnBackgroundTask([process.execPath, "-e", "setInterval(() => {}, 1000)"], process.cwd());
+
+      resetSessionBackgroundTasks("session-a");
+
+      await expect(manageBackgroundTask("status", idA)).rejects.toThrow("Unknown task id");
+      const statusB = (await manageBackgroundTask("status", idB)) as TaskStatus;
+      expect(statusB.state).toBe("running");
+      const statusNone = (await manageBackgroundTask("status", idNone)) as TaskStatus;
+      expect(statusNone.state).toBe("running");
+    });
+
+    it("resetSessionBackgroundTasks cleans up scheduled tasks too", async () => {
+      const id = scheduleBackgroundNotification(3600, "test-cleanup-scheduled", async () => {}, "session-c");
+      // Verify it exists
+      const before = (await manageBackgroundTask("status", id)) as TaskStatus & { sessionId?: string };
+      expect(before.sessionId).toBe("session-c");
+
+      resetSessionBackgroundTasks("session-c");
+
+      // After reset, the task should be gone
+      await expect(manageBackgroundTask("status", id)).rejects.toThrow("Unknown task id");
+      // And list shouldn't have any session-c tasks
+      const listed = (await manageBackgroundTask("list")) as readonly ({ id: string; sessionId?: string })[];
+      const sessionC = listed.filter((t) => t.sessionId === "session-c");
+      expect(sessionC).toHaveLength(0);
+    });
+
+    it("global reset still kills every task regardless of session", async () => {
+      const idA = spawnBackgroundTask([process.execPath, "-e", "setInterval(() => {}, 1000)"], process.cwd(), "session-a");
+      const idB = spawnBackgroundTask([process.execPath, "-e", "setInterval(() => {}, 1000)"], process.cwd(), "session-b");
+
+      // Verify tasks exist before reset
+      const before = (await manageBackgroundTask("list")) as readonly { id: string }[];
+      expect(before.length).toBe(2);
+
+      resetBackgroundTasks();
+
+      expect(await manageBackgroundTask("list")).toEqual([]);
+      await expect(manageBackgroundTask("status", idA)).rejects.toThrow("Unknown task id");
+      await expect(manageBackgroundTask("status", idB)).rejects.toThrow("Unknown task id");
+    });
+
+    it("resetSessionBackgroundTasks on a non-existent session is a no-op", async () => {
+      const id = spawnBackgroundTask([process.execPath, "-e", "setInterval(() => {}, 1000)"], process.cwd(), "session-a");
+
+      // Should not throw
+      expect(() => resetSessionBackgroundTasks("nonexistent")).not.toThrow();
+
+      // The original task should still be running
+      const status = (await manageBackgroundTask("status", id)) as TaskStatus;
+      expect(status.state).toBe("running");
+    });
+
+    it("does not leak sessionId into monitor line pages", async () => {
+      const id = spawnBackgroundTask([process.execPath, "-e", "console.log('ok')"], process.cwd(), "session-secret");
+      await waitForTerminal(id);
+      const page = readBackgroundTaskLines(id, 0, 10);
+      const serialized = JSON.stringify(page);
+      expect(serialized).not.toContain("sessionId");
+      expect(serialized).not.toContain("session-secret");
+    });
+
+    it("cleans up completed tasks in the session too", async () => {
+      const id = spawnBackgroundTask([process.execPath, "-e", "console.log('ok')"], process.cwd(), "session-d");
+      await waitForTerminal(id);
+
+      resetSessionBackgroundTasks("session-d");
+
+      await expect(manageBackgroundTask("status", id)).rejects.toThrow("Unknown task id");
+    });
+
+    it("resets all tasks in a session when multiple tasks share the same sessionId", async () => {
+      const id1 = spawnBackgroundTask([process.execPath, "-e", "setInterval(() => {}, 1000)"], process.cwd(), "session-multi");
+      const id2 = spawnBackgroundTask([process.execPath, "-e", "setInterval(() => {}, 1000)"], process.cwd(), "session-multi");
+      const idOther = spawnBackgroundTask([process.execPath, "-e", "setInterval(() => {}, 1000)"], process.cwd(), "session-other");
+
+      resetSessionBackgroundTasks("session-multi");
+
+      await expect(manageBackgroundTask("status", id1)).rejects.toThrow("Unknown task id");
+      await expect(manageBackgroundTask("status", id2)).rejects.toThrow("Unknown task id");
+      const statusOther = (await manageBackgroundTask("status", idOther)) as TaskStatus;
+      expect(statusOther.state).toBe("running");
+    });
+
+    it("is a no-op when resetting a session that is already empty", async () => {
+      const id = spawnBackgroundTask([process.execPath, "-e", "setInterval(() => {}, 1000)"], process.cwd(), "session-reset-me");
+
+      resetSessionBackgroundTasks("session-reset-me");
+      await expect(manageBackgroundTask("status", id)).rejects.toThrow("Unknown task id");
+
+      // Second reset on the now-empty session should not throw
+      expect(() => resetSessionBackgroundTasks("session-reset-me")).not.toThrow();
+    });
+
+    it("allows reusing a sessionId after the previous tasks were reset", async () => {
+      const id1 = spawnBackgroundTask([process.execPath, "-e", "setInterval(() => {}, 1000)"], process.cwd(), "session-reuse");
+      resetSessionBackgroundTasks("session-reuse");
+      await expect(manageBackgroundTask("status", id1)).rejects.toThrow("Unknown task id");
+
+      const id2 = spawnBackgroundTask([process.execPath, "-e", "console.log('ok')"], process.cwd(), "session-reuse");
+      const status2 = (await manageBackgroundTask("status", id2)) as TaskStatus & { sessionId?: string };
+      expect(status2.sessionId).toBe("session-reuse");
+    });
+
+    it("includes sessionId in the list view", async () => {
+      spawnBackgroundTask([process.execPath, "-e", "setInterval(() => {}, 1000)"], process.cwd(), "session-list-a");
+      spawnBackgroundTask([process.execPath, "-e", "setInterval(() => {}, 1000)"], process.cwd());
+
+      const listed = (await manageBackgroundTask("list")) as readonly ({ id: string; sessionId?: string })[];
+      const withSession = listed.filter((t) => t.sessionId !== undefined);
+      expect(withSession.length).toBeGreaterThanOrEqual(1);
+      expect(withSession.every((t) => t.sessionId === "session-list-a")).toBe(true);
+    });
+
+    it("handles empty string sessionId consistently", async () => {
+      // Empty string is a valid string; session isolation should treat it as a real session.
+      const id = spawnBackgroundTask([process.execPath, "-e", "setInterval(() => {}, 1000)"], process.cwd(), "");
+      const status = (await manageBackgroundTask("status", id)) as TaskStatus & { sessionId?: string };
+      // The public view must include the sessionId since it was explicitly provided
+      expect(status).toHaveProperty("sessionId");
+      expect(status.sessionId).toBe("");
+    });
+  });
 });
+

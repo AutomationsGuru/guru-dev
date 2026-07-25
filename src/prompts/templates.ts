@@ -2,11 +2,15 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { builtinPromptTemplates } from "./builtinTemplates.js";
+
 /**
  * Prompt templates (Composer Completion wave, ADR 2026-07-05-composer-completion).
  * Markdown files with a frontmatter arg schema, invoked as `/name arg…`. Pure
  * discovery + expansion; the REPL wires invocation and the Guru-native
- * $CONTEXT/$SUIT/$TREE expansions.
+ * $CONTEXT/$SUIT/$TREE expansions. Built-in templates (builtinTemplates.ts)
+ * ship with Guru and sit at the lowest precedence — any filesystem template
+ * of the same name overrides them.
  */
 
 export interface TemplateArg {
@@ -31,6 +35,12 @@ export function defaultTemplateRoots(cwd: string = process.cwd()): readonly stri
 
 export function discoverPromptTemplates(roots: readonly string[] = defaultTemplateRoots()): readonly PromptTemplate[] {
   const byName = new Map<string, PromptTemplate>();
+  // Lowest precedence first: built-ins are seeded, then any filesystem
+  // template of the same name overrides them (project roots beat user roots
+  // among themselves — first writer wins).
+  for (const template of builtinPromptTemplates()) {
+    byName.set(template.name, template);
+  }
   for (const root of roots) {
     if (!existsSync(root)) {
       continue;
@@ -51,8 +61,10 @@ export function discoverPromptTemplates(roots: readonly string[] = defaultTempla
           continue;
         }
         const template = parseTemplate(readFileSync(full, "utf8"), entry.replace(/\.md$/u, ""), full);
-        // Project roots come first — first writer wins (project overrides user).
-        if (!byName.has(template.name)) {
+        // Precedence: project roots first (first writer wins between roots),
+        // and any filesystem template overrides a same-named built-in.
+        const existing = byName.get(template.name);
+        if (!existing || existing.source === "builtin") {
           byName.set(template.name, template);
         }
       } catch {

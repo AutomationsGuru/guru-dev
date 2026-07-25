@@ -41,7 +41,7 @@ import {
 } from "../tools/builtins/operationalStoreTools.js";
 import { createRepoContextTool } from "../tools/builtins/repoContextTool.js";
 import { createBaseTools } from "../tools/builtins/baseToolFactory.js";
-import { resetBackgroundTasks, scheduleBackgroundNotification } from "../tools/builtins/backgroundTaskRegistry.js";
+import { resetBackgroundTasks, resetSessionBackgroundTasks, scheduleBackgroundNotification, spawnBackgroundTask } from "../tools/builtins/backgroundTaskRegistry.js";
 import { createReviewGatesTool } from "../tools/builtins/reviewGatesTool.js";
 import { createListSkillsTool, createLoadSkillTool } from "../tools/builtins/skillLoaderTools.js";
 import { createShellExecTool } from "../tools/builtins/shellExecTool.js";
@@ -339,6 +339,7 @@ export function createHarnessRuntime(dependencies: HarnessRuntimeDependencies = 
       }
 
       sessions.delete(sessionId);
+      resetSessionBackgroundTasks(sessionId);
       await builtSession.mcpAttachment.closeAll();
       return true;
     },
@@ -395,7 +396,8 @@ export function createDefaultHarnessToolRegistry(options: CreateDefaultHarnessTo
         ...(options.commandExecutor ? { executor: options.commandExecutor } : {}),
         shellAllowlist: options.runtimeHardening.shellAllowlist,
         secretAllowList: options.runtimeHardening.secretAllowList,
-        ...(options.bashOptimizer ? { optimizer: options.bashOptimizer } : {})
+        ...(options.bashOptimizer ? { optimizer: options.bashOptimizer } : {}),
+        ...(options.sessionId !== undefined ? { startBackground: (command: readonly string[], cwd: string) => spawnBackgroundTask(command, cwd, options.sessionId) } : {})
       },
       read: { secretAllowList: options.runtimeHardening.secretAllowList },
       // TUI/RPC can inject ask_question; otherwise the tool falls back to its own TTY prompt.
@@ -423,7 +425,8 @@ export function createDefaultHarnessToolRegistry(options: CreateDefaultHarnessTo
                 return scheduleBackgroundNotification(
                   delaySeconds,
                   input.Prompt,
-                  scheduleDelivery
+                  scheduleDelivery,
+                  options.sessionId
                 );
               }
             }
