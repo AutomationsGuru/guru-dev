@@ -1,74 +1,55 @@
 /**
- * Subagent Skill Description Match (G1055)
+ * Subagent skill description match (IDEA-F407 / R-WSH-DESCMATCH).
  *
- * Lightweight match gate: pick skills whose description tokens intersect task text.
- * Pure function, no side effects. Returns skills with any token overlap.
+ * Pure gate: pick skills whose description tokens intersect task text.
+ * Empty task or no token intersection → empty array.
  */
 
-/**
- * Skill-like shape for matching (minimal surface).
- */
-export interface SkillLike {
-  name: string;
-  description?: string | null;
+/** Minimal skill surface required for description matching. */
+export interface SkillDescriptionLike {
+  readonly name?: string;
+  readonly description?: string | null;
 }
 
 /**
- * Result of matching a skill against a task.
+ * Tokenize text for description matching.
+ * Whitespace-split, lowercased, empty tokens dropped. Null/blank → [].
  */
-export interface MatchResult<T extends SkillLike> {
-  skill: T;
-  matchedTokens: string[];
+export function tokenizeDescriptionText(text: string | null | undefined): string[] {
+  if (text == null) {
+    return [];
+  }
+
+  return text
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((token) => token.length > 0);
 }
 
 /**
- * Returns skills whose description tokens intersect with task tokens.
- * Tokenization: whitespace split, case-insensitive comparison.
- * Empty task or no intersection → returns empty array.
+ * Return skills whose description tokens intersect the task text.
  *
- * @param task - Task/query text to match against skill descriptions
- * @param skills - Array of skills with optional descriptions
- * @returns Array of skills with at least one matching token (or empty if no match)
+ * Tokenization is case-insensitive whitespace split on both sides.
+ * Skills with missing/blank descriptions never match.
+ * Empty or whitespace-only task → [].
+ * No shared tokens → [] (no intersection empty).
  */
-export function match<T extends SkillLike>(task: string, skills: T[]): T[] {
-  const taskTokens = tokenize(task);
-  if (taskTokens.length === 0) {
+export function match<T extends SkillDescriptionLike>(task: string, skills: readonly T[]): T[] {
+  const taskTokens = new Set(tokenizeDescriptionText(task));
+  if (taskTokens.size === 0) {
+    return [];
+  }
+
+  if (!Array.isArray(skills) || skills.length === 0) {
     return [];
   }
 
   return skills.filter((skill) => {
-    const descTokens = tokenize(skill.description);
-    return descTokens.some((dt) => taskTokens.includes(dt));
-  });
-}
-
-/**
- * Detailed match returning matched tokens per skill.
- */
-export function matchSkillDescriptions<T extends SkillLike>(
-  task: string,
-  skills: T[]
-): MatchResult<T>[] {
-  const taskTokens = tokenize(task);
-  if (taskTokens.length === 0) {
-    return [];
-  }
-
-  const results: MatchResult<T>[] = [];
-  for (const skill of skills) {
-    const descTokens = tokenize(skill.description);
-    const matched = descTokens.filter((dt) => taskTokens.includes(dt));
-    if (matched.length > 0) {
-      results.push({ skill, matchedTokens: matched });
+    const descriptionTokens = tokenizeDescriptionText(skill?.description);
+    if (descriptionTokens.length === 0) {
+      return false;
     }
-  }
-  return results;
-}
 
-function tokenize(text: string | null | undefined): string[] {
-  if (!text) return [];
-  return text
-    .toLowerCase()
-    .split(/\s+/)
-    .filter((t) => t.length > 0);
+    return descriptionTokens.some((token) => taskTokens.has(token));
+  });
 }
