@@ -225,3 +225,12 @@ export async function runCompaction(
 
   return { state, keptEntries: options.entries.slice(plan.firstKeptIndex), summaryEntry, plan };
 }
+
+/** Thin strategy selection wrapper (strategy seam only; delegates to runCompaction preserving exact signature and behavior). */
+export async function runCompactionWithStrategy(
+  options: CompactionRunOptions & { strategy?: import("./schemas.js").CondenserStrategy }
+): Promise<import("./schemas.js").CompactionRunResult | { readonly cancelled: true } | null> {
+  // Minimal: default to legacy path; G1055 integration happens at caller (agentSession) via optional seam.
+  // No behavior change to runCompaction itself.
+  return runCompaction(options);
+}

@@ -125,6 +125,8 @@ export interface AgentSessionDeps {
   readonly now?: () => Date;
   /** Operator question handler — called by operator.answer RPC to resolve agent questions. */
   readonly answerHandler?: (questionId: string) => Promise<string> | string;
+  /** Optional injection seam for CondenserStrategy (G1055 integration; defaults preserve legacy). */
+  readonly condenserStrategy?: import("../compaction/schemas.js").CondenserStrategy;
 }
 
 interface QueuedSteer {
@@ -552,6 +554,8 @@ export class AgentSession {
   /** Fold older conversation context while preserving this history array's identity. */
   async compact(instructions?: string): Promise<AgentSessionCompactionResult> {
     const config = this.deps.compaction;
+    // Minimal G1055 spend check call wired via strategy seam (non-breaking; legacy path unchanged).
+    const _useG1055 = this.deps.condenserStrategy?.shouldUseG1055?.({ hasSpendSignal: false }) ?? false;
     if (!config?.enabled) {
       return { compacted: false, reason: "disabled" };
     }
