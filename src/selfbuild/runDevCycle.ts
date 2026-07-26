@@ -159,6 +159,39 @@ const NATIVE_REVIEW_GATE: CommandGate = {
 // A model loop (BUILD re-plans, DEBUG re-plans) consumes an attempt; gating stages do not.
 const CONSUMES_ATTEMPT = new Set<DevStage>(["build", "debug"]);
 
+class DeadlineExceededError extends Error {
+  constructor(
+    readonly stage: DevStage,
+    readonly remainingMs: number
+  ) {
+    super(`wall-clock deadline hit during ${stage} (${remainingMs}ms remaining at start)`);
+    this.name = "DeadlineExceededError";
+  }
+}
+
+/**
+ * Race a stage runner against the wall-clock budget. If the budget's remaining time
+ * elapses before the stage completes, the stage is recorded as RED with a deadline
+ * evidence. Otherwise, the runner's result is passed through.
+ */
+async function runWithDeadline(
+  stage: DevStage,
+  runner: StageRunner,
+  budget: DevCycleBudget
+): Promise<StageResult> {
+  const snapshot = budget.snapshot();
+  const remainingMs = snapshot.wallClockMs - snapshot.elapsedMs;
+  if (remainingMs <= 0) {
+    throw new DeadlineExceededError(stage, remainingMs);
+  }
+
+  const run = runner();
+  const deadline = new Promise<StageResult>((_, reject) =>
+    setTimeout(() => reject(new DeadlineExceededError(stage, remainingMs)), remainingMs)
+  );
+  return Promise.race([run, deadline]);
+}
+
 export async function runDevCycle(input: RunDevCycleInput = {}): Promise<DevCycleReport> {
   const cwd = input.executorOptions?.cwd ?? process.cwd();
   const canonicalCwd = realpathSync(resolve(cwd));
@@ -596,7 +629,24 @@ export async function runDevCycle(input: RunDevCycleInput = {}): Promise<DevCycl
 
     const completedStage = stage;
     await saveCheckpoint({ stage: completedStage, stageState: "running", status: "running", verdict: null });
-    const result = await runners[completedStage]();
+    let result: StageResult;
+    try {
+      result = await runWithDeadline(completedStage, runners[completedStage], budget);
+    } catch (error) {
+      if (error instanceof DeadlineExceededError) {
+        // Wall-clock exhaustion in-flight is equivalent to budget exhaustion:
+        // kill the loop immediately, do not route through the state machine.
+        stages.push({
+          stage: completedStage,
+          verdict: "RED",
+          evidence: `wall-clock deadline hit during ${completedStage} stage (${error.remainingMs}ms remaining at start)`
+        });
+        stage = "blocked";
+        canPersistTerminalCheckpoint = false;
+        break;
+      }
+      throw error;
+    }
     stages.push({ stage: completedStage, verdict: result.verdict, evidence: result.evidence });
     if (result.tokens) {
       budget.recordTokens(result.tokens);
