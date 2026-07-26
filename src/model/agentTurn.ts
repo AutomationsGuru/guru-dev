@@ -4,6 +4,8 @@ import type { ProviderRouteDescriptor } from "../providers/schemas.js";
 import type { ToolDefinition, ToolObservation } from "../tools/registry.js";
 import { sanitizeErrorMessage } from "../router/health.js";
 import { resolveProviderWire } from "./providerWire.js";
+import { mapProviderError } from "../providers/errors/mapper.js";
+import { GuruError } from "../providers/types/errors.js";
 import {
   DEFAULT_RETRY_CONFIG,
   parseRetryAfterMs,
@@ -1482,10 +1484,20 @@ async function fetchWithPolicy(
         const detail = await response.text().catch(() => "");
         disarm();
         const retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"));
+
+        // Map provider error to standardized GuruError for consistent error handling
+        const providerName = (context.routeId.split("/")[0] || "unknown") as "openai" | "anthropic" | "google";
+        const httpError = new Error(`HTTP ${response.status}: ${detail || "Request failed"}`);
+        (httpError as any).status = response.status;
+        (httpError as any).statusCode = response.status;
+        (httpError as any).response = { data: detail, headers: Object.fromEntries(response.headers.entries()) };
+        const guruError = mapProviderError(providerName, httpError);
+
         throw annotateForRetry(
           new DirectChatError(`${failurePrefix} failed with HTTP ${response.status}: ${sanitizeErrorMessage(detail).slice(0, 300)}`, {
             routeId: context.routeId,
-            status: response.status
+            status: response.status,
+            guruError: guruError.toJSON(),
           }),
           { ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) }
         );
