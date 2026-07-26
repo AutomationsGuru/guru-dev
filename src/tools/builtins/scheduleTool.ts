@@ -32,7 +32,17 @@ export function createScheduleTool(options: ScheduleToolOptions = {}): ToolDefin
     outputSchema: ScheduleToolOutputSchema,
     async execute(input) {
       if (!options.onSchedule) {
-        throw new Error("schedule tool is not supported in this runtime environment (no scheduler backend).");
+        // GAP-0001 fail-closed: surfaces that never injected a scheduler
+        // backend get a clear host-bridge error, never a fabricated taskId.
+        // (Live interactive surfaces inject onSchedule; headless surfaces
+        // should omit this tool from the registry instead of registering it.)
+        const shape =
+          input.CronExpression !== undefined
+            ? "recurring cron schedules need a host bridge"
+            : "one-shot timers need a delivery callback";
+        throw new Error(
+          `schedule tool is not supported in this runtime environment (no scheduler backend); ${shape}.`
+        );
       }
       const taskId = await options.onSchedule(input);
       return { taskId };
