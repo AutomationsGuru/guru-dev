@@ -1,405 +1,517 @@
+import { z } from "zod";
+
 /**
- * Orchestrator DAG runner (IDEA-F267-DAG-ORCH-01 / R-AU-DAG).
+ * Orchestrator DAG runner (IDEA-F267-DAG-ORCH-01).
  *
- * The orchestrator emits a plan as a DAG of nodes with explicit dependencies;
- * this runner schedules every READY node to a worker (parallel up to a bounded
- * concurrency cap), fans results back into dependents as inputs, and exposes a
- * fan-in continue/replan hook after each node settles so the orchestrator can
- * keep going, replan a stale subgraph, or stop the run.
+ * A small, owned runtime that turns a DAG-shaped plan into a bounded
+ * parallel execution. The runner is intentionally narrow:
  *
- * Bounded by construction (never-stuck, §failure paths are observable):
- * - invalid plans (duplicate ids, unknown deps, cycles) are rejected BEFORE the
- *   first worker runs — a malformed plan can never hang the scheduler;
- * - a failed node skips its dependents (cascading) instead of dead-ending;
- * - replanning is hard-capped by `maxReplans` so a hook that always asks for a
- *   replan cannot loop forever.
+ *  - Nodes form a DAG. The schema rejects duplicate ids, unknown deps,
+ *    and self-edges; a separate cycle check rejects any cycle the static
+ *    schema would otherwise permit (e.g. A -> B -> A across two nodes).
+ *  - Ready nodes (all upstream deps `done`) fan out in parallel up to a
+ *    configured concurrency ceiling.
+ *  - The fan-in `continueHook` fires once per wave AFTER every node in
+ *    the current wave has settled. Its return value is the next plan or
+ *    null to stop. A non-null continuation merges into the same
+ *    scheduler; the hook does NOT block individual node completion.
+ *  - Failure is structured: a worker exception is captured into the
+ *    node's result with state `failed`. The runner does NOT throw —
+ *    failure is data. The caller decides whether to suppress downstream
+ *    nodes for a failed dep via `skipOnFailure`.
+ *
+ * The worker closure is supplied by the caller. The runner does NOT
+ * import a provider, model, or framework — capability is composed
+ * through the caller's worker, not silently absorbed into core.
+ *
+ * Out of scope (per the plan explicit exclusions):
+ *  - No multi-tenant scheduler, no telemetry, no default-on audit stream.
+ *  - No HITL gating hidden in the runner — that lives in the hook the
+ *    caller supplies.
  */
 
-/** A single unit of orchestrated work. `deps` names node ids that must settle first. */
-export interface DagNode {
-  readonly id: string;
-  readonly deps?: readonly string[];
-  /** Opaque orchestrator payload forwarded untouched to the worker. */
-  readonly payload?: unknown;
+// ---------------------------------------------------------------------------
+// Schemas
+// ---------------------------------------------------------------------------
+
+export const DagNodeStateSchema = z.enum(["pending", "running", "done", "failed", "skipped"]);
+export type DagNodeState = z.infer<typeof DagNodeStateSchema>;
+
+export const DagNodeSchema = z
+  .object({
+    id: z.string().trim().min(1),
+    /** IDs of upstream nodes that must be `done` before this node may run. */
+    dependsOn: z.array(z.string().trim().min(1)).default([]),
+    /** Optional human title — surfaces in the report and any worker logs. */
+    title: z.string().trim().min(1).optional(),
+    /** Opaque payload forwarded to the worker for this node. */
+    input: z.unknown().optional()
+  })
+  .strict();
+export type DagNode = z.infer<typeof DagNodeSchema>;
+
+export const DagPlanSchema = z
+  .object({
+    objective: z.string().trim().min(1),
+    /** All nodes in the DAG. IDs must be unique. */
+    nodes: z.array(DagNodeSchema).min(1)
+  })
+  .strict()
+  .superRefine((plan, context) => {
+    const seen = new Set<string>();
+    const known = new Set<string>();
+    for (const node of plan.nodes) {
+      if (seen.has(node.id)) {
+        context.addIssue({
+          code: "custom",
+          path: ["nodes"],
+          message: `Duplicate node id: ${node.id}`
+        });
+      }
+      seen.add(node.id);
+      known.add(node.id);
+    }
+    for (const node of plan.nodes) {
+      for (const dep of node.dependsOn) {
+        if (!known.has(dep)) {
+          context.addIssue({
+            code: "custom",
+            path: ["nodes"],
+            message: `Node ${node.id} depends on unknown node: ${dep}`
+          });
+        }
+        if (dep === node.id) {
+          context.addIssue({
+            code: "custom",
+            path: ["nodes"],
+            message: `Node ${node.id} depends on itself`
+          });
+        }
+      }
+    }
+  });
+export type DagPlan = z.infer<typeof DagPlanSchema>;
+
+export const DagRunOptionsSchema = z
+  .object({
+    /** Max concurrent workers running ready nodes. Hard-capped at 32. */
+    concurrency: z.number().int().positive().max(32).default(4),
+    /**
+     * If true, when a node fails, downstream nodes that depend on it are
+     * marked `skipped` instead of running. The caller keeps the failure
+     * visible in the report. The runner never hides failures.
+     */
+    skipOnFailure: z.boolean().default(false)
+  })
+  .strict();
+export type DagRunOptions = z.input<typeof DagRunOptionsSchema>;
+export type ParsedDagRunOptions = z.infer<typeof DagRunOptionsSchema>;
+
+export const DagNodeResultSchema = z
+  .object({
+    nodeId: z.string().trim().min(1),
+    state: DagNodeStateSchema,
+    /** Runtime stamp identifying the module that produced this result. */
+    startedBy: z.string().trim().min(1).optional(),
+    startedAt: z.string().datetime().optional(),
+    endedAt: z.string().datetime().optional(),
+    durationMs: z.number().nonnegative().max(86_400_000).optional(),
+    /** Worker output for this node. Opaque — the caller owns the shape. */
+    output: z.unknown().optional(),
+    error: z.string().trim().min(1).optional()
+  })
+  .strict();
+export type DagNodeResult = z.infer<typeof DagNodeResultSchema>;
+
+export const DagRunStatusSchema = z.enum(["completed", "failed", "cancelled"]);
+export type DagRunStatus = z.infer<typeof DagRunStatusSchema>;
+
+export const DagRunReportSchema = z
+  .object({
+    objective: z.string().trim().min(1),
+    status: DagRunStatusSchema,
+    startedAt: z.string().datetime(),
+    endedAt: z.string().datetime(),
+    durationMs: z.number().nonnegative().max(86_400_000),
+    /**
+     * Original plan nodes by id. Frozen shape — the runner never mutates the
+     * caller's plan input.
+     */
+    plan: z.array(DagNodeSchema),
+    /** One entry per node, indexed by id. Failed-and-suppressed nodes are `skipped`. */
+    results: z.array(DagNodeResultSchema),
+    /**
+     * Structured error messages for cycle/dep/unknown faults that prevented
+     * the run from starting. Per-node failures live in `results`, not here.
+     */
+    blockers: z.array(z.string())
+  })
+  .strict()
+  .superRefine(assertTimestampOrder);
+export type DagRunReport = z.infer<typeof DagRunReportSchema>;
+
+// ---------------------------------------------------------------------------
+// Public surface
+// ---------------------------------------------------------------------------
+
+/**
+ * A worker receives one node at a time. The handler is fully owned by the
+ * caller — the runner will never start a worker without an explicit handler
+ * being injected.
+ */
+export type DagWorker = (node: DagNode, upstream: ReadonlyMap<string, DagNodeResult>) => Promise<unknown> | unknown;
+
+/**
+ * The fan-in hook. Fires once per wave AFTER every node in the current
+ * wave has settled. Returns a non-null `DagPlan` to merge new nodes into
+ * the scheduler (re-plan), or null to terminate the run.
+ */
+export type DagContinueHook = (context: DagContinueContext) => DagPlan | null | Promise<DagPlan | null>;
+
+export interface DagContinueContext {
+  readonly objective: string;
+  readonly results: ReadonlyMap<string, DagNodeResult>;
+  /** The wave that just settled. */
+  readonly wave: readonly DagNode[];
 }
-
-/** The orchestrator's plan: a flat node list whose edges are expressed by `deps`. */
-export interface DagPlan {
-  readonly id: string;
-  readonly nodes: readonly DagNode[];
-}
-
-/** Inputs a node receives: dep node id → that dep's output string. */
-export type DagNodeInputs = ReadonlyMap<string, string>;
-
-/** Executes one node. Injected — the runner owns scheduling, never execution. */
-export type DagWorker = (node: DagNode, inputs: DagNodeInputs) => Promise<string>;
-
-/** Fan-in event delivered to the continue/replan hook after a node settles. */
-export interface DagNodeSettledEvent {
-  readonly nodeId: string;
-  readonly state: "done" | "failed";
-  /** Worker output when state is "done". */
-  readonly output?: string;
-  /** Error message when state is "failed". */
-  readonly error?: string;
-  /** Outputs of every node settled so far (immutable snapshot). */
-  readonly outputs: DagNodeInputs;
-}
-
-/** The hook's verdict after each fan-in event. */
-export type DagContinueDecision =
-  | { readonly action: "continue" }
-  | { readonly action: "replan"; readonly reason?: string }
-  | { readonly action: "abort"; readonly reason?: string };
 
 export interface RunDagOptions {
-  /** Max workers in flight at once. Hard-capped at 16 (swarm contract parity). */
-  readonly maxConcurrency?: number;
-  /**
-   * Max replan requests honored per run. Bounds the continue/replan loop so a
-   * hook that always replans terminates. Default 3; hard cap 8.
-   */
-  readonly maxReplans?: number;
-  /** Fan-in hook invoked (in settle order) after each node finishes or fails. */
-  readonly onNodeSettled?: (event: DagNodeSettledEvent) => DagContinueDecision | Promise<DagContinueDecision>;
+  readonly plan: DagPlan;
+  readonly worker: DagWorker;
+  readonly continueHook?: DagContinueHook;
+  readonly options?: DagRunOptions;
+  /** Caller-supplied abort signal. When tripped, the runner stops scheduling NEW waves. */
+  readonly signal?: AbortSignal;
 }
 
-export type DagRunStatus = "completed" | "failed" | "aborted";
+// ---------------------------------------------------------------------------
+// Runner
+// ---------------------------------------------------------------------------
 
-export interface DagRunResult {
-  readonly status: DagRunStatus;
-  /** node id → worker output for every node that completed. */
-  readonly outputs: ReadonlyMap<string, string>;
-  /** Node ids that ran and rejected. */
-  readonly failed: readonly string[];
-  /** Node ids that never ran because a dependency failed/skipped, or the run aborted. */
-  readonly skipped: readonly string[];
-  /** Replans actually performed (bounded by maxReplans). */
-  readonly replanCount: number;
-  /** Hook-supplied reason when status is "aborted". */
-  readonly abortReason?: string;
-}
-
-/** Plan has a dependency cycle — rejected before any worker runs. */
-export class DagCycleError extends Error {
-  readonly code = "dag_cycle";
-  constructor(readonly cycle: readonly string[]) {
-    super(`DAG plan has a dependency cycle: ${cycle.join(" -> ")}`);
-    this.name = "DagCycleError";
-  }
-}
-
-/** Plan is structurally invalid (duplicate id or unknown dep) — rejected up front. */
-export class DagPlanError extends Error {
-  readonly code = "dag_plan_invalid";
-  constructor(message: string) {
-    super(message);
-    this.name = "DagPlanError";
-  }
-}
-
-const MAX_CONCURRENCY_CEILING = 16;
-const MAX_REPLANS_CEILING = 8;
-const DEFAULT_MAX_REPLANS = 3;
-
-type NodeState = "pending" | "ready" | "running" | "done" | "failed" | "skipped";
-
-function validatePlan(plan: DagPlan): Map<string, DagNode> {
-  const byId = new Map<string, DagNode>();
-  for (const node of plan.nodes) {
-    if (byId.has(node.id)) {
-      throw new DagPlanError(`Duplicate node id "${node.id}" in plan "${plan.id}".`);
-    }
-    byId.set(node.id, node);
-  }
-  for (const node of plan.nodes) {
-    for (const dep of node.deps ?? []) {
-      if (!byId.has(dep)) {
-        throw new DagPlanError(`Node "${node.id}" depends on unknown node "${dep}" in plan "${plan.id}".`);
-      }
-      if (dep === node.id) {
-        throw new DagCycleError([node.id, node.id]);
-      }
-    }
-  }
-  // Cycle check via iterative DFS (white/gray/black). Gray revisit = cycle.
-  const color = new Map<string, 0 | 1 | 2>();
-  const visit = (start: string): void => {
-    const stack: Array<{ id: string; expanded: boolean }> = [{ id: start, expanded: false }];
-    const path: string[] = [];
-    while (stack.length > 0) {
-      const top = stack[stack.length - 1]!;
-      if (!top.expanded) {
-        if (color.get(top.id) === 2) {
-          stack.pop();
-          continue;
-        }
-        color.set(top.id, 1);
-        path.push(top.id);
-        top.expanded = true;
-        for (const dep of byId.get(top.id)!.deps ?? []) {
-          if (color.get(dep) === 1) {
-            const cycleStart = path.indexOf(dep);
-            throw new DagCycleError([...path.slice(cycleStart), dep]);
-          }
-          if (color.get(dep) !== 2) {
-            stack.push({ id: dep, expanded: false });
-          }
-        }
-      } else {
-        color.set(top.id, 2);
-        path.pop();
-        stack.pop();
-      }
-    }
-  };
-  for (const node of plan.nodes) {
-    if (color.get(node.id) === undefined) {
-      visit(node.id);
-    }
-  }
-  return byId;
-}
+const DAG_RUNNER_RUNTIME_NAME = "guruharness-orchestrator-dag-runner";
 
 /**
- * Runs a plan DAG to settlement. Resolves once every node is done, failed, or
- * skipped — never before, never after, never hangs on a valid plan.
+ * Run a DAG plan to a steady state. Returns a structured report.
+ *
+ * Behaviour:
+ *  - Validates the plan (unique ids, known deps, no self-edges, no cycle).
+ *  - Topologically schedules ready nodes up to `options.concurrency`.
+ *  - A node becomes ready when every node in its `dependsOn` is `done`.
+ *  - Within a wave, ready nodes run concurrently; the wave only finishes
+ *    when every node in it has settled.
+ *  - After each wave, `continueHook` runs. If it returns a plan, that plan
+ *    is merged in and scheduling continues. If it returns null, the run
+ *    ends `completed` (or `failed` if any nodes failed).
+ *  - Worker exceptions are captured into the node's result with state
+ *    `failed`. The runner does NOT throw — failure is data.
  */
-export async function runDag(plan: DagPlan, worker: DagWorker, options: RunDagOptions = {}): Promise<DagRunResult> {
-  const byId = validatePlan(plan);
-  const maxConcurrency = Math.max(1, Math.min(options.maxConcurrency ?? MAX_CONCURRENCY_CEILING, MAX_CONCURRENCY_CEILING));
-  const maxReplans = Math.max(0, Math.min(options.maxReplans ?? DEFAULT_MAX_REPLANS, MAX_REPLANS_CEILING));
-
-  const states = new Map<string, NodeState>();
-  const remainingDeps = new Map<string, number>();
-  const dependents = new Map<string, string[]>();
-  const outputs = new Map<string, string>();
-  const failed: string[] = [];
-  const skipped: string[] = [];
+export async function runDag(options: RunDagOptions): Promise<DagRunReport> {
+  const parsedOptions = DagRunOptionsSchema.parse(options.options ?? {});
+  const plan = DagPlanSchema.parse(options.plan);
+  const startedAtDate = new Date();
+  const results = new Map<string, DagNodeResult>();
+  const blockers: string[] = [];
 
   for (const node of plan.nodes) {
-    const deps = node.deps ?? [];
-    states.set(node.id, deps.length === 0 ? "ready" : "pending");
-    remainingDeps.set(node.id, deps.length);
-    for (const dep of deps) {
-      const list = dependents.get(dep) ?? [];
-      list.push(node.id);
-      dependents.set(dep, list);
+    results.set(node.id, blankResult(node.id));
+  }
+
+  // Detect cycles up-front. Topological sort would loop forever on a cycle;
+  // surface it as a structured blocker instead of blowing the stack.
+  const cycle = detectCycle(plan.nodes);
+  if (cycle) {
+    blockers.push(`Cycle detected in DAG: ${cycle.join(" -> ")}`);
+    return buildReport(plan, results, blockers, "failed", startedAtDate, new Date());
+  }
+
+  let cancelled = false;
+
+  // Main scheduling loop. Each iteration picks whatever is ready across the
+  // entire pending set, runs them in a bounded wave, and tries again until
+  // no node can make progress.
+  while (true) {
+    if (options.signal?.aborted) {
+      cancelled = true;
+      break;
+    }
+
+    const ready = pickReady(plan.nodes, results, parsedOptions.skipOnFailure);
+    if (ready.length === 0) {
+      break;
+    }
+    await runWave(ready, options.worker, results, parsedOptions.concurrency, options.signal);
+  }
+
+  // Fan-in hook: caller may extend or replan once the first wave settles.
+  // We pass the full settled view so the caller can decide whether to
+  // extend the plan or terminate.
+  if (options.continueHook && !cancelled) {
+    let hookPlan: DagPlan | null = null;
+    try {
+      hookPlan = await options.continueHook({
+        objective: plan.objective,
+        results: snapshot(results),
+        wave: [...plan.nodes]
+      });
+    } catch (error) {
+      blockers.push(`continueHook threw: ${formatError(error)}`);
+    }
+
+    if (hookPlan) {
+      const validatedHookPlan = DagPlanSchema.safeParse(hookPlan);
+      if (!validatedHookPlan.success) {
+        blockers.push(`continueHook returned an invalid plan: ${validatedHookPlan.error.issues.map(formatIssue).join("; ")}`);
+      } else {
+        const mergedPlan: DagPlan = {
+          objective: plan.objective,
+          nodes: [...plan.nodes, ...validatedHookPlan.data.nodes]
+        };
+        const newCycle = detectCycle(mergedPlan.nodes);
+        if (newCycle) {
+          blockers.push(`continueHook introduced a cycle: ${newCycle.join(" -> ")}`);
+        } else {
+          for (const node of validatedHookPlan.data.nodes) {
+            if (!results.has(node.id)) {
+              results.set(node.id, blankResult(node.id));
+            }
+          }
+          // Continue scheduling across the merged set.
+          while (!cancelled) {
+            if (options.signal?.aborted) {
+              cancelled = true;
+              break;
+            }
+            const readyNext = pickReady(mergedPlan.nodes, results, parsedOptions.skipOnFailure);
+            if (readyNext.length === 0) {
+              break;
+            }
+            await runWave(readyNext, options.worker, results, parsedOptions.concurrency, options.signal);
+          }
+        }
+      }
     }
   }
 
-  let replanCount = 0;
-  let abortReason: string | undefined;
-  let running = 0;
-  let settledCount = 0;
-  const total = plan.nodes.length;
+  const endedAtDate = new Date();
+  // If the plan leaves nodes pending (e.g. a dep that never resolved), the
+  // report still records them as `pending` — the caller can inspect.
+  const status: DagRunStatus = cancelled ? "cancelled" : resolveStatus(results);
+  return buildReport(plan, results, blockers, status, startedAtDate, endedAtDate);
+}
 
-  const skipSubtree = (nodeId: string): void => {
-    // Cascade: dependents of a failed/skipped node can never become ready.
-    for (const childId of dependents.get(nodeId) ?? []) {
-      if (states.get(childId) === "pending") {
-        states.set(childId, "skipped");
-        skipped.push(childId);
-        settledCount += 1;
-        skipSubtree(childId);
+// ---------------------------------------------------------------------------
+// Internals
+// ---------------------------------------------------------------------------
+
+async function runWave(
+  nodes: readonly DagNode[],
+  worker: DagWorker,
+  results: Map<string, DagNodeResult>,
+  concurrency: number,
+  signal: AbortSignal | undefined
+): Promise<void> {
+  let cursor = 0;
+
+  const pump = async (): Promise<void> => {
+    while (cursor < nodes.length) {
+      if (signal?.aborted) {
+        return;
+      }
+      const next = nodes[cursor];
+      cursor += 1;
+      if (!next) {
+        return;
+      }
+      const startedAt = new Date();
+      results.set(next.id, {
+        nodeId: next.id,
+        state: "running",
+        startedBy: DAG_RUNNER_RUNTIME_NAME,
+        startedAt: startedAt.toISOString()
+      });
+      try {
+        const output = await worker(next, buildUpstreamView(next, results));
+        const endedAt = new Date();
+        results.set(next.id, {
+          nodeId: next.id,
+          state: "done",
+          startedBy: DAG_RUNNER_RUNTIME_NAME,
+          startedAt: startedAt.toISOString(),
+          endedAt: endedAt.toISOString(),
+          durationMs: Math.max(0, endedAt.getTime() - startedAt.getTime()),
+          output
+        });
+      } catch (error) {
+        const endedAt = new Date();
+        results.set(next.id, {
+          nodeId: next.id,
+          state: "failed",
+          startedBy: DAG_RUNNER_RUNTIME_NAME,
+          startedAt: startedAt.toISOString(),
+          endedAt: endedAt.toISOString(),
+          durationMs: Math.max(0, endedAt.getTime() - startedAt.getTime()),
+          error: formatError(error)
+        });
       }
     }
   };
 
-  const settleLoop = new Promise<void>((resolveAll) => {
-    const maybeFinish = (): void => {
-      if (settledCount === total && running === 0) {
-        resolveAll();
+  const lanes = Array.from({ length: Math.min(concurrency, nodes.length) }, () => pump());
+  await Promise.all(lanes);
+}
+
+function pickReady(
+  nodes: readonly DagNode[],
+  results: ReadonlyMap<string, DagNodeResult>,
+  skipOnFailure: boolean
+): DagNode[] {
+  const ready: DagNode[] = [];
+  for (const node of nodes) {
+    const result = results.get(node.id);
+    if (!result || result.state !== "pending") {
+      continue;
+    }
+    let allDepsDone = true;
+    let anyDepFailed = false;
+    for (const dep of node.dependsOn) {
+      const depResult = results.get(dep);
+      if (!depResult) {
+        // Unknown dep — the schema should have caught this. Treat as
+        // unresolved; the cycle check covers the rest.
+        allDepsDone = false;
+        break;
       }
-    };
-
-    const pump = (): void => {
-      if (abortReason !== undefined) {
-        // Abort: every node that never started is reported skipped — honest, bounded.
-        for (const node of plan.nodes) {
-          const s = states.get(node.id);
-          if (s === "pending" || s === "ready") {
-            states.set(node.id, "skipped");
-            skipped.push(node.id);
-            settledCount += 1;
-          }
-        }
-        maybeFinish();
-        return;
+      if (depResult.state === "done") {
+        continue;
       }
-      if (running >= maxConcurrency) {
-        return;
+      if (depResult.state === "failed" || depResult.state === "skipped") {
+        anyDepFailed = true;
       }
-      for (const node of plan.nodes) {
-        if (running >= maxConcurrency) {
-          return;
+      allDepsDone = false;
+      break;
+    }
+    if (allDepsDone) {
+      ready.push(node);
+    } else if (anyDepFailed && skipOnFailure) {
+      // Mark downstream nodes as skipped so the report records the chain.
+      results.set(node.id, {
+        nodeId: node.id,
+        state: "skipped",
+        startedBy: DAG_RUNNER_RUNTIME_NAME,
+        error: "Upstream node failed; downstream skipped."
+      });
+    }
+  }
+  return ready;
+}
+
+function buildUpstreamView(node: DagNode, results: ReadonlyMap<string, DagNodeResult>): ReadonlyMap<string, DagNodeResult> {
+  const view = new Map<string, DagNodeResult>();
+  for (const dep of node.dependsOn) {
+    const result = results.get(dep);
+    if (result) {
+      view.set(dep, result);
+    }
+  }
+  return view;
+}
+
+function detectCycle(nodes: readonly DagNode[]): string[] | null {
+  const visited = new Set<string>();
+  const stack = new Set<string>();
+  const path: string[] = [];
+
+  const visit = (id: string): string[] | null => {
+    if (stack.has(id)) {
+      const cycleStart = path.indexOf(id);
+      return cycleStart >= 0 ? [...path.slice(cycleStart), id] : [...path, id];
+    }
+    if (visited.has(id)) {
+      return null;
+    }
+    visited.add(id);
+    stack.add(id);
+    path.push(id);
+    const node = nodes.find((n) => n.id === id);
+    if (node) {
+      for (const dep of node.dependsOn) {
+        const cycle = visit(dep);
+        if (cycle) {
+          return cycle;
         }
-        if (states.get(node.id) !== "ready") {
-          continue;
-        }
-        states.set(node.id, "running");
-        running += 1;
-        const inputs = new Map<string, string>();
-        for (const dep of node.deps ?? []) {
-          const out = outputs.get(dep);
-          if (out !== undefined) {
-            inputs.set(dep, out);
-          }
-        }
-        worker(node, inputs).then(
-          (output) => {
-            onSettled(node, "done", output, undefined);
-          },
-          (error: unknown) => {
-            onSettled(node, "failed", undefined, error instanceof Error ? error.message : String(error));
-          }
-        );
       }
-    };
-
-    const onSettled = (node: DagNode, state: "done" | "failed", output: string | undefined, error: string | undefined): void => {
-      running -= 1;
-      settledCount += 1;
-      states.set(node.id, state);
-      if (state === "done") {
-        outputs.set(node.id, output ?? "");
-      } else {
-        failed.push(node.id);
-        skipSubtree(node.id);
-      }
-
-      const finish = (unblockDependents: boolean): void => {
-        if (unblockDependents) {
-          // Unblock dependents whose deps all settled successfully.
-          for (const childId of dependents.get(node.id) ?? []) {
-            if (states.get(childId) !== "pending") {
-              continue;
-            }
-            const left = remainingDeps.get(childId)! - 1;
-            remainingDeps.set(childId, left);
-            if (left === 0) {
-              states.set(childId, "ready");
-            }
-          }
-        }
-        pump();
-        maybeFinish();
-      };
-
-      const hook = options.onNodeSettled;
-      if (!hook) {
-        finish(true);
-        return;
-      }
-      Promise.resolve(
-        hook({
-          nodeId: node.id,
-          state,
-          ...(output !== undefined ? { output } : {}),
-          ...(error !== undefined ? { error } : {}),
-          outputs: new Map(outputs)
-        })
-      ).then(
-        (decision) => {
-          let replanned = false;
-          if (decision.action === "abort" && abortReason === undefined) {
-            abortReason = decision.reason ?? "aborted by continue/replan hook";
-          } else if (decision.action === "replan" && replanCount < maxReplans && abortReason === undefined) {
-            replanCount += 1;
-            replanned = true;
-            // Replan: re-run this node and its not-yet-started downstream subgraph
-            // against fresh outputs. Running nodes are left to settle; skipped
-            // nodes stay skipped (their branch was already contained).
-            //
-            // Bookkeeping invariant: settledCount tracks how many of the `total`
-            // nodes have a FINAL settle. A reset node's current settle is
-            // discarded (settledCount -= 1) and its re-run settles again later —
-            // net zero. A dependent's arming is rebuilt from scratch against the
-            // post-reset dep states, so no separate consumption tracking is
-            // needed: a dep still "done" contributes its existing output as
-            // input; a dep that will re-run is waited on afresh.
-            // Replan invalidates the settled node's INPUT cone and everything
-            // downstream of it: the node is stale because its inputs are
-            // suspect, so its dependency cone re-runs and the fresh outputs
-            // propagate back down. Running nodes are left to settle; skipped
-            // nodes stay skipped (their branch was already contained).
-            //
-            // Two passes so no node fires on a stale mid-reset dep state:
-            // pass 1 collects the cone and strips settled bookkeeping;
-            // pass 2 rebuilds arming against the FINAL dep states. A node is
-            // ready only if none of its deps will produce a new settle.
-            const subgraph = new Set<string>();
-            const collect = (id: string): void => {
-              if (subgraph.has(id)) {
-                return;
-              }
-              const s = states.get(id);
-              if (s === "running" || s === "skipped") {
-                return;
-              }
-              subgraph.add(id);
-              for (const depId of byId.get(id)!.deps ?? []) {
-                collect(depId);
-              }
-              for (const childId of dependents.get(id) ?? []) {
-                collect(childId);
-              }
-            };
-            collect(node.id);
-            for (const id of subgraph) {
-              const s = states.get(id);
-              if (s === "done" || s === "failed") {
-                settledCount -= 1;
-                outputs.delete(id);
-                const fi = failed.indexOf(id);
-                if (fi >= 0) {
-                  failed.splice(fi, 1);
-                }
-              }
-              states.set(id, "pending");
-            }
-            for (const id of subgraph) {
-              const deps = byId.get(id)!.deps ?? [];
-              // Wait only on deps that will produce a NEW settle: those still
-              // running or re-armed by this reset. A dep that stays done keeps
-              // its output as valid input (its settle already counted, no new
-              // one will come).
-              const waitingOn = deps.filter((dep) => {
-                const ds = states.get(dep);
-                return ds === "running" || ds === "pending" || (ds === "ready" && subgraph.has(dep));
-              }).length;
-              remainingDeps.set(id, waitingOn);
-              states.set(id, waitingOn === 0 ? "ready" : "pending");
-            }
-          }
-          // A replanned node re-runs and will re-settle — its dependents arm from
-          // the re-run's settle, not from this one. Otherwise this settle unblocks
-          // them normally.
-          finish(!replanned);
-        },
-        () => {
-          // A broken hook must not wedge the scheduler — treat as continue.
-          finish(true);
-        }
-      );
-    };
-
-    pump();
-    maybeFinish();
-  });
-
-  await settleLoop;
-
-  const status: DagRunStatus =
-    abortReason !== undefined ? "aborted" : failed.length > 0 ? "failed" : "completed";
-
-  return {
-    status,
-    outputs,
-    failed,
-    skipped,
-    replanCount,
-    ...(abortReason !== undefined ? { abortReason } : {})
+    }
+    stack.delete(id);
+    path.pop();
+    return null;
   };
+
+  for (const node of nodes) {
+    const cycle = visit(node.id);
+    if (cycle) {
+      return cycle;
+    }
+  }
+  return null;
+}
+
+function resolveStatus(results: ReadonlyMap<string, DagNodeResult>): DagRunStatus {
+  for (const result of results.values()) {
+    if (result.state === "failed") {
+      return "failed";
+    }
+  }
+  return "completed";
+}
+
+function snapshot(results: ReadonlyMap<string, DagNodeResult>): ReadonlyMap<string, DagNodeResult> {
+  return new Map(results);
+}
+
+function blankResult(nodeId: string): DagNodeResult {
+  return { nodeId, state: "pending", startedBy: DAG_RUNNER_RUNTIME_NAME };
+}
+
+function buildReport(
+  plan: DagPlan,
+  results: ReadonlyMap<string, DagNodeResult>,
+  blockers: readonly string[],
+  status: DagRunStatus,
+  startedAtDate: Date,
+  endedAtDate: Date
+): DagRunReport {
+  return DagRunReportSchema.parse({
+    objective: plan.objective,
+    status,
+    startedAt: startedAtDate.toISOString(),
+    endedAt: endedAtDate.toISOString(),
+    durationMs: Math.max(0, endedAtDate.getTime() - startedAtDate.getTime()),
+    plan: plan.nodes,
+    results: [...results.values()],
+    blockers: [...blockers]
+  });
+}
+
+function formatIssue(issue: { readonly path: readonly PropertyKey[]; readonly message: string }): string {
+  const path = issue.path.length > 0 ? issue.path.join(".") : "root";
+  return `${path}: ${issue.message}`;
+}
+
+function formatError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function assertTimestampOrder(value: { readonly startedAt: string; readonly endedAt: string }, context: z.RefinementCtx): void {
+  const startedAtMs = Date.parse(value.startedAt);
+  const endedAtMs = Date.parse(value.endedAt);
+  if (!Number.isFinite(startedAtMs) || !Number.isFinite(endedAtMs)) {
+    return;
+  }
+  if (endedAtMs < startedAtMs) {
+    context.addIssue({
+      code: "custom",
+      path: ["endedAt"],
+      message: "endedAt must be greater than or equal to startedAt."
+    });
+  }
 }
