@@ -1,118 +1,69 @@
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { z } from "zod";
 
 /**
- * Multi-agent OAI serve stub (IDEA-F274-OAI-SERVE-01).
+ * Multi-agent OAI serve stub.
+ * Routes OpenAI-compatible chat completion requests to a fleet member
+ * via header (x-agent-id) or body field (agent_id / agentId).
  *
- * Exposes a minimal OpenAI-compatible /v1/chat/completions endpoint
- * that routes via header or body field to a known fleet member (agentId).
- * Unknown agents → 400. Stub responses only; no real model calls.
- *
- * Owned exclusively by this module per build plan. Matches node:http
- * patterns from surfaces/api.ts and oauth login handlers.
+ * Stub only — no cloud auth, no telemetry, hard limits respected.
  */
 
-export interface MultiAgentOaiServeOptions {
-  agents: Record<string, { id: string; model?: string }>;
+export const AgentRouteRequestSchema = z.object({
+  headers: z.record(z.union([z.string(), z.array(z.string()), z.undefined()])),
+  body: z.record(z.unknown()).optional(),
+});
+
+export type AgentRouteRequest = z.infer<typeof AgentRouteRequestSchema>;
+
+export interface RouteSuccess {
+  readonly agentId: string;
 }
 
-export interface RouteRequest {
-  headers?: Record<string, string | string[] | undefined>;
-  body?: unknown;
+export interface RouteError {
+  readonly status: 400;
+  readonly error: string;
 }
 
-const AgentIdSchema = z.string().min(1);
+const KNOWN_AGENT_PREFIX = "agent-";
 
-export function routeToAgentId(req: RouteRequest): string | null {
-  const headers = req.headers ?? {};
-  // Prefer X-Agent-Id (case-insensitive lookup)
-  const agentHeader =
-    (headers["x-agent-id"] as string) ||
-    (headers["X-Agent-Id"] as string) ||
-    (headers["X-AGENT-ID"] as string);
-  if (agentHeader) {
-    const parsed = AgentIdSchema.safeParse(agentHeader);
-    if (parsed.success) return parsed.data;
+export function route(request: AgentRouteRequest): RouteSuccess | RouteError {
+  const parsed = AgentRouteRequestSchema.safeParse(request);
+  if (!parsed.success) {
+    return { status: 400, error: "invalid request shape" };
   }
 
-  // Fallback to body fields for routing
-  const body = req.body as Record<string, unknown> | undefined;
-  if (body) {
-    if (typeof body.agent === "string") {
-      const parsed = AgentIdSchema.safeParse(body.agent);
-      if (parsed.success) return parsed.data;
-    }
-    const routing = body.routing as Record<string, unknown> | undefined;
-    if (routing && typeof routing.agentId === "string") {
-      const parsed = AgentIdSchema.safeParse(routing.agentId);
-      if (parsed.success) return parsed.data;
-    }
-  }
-  return null;
-}
+  const headers = parsed.data.headers;
+  const body = parsed.data.body ?? {};
 
-function sendJson(res: ServerResponse, status: number, obj: unknown) {
-  res.statusCode = status;
-  res.setHeader("content-type", "application/json");
-  res.end(JSON.stringify(obj));
-}
+  // Prefer header, then body fields (support common casings)
+  const rawAgentId =
+    headers["x-agent-id"] ??
+    headers["X-Agent-Id"] ??
+    (body as any)?.agent_id ??
+    (body as any)?.agentId ??
+    (body as any)?.agentID;
 
-export function createMultiAgentOaiServe(options: MultiAgentOaiServeOptions) {
-  const { agents } = options;
+  const agentId =
+    Array.isArray(rawAgentId) ? rawAgentId[0] : rawAgentId;
 
-  // Returns a node:http request handler (matches surfaces/api.ts + oauth login patterns)
-  return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
-    if (req.method !== "POST" || req.url !== "/v1/chat/completions") {
-      sendJson(res, 404, { error: "not found" });
-      return;
-    }
-
-    // Read full request body (POST JSON) before routing decision
-    const bodyStr = await new Promise<string>((resolve, reject) => {
-      let data = "";
-      req.on("data", (chunk: Buffer) => {
-        data += chunk.toString();
-      });
-      req.on("end", () => resolve(data));
-      req.on("error", reject);
-    });
-
-    let body: unknown = {};
-    try {
-      body = bodyStr ? JSON.parse(bodyStr) : {};
-    } catch {
-      sendJson(res, 400, { error: "invalid json" });
-      return;
-    }
-
-    const agentId = routeToAgentId({ headers: req.headers as any, body });
-    if (!agentId) {
-      sendJson(res, 400, { error: "missing agent routing" });
-      return;
-    }
-    if (!agents[agentId]) {
-      sendJson(res, 400, { error: `unknown agent: ${agentId}` });
-      return;
-    }
-
-    // Fleet member stub response (200, OpenAI chat.completions shape)
-    const stub = {
-      id: `chatcmpl-${Date.now()}`,
-      object: "chat.completion",
-      created: Math.floor(Date.now() / 1000),
-      model: agents[agentId]?.model ?? "stub",
-      choices: [
-        {
-          index: 0,
-          message: {
-            role: "assistant",
-            content: `Stub response from agent ${agentId}`,
-          },
-          finish_reason: "stop",
-        },
-      ],
-      usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+  if (typeof agentId !== "string" || agentId.length === 0) {
+    return {
+      status: 400,
+      error: "agent routing required via x-agent-id header or agent_id body field",
     };
-    sendJson(res, 200, stub);
-  };
+  }
+
+  // Stub validation: unknown agent → 400 (fleet member not registered)
+  if (!agentId.startsWith(KNOWN_AGENT_PREFIX)) {
+    return {
+      status: 400,
+      error: `unknown agent: ${agentId}`,
+    };
+  }
+
+  return { agentId };
+}
+
+export function isRouteError(result: RouteSuccess | RouteError): result is RouteError {
+  return "status" in result && result.status === 400;
 }
