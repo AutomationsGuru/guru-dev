@@ -1,84 +1,149 @@
-import { describe, it, expect } from 'vitest';
+import { describe, expect, it } from "vitest";
+
 import {
-  serializeAgentCard,
+  AgentCardSchema,
+  canonicalizeAgentCard,
   parseAgentCard,
-  roundtripAgentCard,
-  A2AAgentCard,
-  A2AAgentCardError,
-} from '../../src/agents/a2aAgentCard.js';
+  serializeAgentCard,
+} from "../../src/agents/a2aAgentCard.js";
 
-describe('A2AAgentCard serialize/parse', () => {
-  const validCard: A2AAgentCard = {
-    id: 'agent-001',
-    name: 'TestAgent',
-    capabilities: ['chat', 'tool-call', 'stream'],
-  };
+describe("a2aAgentCard", () => {
+  describe("AgentCardSchema", () => {
+    it("accepts a minimal card with id and name", () => {
+      const card = AgentCardSchema.parse({ id: "guru-1", name: "Guru" });
+      expect(card).toEqual({ id: "guru-1", name: "Guru", capabilities: [] });
+    });
 
-  it('serializes a valid agent card', () => {
-    const json = serializeAgentCard(validCard);
-    expect(json).toContain('"id":"agent-001"');
-    expect(json).toContain('"name":"TestAgent"');
-    expect(json).toContain('"capabilities":["chat","tool-call","stream"]');
+    it("accepts a full card with a capabilities array", () => {
+      const card = AgentCardSchema.parse({
+        id: "guru-1",
+        name: "Guru",
+        capabilities: ["read", "write", "execute"],
+      });
+      expect(card.capabilities).toEqual(["read", "write", "execute"]);
+    });
+
+    it("defaults capabilities to an empty array when absent", () => {
+      const card = AgentCardSchema.parse({ id: "guru-1", name: "Guru" });
+      expect(card.capabilities).toEqual([]);
+    });
+
+    it("rejects an empty id", () => {
+      expect(() => AgentCardSchema.parse({ id: "", name: "Guru" })).toThrow();
+    });
+
+    it("rejects an empty name", () => {
+      expect(() => AgentCardSchema.parse({ id: "guru-1", name: "" })).toThrow();
+    });
+
+    it("rejects an empty capability entry", () => {
+      expect(() =>
+        AgentCardSchema.parse({ id: "guru-1", name: "Guru", capabilities: ["ok", ""] })
+      ).toThrow();
+    });
+
+    it("trims whitespace on id, name, and capability entries", () => {
+      const card = AgentCardSchema.parse({
+        id: "  guru-1  ",
+        name: "  Guru  ",
+        capabilities: ["  read  "],
+      });
+      expect(card).toEqual({ id: "guru-1", name: "Guru", capabilities: ["read"] });
+    });
+
+    it("rejects unknown top-level keys (strict object)", () => {
+      expect(() =>
+        AgentCardSchema.parse({ id: "guru-1", name: "Guru", extra: true })
+      ).toThrow();
+    });
   });
 
-  it('parses a valid JSON agent card', () => {
-    const json = JSON.stringify(validCard);
-    const parsed = parseAgentCard(json);
-    expect(parsed).toEqual(validCard);
+  describe("parseAgentCard", () => {
+    it("parses a valid raw card", () => {
+      const parsed = parseAgentCard({
+        id: "agent-x",
+        name: "Agent X",
+        capabilities: ["chat"],
+      });
+      expect(parsed).toEqual({
+        id: "agent-x",
+        name: "Agent X",
+        capabilities: ["chat"],
+      });
+    });
+
+    it("throws on non-object input", () => {
+      expect(() => parseAgentCard("not-a-card")).toThrow();
+      expect(() => parseAgentCard(null)).toThrow();
+      expect(() => parseAgentCard(42)).toThrow();
+    });
+
+    it("preserves duplicate capabilities as-authored", () => {
+      const parsed = parseAgentCard({
+        id: "agent-x",
+        name: "Agent X",
+        capabilities: ["read", "read"],
+      });
+      expect(parsed.capabilities).toEqual(["read", "read"]);
+    });
   });
 
-  it('roundtrips correctly', () => {
-    const result = roundtripAgentCard(validCard);
-    expect(result).toEqual(validCard);
+  describe("serializeAgentCard", () => {
+    it("emits canonical JSON with keys in id, name, capabilities order", () => {
+      const json = serializeAgentCard({
+        id: "guru-1",
+        name: "Guru",
+        capabilities: ["read", "write"],
+      });
+      // Stable key order: id, name, capabilities.
+      expect(json).toBe(
+        JSON.stringify({ id: "guru-1", name: "Guru", capabilities: ["read", "write"] })
+      );
+    });
+
+    it("always includes capabilities, even when empty", () => {
+      const json = serializeAgentCard({ id: "guru-1", name: "Guru" });
+      expect(JSON.parse(json)).toEqual({ id: "guru-1", name: "Guru", capabilities: [] });
+    });
+
+    it("normalizes raw input through validation before emitting", () => {
+      const json = serializeAgentCard({
+        id: "  guru-1  ",
+        name: "  Guru  ",
+        capabilities: ["  read  "],
+      });
+      expect(JSON.parse(json)).toEqual({
+        id: "guru-1",
+        name: "Guru",
+        capabilities: ["read"],
+      });
+    });
+
+    it("rejects invalid input rather than emitting malformed JSON", () => {
+      expect(() => serializeAgentCard({ id: "", name: "Guru" })).toThrow();
+    });
   });
 
-  it('throws on missing id', () => {
-    const bad = { ...validCard, id: '' };
-    expect(() => serializeAgentCard(bad)).toThrow(A2AAgentCardError);
-    expect(() => serializeAgentCard(bad)).toThrow(/id must be a non-empty string/);
-  });
+  describe("roundtrip", () => {
+    it("serialize → parse is lossless for a populated card", () => {
+      const original = {
+        id: "guru-1",
+        name: "Guru",
+        capabilities: ["read", "write", "execute"],
+      };
+      const roundTripped = parseAgentCard(serializeAgentCard(original));
+      expect(roundTripped).toEqual(original);
+    });
 
-  it('throws on missing name', () => {
-    const bad = { ...validCard, name: '' };
-    expect(() => serializeAgentCard(bad)).toThrow(A2AAgentCardError);
-    expect(() => serializeAgentCard(bad)).toThrow(/name must be a non-empty string/);
-  });
+    it("serialize → parse is lossless for a minimal card", () => {
+      const original = { id: "guru-1", name: "Guru" };
+      const roundTripped = parseAgentCard(serializeAgentCard(original));
+      expect(roundTripped).toEqual({ id: "guru-1", name: "Guru", capabilities: [] });
+    });
 
-  it('throws on non-array capabilities', () => {
-    const bad = { ...validCard, capabilities: 'chat' as any };
-    expect(() => serializeAgentCard(bad)).toThrow(A2AAgentCardError);
-    expect(() => serializeAgentCard(bad)).toThrow(/capabilities must be an array/);
-  });
-
-  it('throws on non-string capability', () => {
-    const bad = { ...validCard, capabilities: ['chat', 42 as any] };
-    expect(() => serializeAgentCard(bad)).toThrow(A2AAgentCardError);
-    expect(() => serializeAgentCard(bad)).toThrow(/All capabilities must be strings/);
-  });
-
-  it('throws on invalid JSON', () => {
-    expect(() => parseAgentCard('{not json}')).toThrow(A2AAgentCardError);
-    expect(() => parseAgentCard('{not json}')).toThrow(/Invalid JSON/);
-  });
-
-  it('throws on non-object parsed value', () => {
-    expect(() => parseAgentCard('42')).toThrow(/must be an object/);
-    expect(() => parseAgentCard('"string"')).toThrow(/must be an object/);
-    expect(() => parseAgentCard('null')).toThrow(/must be an object/);
-  });
-
-  it('throws on missing fields during parse', () => {
-    expect(() => parseAgentCard('{"id":"x"}')).toThrow(/name must be a non-empty string/);
-    expect(() => parseAgentCard('{"name":"x"}')).toThrow(/id must be a non-empty string/);
-    expect(() => parseAgentCard('{"id":"x","name":"y"}')).toThrow(/capabilities must be an array/);
-  });
-
-  it('rejects non-string input to parseAgentCard', () => {
-    expect(() => parseAgentCard(123 as any)).toThrow(/Input must be a string/);
-  });
-
-  it('rejects non-object input to serializeAgentCard', () => {
-    expect(() => serializeAgentCard(null as any)).toThrow(/must be an object/);
-    expect(() => serializeAgentCard('not an object' as any)).toThrow(/must be an object/);
+    it("canonicalize equals parse for the same normalized input", () => {
+      const raw = { id: "  guru-1 ", name: "Guru ", capabilities: [" read"] };
+      expect(canonicalizeAgentCard(raw)).toEqual(parseAgentCard(raw));
+    });
   });
 });
