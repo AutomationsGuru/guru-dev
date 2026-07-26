@@ -28,6 +28,7 @@ import { buildDevCyclePlan, renderDevCyclePlan } from "./selfbuild/devCyclePlan.
 import { makeAskModelFromRoute, routeFromPlannerConfig } from "./selfbuild/askModelAdapter.js";
 import { makeSmokeDeps } from "./selfbuild/smokeDeps.js";
 import { createDevCycleCheckpointStore } from "./selfbuild/devCycleCheckpoint.js";
+import { createTaskOutcomeStore } from "./selfbuild/outcomeStore.js";
 import { commandExists } from "./review/gates.js";
 import { createFileMemoryStore } from "./memory/store.js";
 import { normalizeKnownPathFields } from "./runtime/pathNormalization.js";
@@ -347,13 +348,20 @@ if (command === "self-build-plan") {
     }));
     const maxCycles = getOptionalPositiveInt(args, "--max-cycles");
 
+    // Hardening #12: persist task outcomes so the LEARN→SELECT feedback arc closes
+    // across invocations.
+    const outcomeStore = createTaskOutcomeStore(cwd);
+    const history = await outcomeStore.load();
+
     const loopReport = await runDevCycleLoop({
       tasks,
       ...(maxCycles !== undefined ? { maxCycles } : {}),
       baseInput: {
         ...(askModel ? { askModel } : {}),
         smoke: makeSmokeDeps({ cwd, timeoutMs: 30_000 }),
-        executorOptions
+        executorOptions,
+        history,
+        recordFact: (fact) => outcomeStore.recordFact(fact)
       },
       // Progress to stderr so stdout stays a single parseable JSON report.
       onCycle: (report, cycleTaskId) => {
@@ -361,15 +369,23 @@ if (command === "self-build-plan") {
       }
     });
 
+    await outcomeStore.flush();
     console.log(JSON.stringify(loopReport, null, 2));
     process.exitCode = loopReport.blocked.length === 0 ? 0 : 1;
   } else {
+    // Hardening #12: persist task outcomes even for single runs so the feedback arc
+    // closes across invocations.
+    const outcomeStore = createTaskOutcomeStore(cwd);
+    const history = await outcomeStore.load();
+
     console.error(`[self-build-run] cycle=${cycleId}${resumeCycle ? ` resume=${resumeCycle}` : ""}`);
     const devCycleReport = await runDevCycle({
       ...(askModel ? { askModel } : {}),
       // Real SMOKE: nucleus boot + model-free session/tool self-call (bounded).
       smoke: makeSmokeDeps({ cwd, timeoutMs: 30_000 }),
       executorOptions,
+      history,
+      recordFact: (fact) => outcomeStore.recordFact(fact),
       checkpoint: {
         cycleId,
         ...(resumedCheckpoint ? { resume: resumedCheckpoint } : {}),
@@ -378,6 +394,7 @@ if (command === "self-build-plan") {
         }
       }
     });
+    await outcomeStore.flush();
     console.log(JSON.stringify(devCycleReport, null, 2));
     process.exitCode = devCycleReport.terminal === "done" ? 0 : 1;
   }

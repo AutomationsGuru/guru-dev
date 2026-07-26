@@ -33,10 +33,13 @@ export interface DevCycleLoopReport {
 export async function runDevCycleLoop(input: DevCycleLoopInput): Promise<DevCycleLoopReport> {
   const cycle = input.cycle ?? runDevCycle;
   const maxCycles = input.maxCycles ?? input.tasks.length;
-  const completed = new Set<string>();
-  const blocked = new Set<string>();
+  // Seed in-memory sets from the persisted history so the LEARN→SELECT feedback arc
+  // survives cold starts after a prior invocation shipped or blocked tasks.
+  const persistedHistory = input.baseInput?.history;
+  const completed = new Set<string>(persistedHistory?.completed ?? []);
+  const blocked = new Set<string>(persistedHistory?.recentBlockers ?? []);
   // Processed = shipped OR blocked → ineligible for re-pick, so the loop is guaranteed finite.
-  const processed = new Set<string>();
+  const processed = new Set<string>([...completed, ...blocked]);
   const cycles: DevCycleReport[] = [];
 
   const historyNow = (): TaskOutcomeHistory => ({
