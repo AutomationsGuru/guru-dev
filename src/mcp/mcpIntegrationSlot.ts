@@ -1,134 +1,229 @@
-import { z } from "zod";
-
 import type { ToolDefinition } from "../tools/registry.js";
-import { McpServerIdSchema, type McpServerId } from "./schemas.js";
 
 /**
- * MCP integration slot — the explicit-gating layer between ATTACH and the
- * session tool catalog. attachConfiguredMcpServers hands over a flat pile of
- * bridged ToolDefinitions; this slot re-groups them by serverId so the
- * operator (or policy) can enable/disable an attached server's whole tool set
- * as ONE decision, per GuruHarness's explicit-gating constitution: an
- * attached capability is inert until its set is enabled, and disabling never
- * destroys the registration — the set stays visible in the catalog, honestly
- * marked disabled, so the operator can see WHY a tool is out and re-enable it.
+ * MCP integration slot — register / enable-disable / list for the MCP tool
+ * bridge surface (P2 IDEA-F262-MCP-SLOT-01). One independent data structure
+ * sits *above* `attachConfiguredMcpServers` / `discoverMcpTools`: the bridge
+ * hands the slot per-server `ToolDefinition[]`, and the slot decides what the
+ * session tool catalog actually sees.
  *
- * The slot is pure and process-local: no network I/O, no child processes, no
- * new dependencies. It operates on already-bridged ToolDefinition[] (output
- * of discoverMcpTools), so wiring it into createSessionTooling is a future
- * owner's one-line change — register each set here, then feed
- * listEnabledTools() into the registry instead of the raw attachment pile.
+ * Why a separate layer:
+ *  - `attach.ts` is boot-time transport wiring (connect, handshake, discover).
+ *  - `toolBridge.ts` is one-shot tool registry wrapping.
+ *  - This slot is the *operator-facing* enable/disable surface — the thing a
+ *    runtime session catalog reads from when it assembles its tools. It is
+ *    intentionally pure: no I/O, no transport, no env, no async. That makes it
+ *    trivial to test, replay, serialize, and reason about.
  *
- * Duplicate serverIds throw, mirroring ToolRegistry semantics: a second
- * registration for the same server would silently shadow the first set's
- * gating state, so it is rejected loudly instead.
+ * Frozen extension seam: this module never imports the transport, the
+ * registry, or any read-shaped surface. It accepts `ToolDefinition` and
+ * exposes `ToolDefinition` — nothing else leaves the slot.
+ *
+ * Identity invariant (review-guarded): tool ids entering the slot must be
+ * shaped `mcp.<serverId>.<tool>`. A tool id that doesn't match its server is
+ * rejected — the slot will not silently let a "spoofed" id leak into the
+ * session catalog under another server's name.
  */
 
-const ToolDefinitionShapeSchema = z
-  .object({
-    id: z.string().trim().min(1),
-    title: z.string(),
-    description: z.string(),
-    inputSchema: z.instanceof(z.ZodType),
-    outputSchema: z.instanceof(z.ZodType),
-    // z.custom, not z.function(): zod wraps z.function() values on parse,
-    // which would break ToolDefinition identity for registry consumers.
-    execute: z.custom<ToolDefinition["execute"]>((value) => typeof value === "function", "Expected a tool execute function.")
-  })
-  .loose();
-
-export const McpToolSetRegistrationSchema = z
-  .object({
-    serverId: McpServerIdSchema,
-    /** Already-bridged tools for this server (from discoverMcpTools). Readonly arrays accepted; stored as-is. */
-    tools: z.array(ToolDefinitionShapeSchema).readonly(),
-    /**
-     * Initial gating state. Default TRUE (mirrors McpServerConfig.enabled's
-     * default): ATTACH implies intent to use, so a freshly registered set is
-     * live; pass false to stage a set in the catalog without exposing it.
-     */
-    enabled: z.boolean().default(true)
-  })
-  .strict();
-
-/**
- * Declared structurally (not z.infer): the zod schema above is the runtime
- * boundary, but its loose-object output type would force an index signature
- * onto callers' ToolDefinition literals at compile time.
- */
-export interface McpToolSetRegistration {
-  readonly serverId: McpServerId;
-  readonly tools: readonly ToolDefinition[];
-  /** Defaults to true — see McpToolSetRegistrationSchema. */
-  readonly enabled?: boolean;
-}
-
-/** Read-only catalog entry: one registered set with its gating state. */
-export interface McpToolSetView {
-  readonly serverId: McpServerId;
+export interface McpSlotServerEntry {
+  readonly serverId: string;
   readonly enabled: boolean;
-  readonly toolIds: readonly string[];
+  /** All known tools for this server (enabled or not) — frozen. */
+  readonly tools: readonly ToolDefinition[];
 }
 
 export interface McpIntegrationSlot {
-  /** Register a server's bridged tools. Throws on duplicate serverId or invalid input. */
-  registerToolSet(registration: McpToolSetRegistration): void;
-  /** Enable a registered set. Throws on unknown serverId. */
-  enable(serverId: McpServerId): void;
-  /** Disable a registered set (kept in the catalog, hidden from the session view). Throws on unknown serverId. */
-  disable(serverId: McpServerId): void;
-  /** Every registered set with its enabled state and tool ids (snapshot). */
-  listToolSets(): readonly McpToolSetView[];
-  /** The session tool catalog view: enabled sets' tools flattened (snapshot). */
+  /**
+   * Register (or merge) a server's tools.
+   *
+   * Behavior:
+   *  - First call for a server: creates the entry, enables it by default.
+   *  - Subsequent calls: dedupes tool ids against the existing tool set,
+   *    adds new ones, and PRESERVES the prior enabled/disabled state. A
+   *    user who disabled a server stays disabled across re-registration.
+   *
+   * Validation:
+   *  - `serverId` must be a non-blank trimmed string.
+   *  - Every tool id must be shaped `mcp.<serverId>.<tool>` — same server.
+   *  - Tool ids within one payload must be unique.
+   */
+  register(serverId: string, tools: readonly ToolDefinition[]): void;
+
+  /**
+   * Enable a server. Returns `true` if the state changed, `false` if the
+   * server was already enabled, unknown (not registered), or already enabled.
+   */
+  enable(serverId: string): boolean;
+
+  /**
+   * Disable a server. Returns `true` if the state changed, `false` if it was
+   * already disabled or unknown.
+   */
+  disable(serverId: string): boolean;
+
+  /** Whether the server is currently registered AND enabled. */
+  isEnabled(serverId: string): boolean;
+
+  /**
+   * Sorted (by tool id) frozen snapshot of every tool from every currently
+   * enabled server. Re-fetched on every call; the result is structurally
+   * frozen to keep callers honest.
+   */
   listEnabledTools(): readonly ToolDefinition[];
+
+  /**
+   * Insertion-ordered frozen snapshot of every registered server entry,
+   * including the tools known for it and its current enabled flag.
+   */
+  listServers(): readonly McpSlotServerEntry[];
+
+  /**
+   * Frozen snapshot of one server's entry, or `undefined` if the server is
+   * not registered.
+   */
+  getServerEntry(serverId: string): McpSlotServerEntry | undefined;
+
+  /**
+   * Unregister a server entirely. Returns `true` if the server was present,
+   * `false` if it was already absent. A disabled-after-remove server is gone;
+   * a subsequent `enable` for the same id is a documented no-op (a clean
+   * 'ghost' rather than resurrection).
+   */
+  remove(serverId: string): boolean;
 }
 
-interface SlotEntry {
+interface InternalServerEntry {
+  serverId: string;
   enabled: boolean;
-  readonly tools: readonly ToolDefinition[];
+  /** Insertion order of `mcpToolId` keys; preserved for stable re-registration. */
+  toolOrder: string[];
+  /** Map is more robust to dedupe than a single array. */
+  tools: Map<string, ToolDefinition>;
+}
+
+function freezeToolsArray(arr: readonly ToolDefinition[]): readonly ToolDefinition[] {
+  // The tools themselves may be mutable in principle; we just want to block
+  // external splices/pushes. Object.freeze on the array is enough.
+  Object.freeze(arr);
+  return arr;
+}
+
+function toFrozenEntry(entry: InternalServerEntry): McpSlotServerEntry {
+  const tools = Object.freeze(entry.toolOrder.map((id) => entry.tools.get(id)!));
+  const frozen: McpSlotServerEntry = { serverId: entry.serverId, enabled: entry.enabled, tools };
+  Object.freeze(frozen);
+  return frozen;
+}
+
+function assertValidServerId(serverId: string): void {
+  if (typeof serverId !== "string" || serverId.trim().length === 0) {
+    throw new Error(`mcpIntegrationSlot: serverId must be a non-blank string (received ${JSON.stringify(serverId)}).`);
+  }
+}
+
+function assertToolsMatchServer(serverId: string, tools: readonly ToolDefinition[]): void {
+  const prefix = `mcp.${serverId}.`;
+  for (const tool of tools) {
+    if (typeof tool.id !== "string" || !tool.id.startsWith(prefix)) {
+      throw new Error(
+        `mcpIntegrationSlot: tool id '${tool.id}' does not match registered server '${serverId}' (expected 'mcp.${serverId}.<tool>').`
+      );
+    }
+  }
+  const seen = new Set<string>();
+  for (const tool of tools) {
+    if (seen.has(tool.id)) {
+      throw new Error(`mcpIntegrationSlot: duplicate tool id '${tool.id}' in a single register payload.`);
+    }
+    seen.add(tool.id);
+  }
 }
 
 export function createMcpIntegrationSlot(): McpIntegrationSlot {
-  const sets = new Map<McpServerId, SlotEntry>();
+  /** Insertion-ordered list of internal entries. */
+  const entries: InternalServerEntry[] = [];
+  /** Lookup helper; rebuilt state is cheap. */
+  const indexById = new Map<string, InternalServerEntry>();
 
-  function requireEntry(serverId: McpServerId): SlotEntry {
-    const entry = sets.get(serverId);
-    if (!entry) {
-      throw new Error(`MCP tool set not registered: ${serverId}`);
-    }
-    return entry;
+  function findOrCreateEntry(serverId: string): InternalServerEntry {
+    const existing = indexById.get(serverId);
+    if (existing) return existing;
+    const created: InternalServerEntry = {
+      serverId,
+      enabled: true,
+      toolOrder: [],
+      tools: new Map()
+    };
+    entries.push(created);
+    indexById.set(serverId, created);
+    return created;
+  }
+
+  function setEnabled(entry: InternalServerEntry, next: boolean): boolean {
+    if (entry.enabled === next) return false;
+    entry.enabled = next;
+    return true;
   }
 
   return {
-    registerToolSet(registration) {
-      const parsed = McpToolSetRegistrationSchema.parse(registration);
-      if (sets.has(parsed.serverId)) {
-        throw new Error(`MCP tool set already registered: ${parsed.serverId}`);
+    register(serverId, tools) {
+      assertValidServerId(serverId);
+      assertToolsMatchServer(serverId, tools);
+      const entry = findOrCreateEntry(serverId);
+      for (const tool of tools) {
+        if (!entry.tools.has(tool.id)) {
+          entry.tools.set(tool.id, tool);
+          entry.toolOrder.push(tool.id);
+        }
       }
-      sets.set(parsed.serverId, {
-        enabled: parsed.enabled,
-        // Original references (not the parsed clones) so listEnabledTools()
-        // hands the registry the very definitions the bridge produced.
-        tools: [...registration.tools]
-      });
     },
+
     enable(serverId) {
-      const id = McpServerIdSchema.parse(serverId);
-      requireEntry(id).enabled = true;
+      const entry = indexById.get(serverId);
+      if (!entry) return false;
+      return setEnabled(entry, true);
     },
+
     disable(serverId) {
-      const id = McpServerIdSchema.parse(serverId);
-      requireEntry(id).enabled = false;
+      const entry = indexById.get(serverId);
+      if (!entry) return false;
+      return setEnabled(entry, false);
     },
-    listToolSets() {
-      return [...sets.entries()].map(([serverId, entry]) => ({
-        serverId,
-        enabled: entry.enabled,
-        toolIds: entry.tools.map((tool) => tool.id)
-      }));
+
+    isEnabled(serverId) {
+      const entry = indexById.get(serverId);
+      return entry?.enabled === true;
     },
+
     listEnabledTools() {
-      return [...sets.values()].filter((entry) => entry.enabled).flatMap((entry) => [...entry.tools]);
+      const collected: ToolDefinition[] = [];
+      for (const entry of entries) {
+        if (!entry.enabled) continue;
+        for (const tool of entry.tools.values()) {
+          collected.push(tool);
+        }
+      }
+      collected.sort((a, b) => a.id.localeCompare(b.id));
+      return freezeToolsArray(collected);
+    },
+
+    listServers() {
+      return Object.freeze(entries.map((e) => toFrozenEntry(e)));
+    },
+
+    getServerEntry(serverId) {
+      const entry = indexById.get(serverId);
+      if (!entry) return undefined;
+      return toFrozenEntry(entry);
+    },
+
+    remove(serverId) {
+      const entry = indexById.get(serverId);
+      if (!entry) return false;
+      const idx = entries.indexOf(entry);
+      if (idx >= 0) entries.splice(idx, 1);
+      indexById.delete(serverId);
+      return true;
     }
   };
 }
