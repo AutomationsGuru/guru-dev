@@ -1,32 +1,48 @@
 /**
- * Sequential Agent Pipeline — Pure Deterministic Composition
+ * Sequential agent pipeline — run agents left-to-right, threading each prior
+ * output as the next agent's input. Pure and deterministic; no retry, fan-out,
+ * side effects, model calls, or runtime registration.
  *
- * Composes an ordered array of pure transform functions into a single
- * deterministic pipeline. Each transform receives the output of the previous
- * transform as its input. Order is strictly preserved.
+ * Plan: IDEA-F520-SEQ-01 — exact API `runSequential(agents, task)`.
+ */
+
+/**
+ * A single step in a sequential pipeline: receives the prior step's output
+ * (or the initial task) and returns a value for the next step.
  *
- * Per PLAN (IDEA-F520-SEQ-01): primary public API is runSequential.
- * sequentialAgentPipeline is exported as an exact compatibility alias.
+ * The `TOutput` default (`= TInput`) keeps the common homogenous case
+ * (T → T → T → …) a single generic parameter.
+ */
+export type SequentialAgent<TInput, TOutput = TInput> = (
+  input: TInput,
+) => TOutput;
+
+/**
+ * Run a sequence of agents in strict array order. The first agent receives
+ * `task`; each subsequent agent receives the prior agent's return value.
+ * Returns the final agent's output, or `task` unchanged when `agents` is empty.
  *
- * Constraints (enforced by design):
- * - No model calls, providers, tools, networks, or file I/O
- * - No retries, fanout, background work, or runtime registration
- * - No framework or external dependencies
- * - Pure functions only — deterministic, side-effect free
- *
- * @template T - The type flowing through the pipeline
- * @param transforms - Ordered array of pure transform functions
- * @returns A composed function accepting initial input and returning final output
+ * Pure, deterministic, and synchronous. A throw from any agent propagates
+ * immediately — no agent after the thrower runs (lazy in-order).
  */
 export function runSequential<T>(
-  transforms: ReadonlyArray<(input: T) => T>
-): (initialInput: T) => T {
-  return (initialInput: T): T => {
-    return transforms.reduce((current, transform) => transform(current), initialInput);
-  };
+  agents: readonly SequentialAgent<T>[],
+  task: T,
+): T {
+  let value: T = task;
+  for (let i = 0; i < agents.length; i++) {
+    value = agents[i]!(value);
+  }
+  return value;
 }
 
 /**
- * Exact compatibility alias for runSequential per PLAN alignment.
+ * Curried form: build a pipeline once, apply to many inputs.
+ *
+ * `sequentialAgentPipeline(agents)(task)` ≡ `runSequential(agents, task)`.
  */
-export { runSequential as sequentialAgentPipeline };
+export function sequentialAgentPipeline<T>(
+  agents: readonly SequentialAgent<T>[],
+): (task: T) => T {
+  return (task: T) => runSequential(agents, task);
+}
