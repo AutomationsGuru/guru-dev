@@ -1,91 +1,106 @@
-import { evaluateToolMandate, verbsForCall, type MandateContext, type MandateDecision } from "./evaluate.js";
 import { HARD_EDGE_VERBS, type MandateVerb } from "./schema.js";
+import { evaluateToolMandate, type MandateContext, type MandateDecision } from "./evaluate.js";
 
 /**
- * Sticky plan|act session mode (idea F64 / R-CL-PLAN-ACT, 2026-07-18).
- *
- * `plan` mode denies mutate / side-effect tools (write / exec / net / spend-class
- * verbs) so the operator can explore and reason without touching anything; `act`
- * restores the prior mandate density by deferring ENTIRELY to
- * {@link evaluateToolMandate}. HARD-EDGE behavior (destructive / spend /
- * secret-edge / auth-edge) is never weakened: those calls still ESCALATE in every
- * mode — plan mode never silently denies a hard edge, it surfaces it. Plan mode
- * sits in FRONT of the constitution pipeline (read-only floor → deny-wins →
- * hard-edge escalation → YOLO → grant → escalate) as an additional gate; it never
- * replaces or reorders it.
- *
- * Session state is a module-level singleton (sticky per-process session mode)
- * with `setMode` / `getMode`, defaulting to `act` so sessions that never toggle
- * behave exactly as before.
+ * The session-local work posture. `plan` is a restrictive tool floor; `act`
+ * delegates to the existing mandate policy unchanged.
  */
-
-/** The session posture: `plan` = deny side effects; `act` = full mandate pipeline. */
-export type PlanActMode = "plan" | "act";
-
-/** Verbs that mutate state or cause side effects — denied outright in plan mode. */
-const PLAN_MODE_SIDE_EFFECT_VERBS: ReadonlySet<MandateVerb> = new Set(["write", "exec", "net", "spend"]);
-
-let currentMode: PlanActMode = "act";
-
-/** Set the sticky session mode. */
-export function setMode(mode: PlanActMode): void {
-  currentMode = mode;
+export enum PlanActMode {
+  Plan = "plan",
+  Act = "act"
 }
 
-/** Read the sticky session mode (defaults to `act`). */
-export function getMode(): PlanActMode {
-  return currentMode;
-}
+export const PLAN_ACT_PLAN_DENY_REASON = "plan mode denies mutating or side-effect tools until act mode is selected";
 
-/**
- * Evaluate a tool call through the plan/act gate. In `act` mode this is a pure
- * pass-through to {@link evaluateToolMandate}. In `plan` mode, a call whose
- * verbs include ANY hard edge still escalates (hard edges are never weakened or
- * silently denied — Article 3), a call with any mutate/side-effect verb is
- * DENIED with a clear plan-mode reason, and read-only / empty-verb calls fall
- * through to the ordinary pipeline (allow).
- */
-export function evaluatePlanActGate(toolId: string, input: unknown, ctx: MandateContext): MandateDecision {
-  if (currentMode === "act") {
-    return evaluateToolMandate(toolId, input, ctx);
-  }
-
-  const verbs = verbsForCall(toolId, input);
-
-  // Hard edges SURFACE in every mode — a plan-mode deny would hide a
-  // destructive / spend / secret-edge / auth-edge call from the operator.
-  if (verbs.some((verb) => HARD_EDGE_VERBS.has(verb))) {
-    return evaluateToolMandate(toolId, input, ctx);
-  }
-
-  const sideEffect = verbs.find((verb) => PLAN_MODE_SIDE_EFFECT_VERBS.has(verb));
-  if (sideEffect) {
-    return {
-      outcome: "deny",
-      reason: `plan mode: ${sideEffect} (mutate/side-effect) is denied — switch to act mode to execute`,
-      verbs
-    };
-  }
-
-  return evaluateToolMandate(toolId, input, ctx);
-}
-
-/**
- * A decision receipt carrying the session mode under which it was produced, so
- * downstream audit trails can show whether a call ran under `plan` or `act`.
- * Self-contained: `MandateDecision` lives in `evaluate.ts`, so the receipt is a
- * stamped copy rather than a schema change there.
- */
-export interface PlanActReceipt extends MandateDecision {
-  /** The plan/act mode in effect when the decision was produced. */
+export interface PlanActMandateContext extends MandateContext {
+  /** The session work posture, evaluated after hard limits and explicit denies. */
   readonly mode: PlanActMode;
 }
 
 /**
- * Stamp an existing mandate decision with the session mode. Defaults to the
- * current sticky mode; pass `mode` explicitly when stamping a decision produced
- * under a different posture.
+ * A mandate decision annotated with the session posture that produced it. Call
+ * sites can persist this receipt with their normal tool observation/audit data.
  */
-export function receiptForDecision(decision: MandateDecision, mode: PlanActMode = currentMode): PlanActReceipt {
-  return { mode, ...decision };
+export interface PlanActMandateReceipt extends MandateDecision {
+  readonly mode: PlanActMode;
+}
+
+export interface PlanActModeSession {
+  getMode(): PlanActMode;
+  setMode(mode: PlanActMode): PlanActMode;
+  evaluateToolMandate(toolId: string, input: unknown, ctx: MandateContext): PlanActMandateReceipt;
+}
+
+function assertPlanActMode(mode: PlanActMode): void {
+  if (mode !== PlanActMode.Plan && mode !== PlanActMode.Act) {
+    throw new Error(`Invalid plan|act mode: ${String(mode)}`);
+  }
+}
+
+function receipt(mode: PlanActMode, decision: MandateDecision): PlanActMandateReceipt {
+  return { ...decision, mode };
+}
+
+function hasHardEdge(verbs: readonly MandateVerb[]): boolean {
+  return verbs.some((verb) => HARD_EDGE_VERBS.has(verb));
+}
+
+/**
+ * Apply the plan|act posture to a normal mandate evaluation.
+ *
+ * Explicit deny rules and hard edges remain first: plan mode never weakens a
+ * denial, and hard edges retain their existing per-call escalation rather than
+ * being silently converted into ordinary plan-mode denials. Once those floors
+ * have been evaluated, plan mode denies every non-read-only call before YOLO or
+ * standing grants can permit it. Act mode is a transparent pass-through to the
+ * existing mandate policy, preserving its current YOLO/grant density.
+ */
+export function evaluatePlanActToolMandate(
+  toolId: string,
+  input: unknown,
+  ctx: PlanActMandateContext
+): PlanActMandateReceipt {
+  assertPlanActMode(ctx.mode);
+
+  const decision = evaluateToolMandate(toolId, input, ctx);
+
+  if (decision.outcome === "deny") {
+    return receipt(ctx.mode, decision);
+  }
+
+  if (ctx.mode === PlanActMode.Plan && decision.verbs.length > 0) {
+    const hardEdge = decision.verbs.find((verb) => HARD_EDGE_VERBS.has(verb));
+    return {
+      mode: ctx.mode,
+      outcome: "deny",
+      reason: hardEdge ? `${PLAN_ACT_PLAN_DENY_REASON}; hard edge (${hardEdge}) remains blocked` : PLAN_ACT_PLAN_DENY_REASON,
+      verbs: decision.verbs
+    };
+  }
+
+  return receipt(ctx.mode, decision);
+}
+
+/**
+ * Creates a sticky mode holder for one session. The default is `act` so adding
+ * this optional policy helper cannot silently reduce an existing session's
+ * ordinary mandate density; callers must explicitly select `plan`.
+ */
+export function createPlanActMode(initialMode: PlanActMode = PlanActMode.Act): PlanActModeSession {
+  assertPlanActMode(initialMode);
+  let mode = initialMode;
+
+  return {
+    getMode() {
+      return mode;
+    },
+    setMode(nextMode) {
+      assertPlanActMode(nextMode);
+      mode = nextMode;
+      return mode;
+    },
+    evaluateToolMandate(toolId, input, ctx) {
+      return evaluatePlanActToolMandate(toolId, input, { ...ctx, mode });
+    }
+  };
 }
