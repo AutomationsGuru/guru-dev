@@ -1,7 +1,7 @@
 /**
  * SessionTree — shared-core session-tree primitives (Session Tree / F23).
  *
- * A lightweight, in-memory tree model for session lineage: every node has an id,
+ * A lightweight, in-memory DAG model for session lineage: every node has an id,
  * an optional parent, an ordered list of children, a display label, and a
  * creation timestamp. `fork` creates a new branch node pointing back at the
  * source node as a checkpoint. `list` and `pathToRoot` provide the two traversal
@@ -10,10 +10,6 @@
  * This is the honest shared core: it does not render, persist, or wire into any
  * surface. Surfaces compose with it by building a tree from their own source
  * of truth and calling these helpers.
- *
- * Distinct from `src/guru/sessionTree.ts`, which models a single session's
- * message chain for `/tree` / `/fork <n>` rendering. This module owns abstract
- * session-lineage trees that both TUI and RPC can share.
  */
 
 export interface SessionTreeNode {
@@ -140,11 +136,6 @@ class SessionTreeBuilder {
     return node;
   }
 
-  /**
-   * Fork a new branch from `fromId`. The new node is a child of the source node
-   * and carries a checkpoint pointer (default: `"forked from <id>"`).
-   * Returns the new branch node; the builder remains mutable until `build()`.
-   */
   fork(options: ForkOptions): SessionTreeNode {
     const fromNode = this.nodes.get(options.fromId);
     if (fromNode === undefined) throw new SessionTreeNodeNotFoundError(options.fromId);
@@ -163,7 +154,6 @@ class SessionTreeBuilder {
     if (this.rootId === null) throw new Error("SessionTree has no root");
     return {
       rootId: this.rootId,
-      // Fresh Map so callers cannot mutate the builder's internal store through the freeze.
       nodes: new Map(this.nodes)
     };
   }
@@ -181,7 +171,7 @@ export function createSessionTree(rootLabel: string, rootId?: string): SessionTr
   return builder.build();
 }
 
-/** List every node in the tree, depth-first from the root (pre-order, children left-to-right). */
+/** List every node in the tree, depth-first from the root. */
 export function listSessionTree(tree: SessionTree): readonly SessionTreeNode[] {
   const result: SessionTreeNode[] = [];
   const stack = [tree.rootId];
@@ -202,7 +192,7 @@ export function listSessionTree(tree: SessionTree): readonly SessionTreeNode[] {
   return result;
 }
 
-/** Return ids from root down to `nodeId` (inclusive), root first. */
+/** Return ids from `nodeId` up to the root (inclusive), root first. */
 export function pathToRoot(tree: SessionTree, nodeId: string): readonly string[] {
   const path: string[] = [];
   let current: string | null = nodeId;
@@ -218,14 +208,10 @@ export function pathToRoot(tree: SessionTree, nodeId: string): readonly string[]
   return path;
 }
 
-/**
- * Return all ancestors of `nodeId`, root first, excluding `nodeId` itself.
- * Empty for the root.
- */
+/** Return all ancestors of `nodeId`, starting with the immediate parent. */
 export function getAncestors(tree: SessionTree, nodeId: string): readonly SessionTreeNode[] {
   const path = pathToRoot(tree, nodeId);
-  // path is root-first inclusive of nodeId; drop the last entry (self).
-  const ancestorIds = path.slice(0, -1);
+  const ancestorIds = [...path].slice(1);
   return ancestorIds.map((id) => {
     const node = tree.nodes.get(id);
     if (node === undefined) throw new SessionTreeNodeNotFoundError(id);
@@ -248,7 +234,7 @@ export function nearestCommonAncestor(tree: SessionTree, aId: string, bId: strin
   return null;
 }
 
-/** Find all leaf nodes (nodes with no children), depth-first order. */
+/** Find all leaf nodes (nodes with no children). */
 export function findLeaves(tree: SessionTree): readonly SessionTreeNode[] {
   return listSessionTree(tree).filter((node) => node.children.length === 0);
 }
