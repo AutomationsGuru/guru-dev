@@ -41,6 +41,11 @@ export function createBaseTools(options: BaseToolFactoryOptions = {}): readonly 
   // ask_question ships in the base set so the TUI/RPC onAsk seam reaches it;
   // web_fetch / web_search / todo board register via the extension host.
   tools.push(...createAskQuestionTools(options.askQuestion ?? {}));
+  // GAP-0001: schedule registers fail-closed when no backend is injected.
+  // The full "omit the tool on surfaces with no delivery callback" change
+  // belongs to the session wiring (S1-A owns src/runtime/session.ts): the
+  // session currently relies on this registered-but-fail-closed tool to
+  // surface the host-bridge "no scheduler backend" error on headless paths.
   tools.push(createScheduleTool(options.schedule ?? {}));
   tools.push(createManageTaskTool(options.manageTask ?? { onManage: manageBackgroundTask }));
   tools.push(createReadDiagnosticsTool(options.readDiagnostics ?? {}));

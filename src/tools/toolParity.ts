@@ -318,7 +318,7 @@ export const TOOL_PARITY_ROWS: readonly ToolParityRow[] = [
     status: "partial-equivalent",
     verdict: "YELLOW",
     ownerModule: "src/tools/builtins/scheduleTool.ts",
-    notes: "Interactive Guru supports cancellable in-process one-shot notifications; headless runtimes stay fail-closed and recurring schedules are not implemented.",
+    notes: "Interactive Guru (injected delivery callback) supports cancellable in-process one-shot DurationSeconds notifications; cron/MaxIterations/conditional timers are explicitly rejected with stable errors. Surfaces with no backend OMIT schedule from the base set (no dead tool); a bare createScheduleTool() stays fail-closed and never fabricates a taskId.",
     nextAction: "Define durable recurring cron semantics for timezone, persistence, missed runs, restart, and cancellation before claiming full parity."
   },
   {
