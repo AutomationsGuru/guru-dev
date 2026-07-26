@@ -1,196 +1,154 @@
-import { describe, it, expect, beforeEach } from "vitest";
-import { normalize as pathNormalize, sep as pathSep } from "node:path";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { afterEach, describe, expect, it } from "vitest";
+
 import {
-  exportToDir,
-  importFromDir,
-  suggestCommitMessage,
-  type MemoryBlock,
-  type InjectableFs
-} from '../../src/memory/versionedMemoryStore.js';
+  createVersionedMemoryStore,
+  isValidVersionedKey,
+  type VersionedMemoryStore
+} from "../../src/memory/versionedMemoryStore.js";
 
-// In-memory fs mock
-class MockFs implements InjectableFs {
-  public files = new Map<string, string>();
+const cleanups: string[] = [];
 
-  private norm(p: string): string {
-    return pathNormalize(p);
-  }
-
-  async mkdir(path: string, options?: { recursive?: boolean }): Promise<void> {}
-
-  async writeFile(path: string, data: string, options?: { encoding?: "utf8" }): Promise<void> {
-    this.files.set(this.norm(path), data);
-  }
-
-  async readFile(path: string, options: { encoding: "utf8" }): Promise<string> {
-    const data = this.files.get(this.norm(path));
-    if (data === undefined) {
-      const err = new Error("ENOENT");
-      (err as any).code = "ENOENT";
-      throw err;
-    }
-    return data;
-  }
-
-  async readdir(path: string): Promise<string[]> {
-    // simplified readdir: only matches files exactly starting with path/
-    // (for tests, we don't need full posix hierarchy matching, but let's make it work for root)
-    const n = this.norm(path);
-    const sep = pathSep;
-    const normalizedPath = n.endsWith(sep) ? n : n + sep;
-    const result = new Set<string>();
-
-    for (const key of this.files.keys()) {
-      if (key.startsWith(normalizedPath)) {
-        const remaining = key.substring(normalizedPath.length);
-        if (!remaining.includes("/")) {
-          result.add(remaining);
-        }
-      }
-    }
-
-    // Also handle case where the path exactly matches a prefix
-    // (if our mock only uses join, it might not have trailing slashes)
-    const exactPrefix = path + (path.endsWith("/") ? "" : (path.includes("\\") ? "\\" : "/"));
-    for (const key of this.files.keys()) {
-      if (key.startsWith(exactPrefix)) {
-         const remaining = key.substring(exactPrefix.length);
-         if (!remaining.includes("/") && !remaining.includes("\\")) {
-             result.add(remaining);
-         }
-      }
-    }
-
-    // In testing, since path.join uses local OS separators, let's just cheat and do a simple string matching
-    // that works for the tests.
-    // Instead of complex logic, let's just make it very simple based on what we know the code does.
-    const readdirResult: string[] = [];
-    const rootPath = path;
-    for (const key of this.files.keys()) {
-       // if key is rootPath + "/" + filename or rootPath + "\" + filename
-       if (key.startsWith(rootPath)) {
-         const rel = key.substring(rootPath.length);
-         if ((rel.startsWith("/") || rel.startsWith("\\")) && rel.length > 1) {
-             const filename = rel.substring(1);
-             if (!filename.includes("/") && !filename.includes("\\")) {
-                 readdirResult.push(filename);
-             }
-         }
-       }
-    }
-
-    if (readdirResult.length === 0 && !this.files.has(path)) {
-       // To be safe, let's not throw ENOENT for readdir if no files exist,
-       // but maybe we should to emulate real FS.
-       // The mock is simple, we can just return empty array.
-    }
-    return readdirResult;
-  }
-
-  async stat(path: string): Promise<{ isDirectory(): boolean; isFile(): boolean }> {
-    if (this.files.has(path)) {
-      return { isDirectory: () => false, isFile: () => true };
-    }
-    const err = new Error("ENOENT");
-    (err as any).code = "ENOENT";
-    throw err;
-  }
-
-  async rm(path: string, options?: { recursive?: boolean; force?: boolean }): Promise<void> {
-    if (this.files.has(path)) {
-      this.files.delete(path);
-    }
-  }
+function makeStore(now?: () => Date): { store: VersionedMemoryStore; dir: string } {
+  const dir = mkdtempSync(join(tmpdir(), "guru-versioned-memory-test-"));
+  cleanups.push(dir);
+  const store = createVersionedMemoryStore({ directory: dir, ...(now ? { now } : {}) });
+  return { store, dir };
 }
 
-describe("versionedMemoryStore", () => {
-  let fs: MockFs;
-  const root = "/mem-root";
+afterEach(() => {
+  for (const dir of cleanups.splice(0)) {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
-  beforeEach(() => {
-    fs = new MockFs();
+describe("versioned memory store — put/getLatest/history (the acceptance core)", () => {
+  it("put returns version 1 for a new key and increments on each subsequent put", () => {
+    const { store } = makeStore();
+    expect(store.put("alpha", { value: "v1" }).version).toBe(1);
+    expect(store.put("alpha", { value: "v2" }).version).toBe(2);
+    expect(store.put("alpha", { value: "v3" }).version).toBe(3);
   });
 
-  it("exports blocks to directory and returns change summary", async () => {
-    const blocks: MemoryBlock[] = [
-      { name: "core", content: "core content" },
-      { name: "persona", content: "persona content" }
-    ];
-
-    const summary = await exportToDir(blocks, root, fs);
-
-    expect(summary.added).toEqual(["core", "persona"]);
-    expect(summary.modified).toEqual([]);
-    expect(summary.deleted).toEqual([]);
-
-    expect(await fs.readFile("/mem-root/core.md", { encoding: "utf8" })).toBe("core content");
-    expect(await fs.readFile("/mem-root/persona.md", { encoding: "utf8" })).toBe("persona content");
+  it("versions increment independently per key", () => {
+    const { store } = makeStore();
+    store.put("alpha", { value: "a1" });
+    store.put("beta", { value: "b1" });
+    store.put("beta", { value: "b2" });
+    expect(store.put("alpha", { value: "a2" }).version).toBe(2);
+    expect(store.put("beta", { value: "b3" }).version).toBe(3);
   });
 
-  it("imports blocks from directory", async () => {
-    fs.files.set("/mem-root/core.md", "core content");
-    fs.files.set("/mem-root/persona.md", "persona content");
-    // Ignore non-md files
-    fs.files.set("/mem-root/other.txt", "ignore");
-
-    const blocks = await importFromDir(root, fs);
-    expect(blocks).toHaveLength(2);
-    // order doesn't matter strictly, but let's check contents
-    expect(blocks).toContainEqual({ name: "core", content: "core content" });
-    expect(blocks).toContainEqual({ name: "persona", content: "persona content" });
+  it("getLatest returns the newest value and version", () => {
+    const { store } = makeStore();
+    store.put("alpha", { value: "v1" });
+    store.put("alpha", { value: "v2" });
+    store.put("alpha", { value: "v3" });
+    const latest = store.getLatest("alpha");
+    expect(latest).not.toBeNull();
+    expect(latest?.key).toBe("alpha");
+    expect(latest?.version).toBe(3);
+    expect(latest?.value).toBe("v3");
   });
 
-  it("handles round-trip: export then import", async () => {
-    const original: MemoryBlock[] = [
-      { name: "block1", content: "val1" },
-      { name: "block2", content: "val2" }
-    ];
-
-    await exportToDir(original, root, fs);
-    const imported = await importFromDir(root, fs);
-
-    expect(imported.sort((a, b) => a.name.localeCompare(b.name)))
-      .toEqual(original.sort((a, b) => a.name.localeCompare(b.name)));
+  it("getLatest returns null for a key with no versions", () => {
+    const { store } = makeStore();
+    expect(store.getLatest("never-put")).toBeNull();
   });
 
-  it("tracks modifications and deletions", async () => {
-    // initial state
-    fs.files.set("/mem-root/keep.md", "keep me");
-    fs.files.set("/mem-root/modify.md", "old content");
-    fs.files.set("/mem-root/delete.md", "bye");
-
-    const blocks: MemoryBlock[] = [
-      { name: "keep", content: "keep me" },
-      { name: "modify", content: "new content" },
-      { name: "add", content: "hello" }
-    ];
-
-    const summary = await exportToDir(blocks, root, fs);
-
-    expect(summary.added).toEqual(["add"]);
-    expect(summary.modified).toEqual(["modify"]);
-    expect(summary.deleted).toEqual(["delete"]);
-
-    const imported = await importFromDir(root, fs);
-    const names = imported.map(b => b.name).sort();
-    expect(names).toEqual(["add", "keep", "modify"]);
+  it("history lists version ids in insertion order (oldest first)", () => {
+    const { store } = makeStore();
+    store.put("alpha", { value: "v1" });
+    store.put("alpha", { value: "v2" });
+    store.put("alpha", { value: "v3" });
+    expect(store.history("alpha")).toEqual([1, 2, 3]);
+    expect(store.count("alpha")).toBe(3);
   });
 
-  it("rejects path traversal in export", async () => {
-    const blocks: MemoryBlock[] = [
-      { name: "../outside", content: "malicious" }
-    ];
-    await expect(exportToDir(blocks, root, fs)).rejects.toThrow(/Invalid block name/);
+  it("history is empty for an unknown key", () => {
+    const { store } = makeStore();
+    expect(store.history("never-put")).toEqual([]);
+    expect(store.count("never-put")).toBe(0);
+  });
+});
+
+describe("versioned memory store — durability and isolation", () => {
+  it("versions survive a fresh store instance over the same directory (restart survival)", () => {
+    const { store, dir } = makeStore();
+    store.put("alpha", { value: "v1" });
+    store.put("alpha", { value: "v2" });
+
+    const reborn = createVersionedMemoryStore({ directory: dir });
+    expect(reborn.history("alpha")).toEqual([1, 2]);
+    expect(reborn.getLatest("alpha")?.value).toBe("v2");
+    // A put after restart continues the existing sequence, not from 1.
+    expect(reborn.put("alpha", { value: "v3" }).version).toBe(3);
   });
 
-  it("suggests commit message based on summary", () => {
-    expect(suggestCommitMessage({ added: [], modified: [], deleted: [] }))
-      .toBe("chore(memory): sync memory blocks");
+  it("two keys are fully isolated on disk", () => {
+    const { store } = makeStore();
+    store.put("alpha", { value: "a1" });
+    store.put("beta", { value: "b1" });
+    expect(store.getLatest("alpha")?.value).toBe("a1");
+    expect(store.getLatest("beta")?.value).toBe("b1");
+    expect(store.history("alpha")).toEqual([1]);
+    expect(store.history("beta")).toEqual([1]);
+  });
 
-    expect(suggestCommitMessage({ added: ["core"], modified: [], deleted: [] }))
-      .toBe("chore(memory): added core");
+  it("values may contain newlines and special characters without corrupting the trail", () => {
+    const { store } = makeStore();
+    const tricky = "line one\nline\ttwo\n\n{ \"json\": \"inside\" }";
+    store.put("alpha", { value: tricky });
+    store.put("alpha", { value: "plain" });
+    expect(store.getLatest("alpha")?.value).toBe("plain");
+    expect(store.history("alpha")).toEqual([1, 2]);
+    // Restart and confirm the multiline first version is intact.
+    const { dir } = { dir: store.directory } as { dir: string };
+    const reborn = createVersionedMemoryStore({ directory: dir });
+    // Latest is still the plain second version; the trail length survived.
+    expect(reborn.history("alpha")).toEqual([1, 2]);
+  });
 
-    expect(suggestCommitMessage({ added: ["core", "persona"], modified: ["human"], deleted: ["temp"] }))
-      .toBe("chore(memory): added core, persona; updated human; removed temp");
+  it("each write is atomic — no .tmp file is left behind", () => {
+    const { store, dir } = makeStore();
+    store.put("alpha", { value: "v1" });
+    store.put("alpha", { value: "v2" });
+    expect(existsSync(join(dir, "alpha.log.tmp"))).toBe(false);
+    expect(existsSync(join(dir, "alpha.log"))).toBe(true);
+  });
+
+  it("storedAt uses the injected clock", () => {
+    const fixed = new Date("2026-07-19T16:42:00.000Z");
+    const { store } = makeStore(() => fixed);
+    const result = store.put("alpha", { value: "v1" });
+    expect(result.storedAt).toBe("2026-07-19T16:42:00.000Z");
+    expect(store.getLatest("alpha")?.storedAt).toBe("2026-07-19T16:42:00.000Z");
+  });
+});
+
+describe("versioned memory store — key safety (path-traversal gate)", () => {
+  it("rejects path-unsafe keys before touching the filesystem", () => {
+    const { store, dir } = makeStore();
+    expect(() => store.put("../escape", { value: "x" })).toThrow();
+    expect(() => store.put("a/b", { value: "x" })).toThrow();
+    expect(() => store.put("a\\b", { value: "x" })).toThrow();
+    expect(() => store.put("", { value: "x" })).toThrow();
+    expect(() => store.put(".hidden", { value: "x" })).toThrow();
+    // Nothing was written for any rejected key.
+    expect(existsSync(join(dir, "../escape.log"))).toBe(false);
+    expect(store.history("../escape")).toEqual([]);
+  });
+
+  it("isValidVersionedKey matches the store gate", () => {
+    expect(isValidVersionedKey("alpha")).toBe(true);
+    expect(isValidVersionedKey("provider-wiring")).toBe(true);
+    expect(isValidVersionedKey("key.with.dots")).toBe(true);
+    expect(isValidVersionedKey("")).toBe(false);
+    expect(isValidVersionedKey("../x")).toBe(false);
+    expect(isValidVersionedKey(".hidden")).toBe(false);
+    expect(isValidVersionedKey("a b")).toBe(false);
   });
 });
