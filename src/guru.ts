@@ -74,7 +74,6 @@ import { listManifests, loadManifest, parkManifest } from "./garage/store.js";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { AgentSession, type TurnDriver} from "./session/agentSession.js";
 import { runRpcMode } from "./surfaces/rpc.js";
-import { runBootMode } from "./surfaces/bootMode.js";
 import { runBootRitual, type BootRitualHooks, type PhaseOutput } from "./boot/ritual.js";
 import { incrementSessionCounter } from "./boot/sessionCounter.js";
 import { evaluateAndClose, loadGapRecords, makeGapRecord, saveGapRecords, upsertGapRecords } from "./garage/gapRecords.js";
@@ -763,6 +762,7 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = [
   { name: "/lookahead", usage: "/lookahead [on|off]", description: "The scout/commit look-ahead engine (config-gated; scouts run ahead in dead time)" },
   { name: "/compact", usage: "/compact [instructions]", description: "Fold older history into an LLM summary (auto-runs near the context window)" },
   { name: "/plan", usage: "/plan <objective>", description: "Run the self-build planner model to generate and execute a plan" },
+  { name: "/posture", usage: "/posture [plan|act|operate] [ask|auto_review|full]", description: "Show or set the session's plan posture (workMode × approvalPosture). The plan floor binds regardless of posture." },
   { name: "/settings", usage: "/settings", description: "Show harness config (names only)" },
   { name: "/theme", usage: "/theme", description: "Hot-reload the active design system from .guru/theme.json" },
   { name: "/login", usage: "/login [provider]", description: "Credential presence, or a provider's login flow" },
@@ -2960,7 +2960,7 @@ function cmdHelp(): void {
   const groups: ReadonlyArray<{ title: string; names: readonly string[] }> = [
     {
       title: "work",
-      names: ["/plan", "/model", "/models", "/role", "/mandate", "/yolo", "/lookahead", "/tools", "/todo", "/skills", "/remember", "/memory", "/recall", "/compact"]
+      names: ["/plan", "/posture", "/model", "/models", "/role", "/mandate", "/yolo", "/lookahead", "/tools", "/todo", "/skills", "/remember", "/memory", "/recall", "/compact"]
     },
     { title: "sessions", names: ["/sessions", "/resume", "/new", "/clear", "/tree", "/fork", "/rewind", "/clone", "/export", "/copy"] },
     { title: "info", names: ["/status", "/context", "/login", "/accounts", "/logout", "/keys", "/settings", "/theme", "/help"] },
@@ -2986,7 +2986,7 @@ function cmdHelp(): void {
 function cmdMenu(): void {
   print(bold(theme, "/ command menu") + dim(theme, "  (type / then ↑↓ · → drill · ⇥ accept · ⏎ run)"));
   const groups: ReadonlyArray<{ title: string; names: readonly string[] }> = [
-    { title: "work", names: ["/plan", "/model", "/models", "/role", "/mandate", "/yolo", "/lookahead", "/tools", "/todo", "/skills", "/remember", "/memory", "/recall"] },
+    { title: "work", names: ["/plan", "/posture", "/model", "/models", "/role", "/mandate", "/yolo", "/lookahead", "/tools", "/todo", "/skills", "/remember", "/memory", "/recall"] },
     { title: "sessions", names: ["/sessions", "/resume", "/new", "/tree", "/fork", "/clone", "/clear"] },
     { title: "info", names: ["/status", "/login", "/accounts", "/keys", "/logout", "/settings", "/theme", "/help"] },
     { title: "leave", names: ["/exit"] }
@@ -3038,6 +3038,60 @@ async function cmdPlan(state: GuruState, objective: string): Promise<void> {
     const statusColor = obs.observation.status === "succeeded" ? "success" : "error";
     print(`  [${paint.fg(statusColor, obs.observation.status)}] ${obs.step.title}`);
   }
+}
+
+/**
+ * IDEA-A1 `/posture` handler. Shows the current posture when invoked with no
+ * args; sets the workMode and/or approvalPosture when invoked with one or
+ * two args. The plan floor binds regardless of approvalPosture — the runtime
+ * gate enforces it before any tool runs.
+ */
+function cmdPosture(state: GuruState, args: readonly string[]): void {
+  if (!state.session) {
+    print(paint.bold(paint.fg("error", "X No active session.")));
+    return;
+  }
+  const current = state.runtime.getSessionPosture(state.session.id);
+
+  if (args.length === 0) {
+    if (!current) {
+      print(paint.fg("info", "  No posture resolved for this session."));
+      return;
+    }
+    print(paint.bold(paint.fg("fgBright", "  Posture")));
+    print(`    ${paint.fg("accent", "workMode         ")} ${paint.fg("fgBright", current.workMode)}`);
+    print(`    ${paint.fg("accent", "approvalPosture  ")} ${paint.fg("fgBright", current.approvalPosture)}`);
+    print(`    ${paint.fg("accent", "planFloorActive  ")} ${paint.fg(current.planFloorActive ? "success" : "muted", String(current.planFloorActive))}`);
+    print(`    ${paint.fg("accent", "allowlist        ")} ${paint.fg("muted", current.readOnlyAllowlist.join(", ") || "(empty)")}`);
+    print(`    ${paint.fg("accent", "resolvedAt       ")} ${paint.fg("muted", current.resolvedAt)}`);
+    return;
+  }
+
+  const [workModeArg, approvalPostureArg] = args;
+  const workMode = workModeArg as "plan" | "act" | "operate" | undefined;
+  if (workMode && !["plan", "act", "operate"].includes(workMode)) {
+    print(paint.bold(paint.fg("error", "X Usage: /posture [plan|act|operate] [ask|auto_review|full]")));
+    return;
+  }
+  const approvalPosture = approvalPostureArg as "ask" | "auto_review" | "full" | undefined;
+  if (approvalPosture && !["ask", "auto_review", "full"].includes(approvalPosture)) {
+    print(paint.bold(paint.fg("error", "X Usage: /posture [plan|act|operate] [ask|auto_review|full]")));
+    return;
+  }
+
+  const updated = state.runtime.setSessionPosture(state.session.id, {
+    ...(workMode ? { workMode } : {}),
+    ...(approvalPosture ? { approvalPosture } : {})
+  });
+  if (!updated) {
+    print(paint.bold(paint.fg("error", "X Failed to update posture.")));
+    return;
+  }
+  print(
+    paint.bold(
+      paint.fg("success", `? Posture set: workMode=${updated.workMode}, approvalPosture=${updated.approvalPosture}, planFloorActive=${updated.planFloorActive}`)
+    )
+  );
 }
 
 function cmdTheme(): void {
@@ -4876,6 +4930,9 @@ async function handleLine(state: GuruState, line: string, rl: { close(): void })
     case "/plan":
       await cmdPlan(state, slash.args.join(" "));
       break;
+    case "/posture":
+      cmdPosture(state, slash.args);
+      break;
     case "/status":
       await cmdStatus(state);
       break;
@@ -5083,22 +5140,11 @@ export async function runGuru(): Promise<void> {
     await runKeysCli(process.argv.slice(keysIndex + 1));
     return;
   }
-  // Headless surfaces: --mode rpc / --mode boot → JSON(L) over stdio on the
-  // unified AgentSession engine (no banner, no TUI). rpc drives the same
-  // driveTurn the REPL drives; boot streams NDJSON boot events.
+  // Headless RPC surface (§14): guru --mode rpc → JSONL over stdio on the unified
+  // AgentSession engine (no banner, no TUI). The same driveTurn the REPL drives.
   const modeIndex = process.argv.indexOf("--mode");
-  const mode = modeIndex >= 0 ? process.argv[modeIndex + 1] : undefined;
-  if (mode === "rpc") {
+  if (modeIndex >= 0 && process.argv[modeIndex + 1] === "rpc") {
     await runRpcMode();
-    return;
-  }
-  if (mode === "boot") {
-    const cwdIndex = process.argv.indexOf("--cwd");
-    const cwd = cwdIndex >= 0 ? process.argv[cwdIndex + 1] : undefined;
-    await runBootMode({
-      dryRun: process.argv.includes("--dry-run"),
-      ...(cwd !== undefined ? { cwd } : {}),
-    });
     return;
   }
 

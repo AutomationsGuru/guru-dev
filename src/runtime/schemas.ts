@@ -93,6 +93,22 @@ export const RuntimeDirectionReportSchema = z
   })
   .strict();
 
+/**
+ * Plan-posture summary (IDEA-A1 dual axis). Carried on the session payload
+ * so the operator (and downstream surfaces) can see what floor binds the
+ * current session.
+ */
+export const RuntimePlanPostureSummarySchema = z
+  .object({
+    workMode: z.enum(["plan", "act", "operate"]),
+    approvalPosture: z.enum(["ask", "auto_review", "full"]),
+    planFloorActive: z.boolean(),
+    readOnlyAllowlist: z.array(z.string()),
+    resolvedAt: z.string().trim().min(1).max(64)
+  })
+  .strict();
+export type RuntimePlanPostureSummary = z.infer<typeof RuntimePlanPostureSummarySchema>;
+
 export const HarnessSessionSchema = z
   .object({
     id: z.string().trim().min(1),
@@ -116,6 +132,8 @@ export const HarnessSessionSchema = z
     memory: RuntimeMemoryBindingSchema,
     policy: RuntimePolicySummarySchema,
     tools: z.array(RuntimeToolSummarySchema),
+    /** IDEA-A1 dual-axis posture summary. Optional for persisted pre-bootstrap sessions. */
+    posture: RuntimePlanPostureSummarySchema.optional(),
     blockers: z.array(z.string()),
     nextActions: z.array(z.string())
   })
@@ -138,7 +156,20 @@ export const StartHarnessSessionOptionsSchema = z
      * conversational session — no task planning, no self-build/direction
      * blockers (config-RED, skill, and repo blockers still apply).
      */
-    purpose: z.enum(["self-build", "chat"]).default("self-build")
+    purpose: z.enum(["self-build", "chat"]).default("self-build"),
+    /**
+     * Initial work mode (IDEA-A1). Defaults to "act" so existing harness
+     * behavior is preserved; the operator enters "plan" explicitly (via
+     * `/posture plan`) when they want the read-only floor before they have
+     * accepted a plan artifact.
+     */
+    workMode: z.enum(["plan", "act", "operate"]).default("act"),
+    /**
+     * Initial approval posture (IDEA-A1). Defaults to "ask"; "auto_review"
+     * and "full" lift ordinary per-call approval but never the plan floor
+     * or the hard-edge floor.
+     */
+    approvalPosture: z.enum(["ask", "auto_review", "full"]).default("ask")
   })
   .strict()
   .refine((options) => !(options.purpose === "chat" && options.taskId), {

@@ -104,6 +104,10 @@ export interface CreateTuiStateOptions {
   readonly messageRenderers?: readonly TuiMessageRendererDescriptor[];
   readonly widgets?: readonly TuiWidgetDescriptor[];
   readonly themeId?: string;
+  /** IDEA-A1 initial workMode chip for the status foot. */
+  readonly workMode?: "plan" | "act" | "operate";
+  /** IDEA-A1 initial approvalPosture chip for the status foot. */
+  readonly approvalPosture?: "ask" | "auto_review" | "full";
 }
 
 export function createTuiState(options: CreateTuiStateOptions): TuiState {
@@ -118,7 +122,10 @@ export function createTuiState(options: CreateTuiStateOptions): TuiState {
     ...(options.sessionId !== undefined ? { sessionId: options.sessionId } : {}),
     ...(options.modelId !== undefined ? { modelId: options.modelId } : {}),
     ...(options.providerId !== undefined ? { providerId: options.providerId } : {}),
-    ...(options.thinkingLevel !== undefined ? { thinkingLevel: options.thinkingLevel } : {})
+    ...(options.thinkingLevel !== undefined ? { thinkingLevel: options.thinkingLevel } : {}),
+    ...(options.workMode !== undefined ? { workMode: options.workMode } : {}),
+    ...(options.approvalPosture !== undefined ? { approvalPosture: options.approvalPosture } : {}),
+    ...(options.workMode !== undefined ? { planFloorActive: options.workMode === "plan" } : {})
   };
 
   const picker: TuiModelPicker = {
@@ -195,6 +202,9 @@ export type TuiAction =
   | { readonly type: "set-model"; readonly modelId: string; readonly providerId?: string }
   | { readonly type: "set-thinking"; readonly level: string }
   | { readonly type: "update-usage"; readonly usage: TuiTokenUsage }
+  // IDEA-A1: posture chips. workMode flips planFloorActive; approvalPosture alone never widens the floor.
+  | { readonly type: "set-work-mode"; readonly workMode: "plan" | "act" | "operate" }
+  | { readonly type: "set-approval-posture"; readonly approvalPosture: "ask" | "auto_review" | "full" }
   // model picker
   | { readonly type: "picker-set-query"; readonly query: string }
   | { readonly type: "picker-expand-provider"; readonly providerId: string }
@@ -330,6 +340,21 @@ export function reduceTuiState(state: TuiState, action: TuiAction): TuiState {
 
     case "update-usage":
       return { ...state, status: { ...state.status, usage: action.usage } };
+
+    case "set-work-mode":
+      return {
+        ...state,
+        status: {
+          ...state.status,
+          workMode: action.workMode,
+          planFloorActive: action.workMode === "plan"
+        }
+      };
+
+    case "set-approval-posture":
+      // Approval posture alone NEVER widens the plan floor: when the current
+      // workMode is "plan", planFloorActive remains true regardless of posture.
+      return { ...state, status: { ...state.status, approvalPosture: action.approvalPosture } };
 
     case "picker-set-query":
       return { ...state, modelPicker: { ...state.modelPicker, query: action.query } };

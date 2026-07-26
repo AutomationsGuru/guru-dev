@@ -354,7 +354,12 @@ export const TuiStatusFootSchema = z
     thinkingLevel: z.string().trim().min(1).max(32).optional(),
     usage: TuiTokenUsageSchema.optional(),
     /** True while an assistant turn is streaming. */
-    busy: z.boolean().default(false)
+    busy: z.boolean().default(false),
+    /** IDEA-A1 dual-axis chips surfaced in the status foot. */
+    workMode: z.enum(["plan", "act", "operate"]).optional(),
+    approvalPosture: z.enum(["ask", "auto_review", "full"]).optional(),
+    /** True when the plan floor is currently active (workMode === "plan"). */
+    planFloorActive: z.boolean().optional()
   })
   .strict();
 export type TuiStatusFoot = z.infer<typeof TuiStatusFootSchema>;

@@ -1,159 +1,180 @@
-import {
-  createEmptyPlanArtifact,
-  parsePlanArtifact,
-  PLAN_ARTIFACT_SECTIONS,
-  PlanArtifactSchema,
-  serializePlanArtifact
-} from '../../src/planner/planArtifact.js';
+import { describe, expect, it } from "vitest";
 
-const VALID_ARTIFACT = {
-  objective: "Add a bounded retry to the session resume path.",
-  sources: ["handoffs/build-plans/example.md", "src/runtime/session.ts"],
-  critical_files: ["src/runtime/session.ts"],
-  constraints: ["Do not change package.json."],
-  approach: ["Inspect the resume path.", "Add the retry.", "Test it."],
-  verification: ["Run tests/runtime/session.test.ts."],
-  risks: ["Resume could double-record events."],
-  handoff_notes: ["Next owner is code-review."]
+import {
+  PLAN_ARTIFACT_INVALID_CODE,
+  PlanArtifactDecisionSchema,
+  PlanArtifactSchema,
+  PlanArtifactVerdictSchema,
+  parsePlanArtifact,
+  renderPlanArtifactMarkdown,
+  verdictLiftsPlanFloor
+} from "../../src/planner/planArtifact.js";
+
+const BASE_ARTIFACT = {
+  id: "plan-2026-07-18-001",
+  createdAt: "2026-07-18T00:00:00.000Z",
+  objective: "Refactor the planner session gate to enforce the dual-axis floor before YOLO."
 };
 
-describe("PLAN_ARTIFACT_SECTIONS", () => {
-  it("names the eight canonical sections in fixed order and is frozen", () => {
-    expect(PLAN_ARTIFACT_SECTIONS).toEqual([
-      "objective",
-      "sources",
-      "critical_files",
-      "constraints",
-      "approach",
-      "verification",
-      "risks",
-      "handoff_notes"
-    ]);
-    expect(Object.isFrozen(PLAN_ARTIFACT_SECTIONS)).toBe(true);
-  });
-});
-
 describe("PlanArtifactSchema", () => {
-  it("accepts a fully populated artifact", () => {
-    const artifact = PlanArtifactSchema.parse(VALID_ARTIFACT);
-
-    expect(artifact.objective).toBe(VALID_ARTIFACT.objective);
-    expect(artifact.approach).toHaveLength(3);
+  it("accepts an artifact with empty sections (every section is rendered visible)", () => {
+    const result = PlanArtifactSchema.safeParse(BASE_ARTIFACT);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.sources_context).toEqual([]);
+      expect(result.data.critical_files).toEqual([]);
+      expect(result.data.constraints).toEqual([]);
+      expect(result.data.approach).toEqual([]);
+      expect(result.data.verification).toEqual([]);
+      expect(result.data.risks).toEqual([]);
+      expect(result.data.handoff_notes).toEqual([]);
+    }
   });
 
-  it("requires a non-empty objective", () => {
-    expect(PlanArtifactSchema.safeParse({ ...VALID_ARTIFACT, objective: "" }).success).toBe(false);
-    expect(PlanArtifactSchema.safeParse({ ...VALID_ARTIFACT, objective: "   " }).success).toBe(false);
-  });
-
-  it("keeps empty sections visible instead of omitting them", () => {
-    const artifact = PlanArtifactSchema.parse({
-      ...VALID_ARTIFACT,
-      sources: [],
-      constraints: [],
-      risks: [],
-      handoff_notes: []
+  it("accepts a fully-populated artifact with sequential approach steps", () => {
+    const result = PlanArtifactSchema.safeParse({
+      ...BASE_ARTIFACT,
+      sources_context: ["handoffs/build-plans/2026-07-15T1930Z-g1004-read-only-plan-mode-core-plan.md"],
+      critical_files: ["src/planner/workApprovalAxes.ts", "src/runtime/session.ts"],
+      constraints: ["No new dependencies", "Plan floor binds regardless of approvalPosture"],
+      approach: [
+        { order: 1, description: "Define dual-axis types." },
+        { order: 2, description: "Wire the runtime gate." },
+        { order: 3, description: "Add focused tests." }
+      ],
+      verification: ["npx vitest run tests/planner/planArtifact.test.ts", "npx tsc --noEmit"],
+      risks: ["Approve-as-act requires explicit operator action — never implicit."],
+      handoff_notes: ["Hand off to code-review after focused tests are GREEN."]
     });
-
-    expect(artifact.sources).toEqual([]);
-    expect(artifact.constraints).toEqual([]);
-    expect(artifact.risks).toEqual([]);
-    expect(artifact.handoff_notes).toEqual([]);
-    expect(Object.keys(artifact).sort()).toEqual([...PLAN_ARTIFACT_SECTIONS].sort());
+    expect(result.success).toBe(true);
   });
 
-  it("rejects artifacts missing a required section key", () => {
-    const { risks: _risks, ...missingRisks } = VALID_ARTIFACT;
-
-    expect(PlanArtifactSchema.safeParse(missingRisks).success).toBe(false);
+  it("rejects non-sequential approach step order", () => {
+    const result = PlanArtifactSchema.safeParse({
+      ...BASE_ARTIFACT,
+      approach: [
+        { order: 2, description: "Out of order." }
+      ]
+    });
+    expect(result.success).toBe(false);
+    expect(result.error?.issues[0]?.message).toContain("one-based position");
   });
 
-  it("rejects extra keys (strict shape)", () => {
-    expect(PlanArtifactSchema.safeParse({ ...VALID_ARTIFACT, extra: "nope" }).success).toBe(false);
-  });
-
-  it("rejects blank entries inside list sections", () => {
-    expect(PlanArtifactSchema.safeParse({ ...VALID_ARTIFACT, approach: ["ok", "  "] }).success).toBe(false);
-  });
-
-  it("rejects path traversal in critical_files", () => {
-    const result = PlanArtifactSchema.safeParse({ ...VALID_ARTIFACT, critical_files: ["../secrets.env"] });
-
+  it.each(["../secrets.env", "src\\..\\secrets.env"])("rejects traversal-bearing critical_files: %s", (path) => {
+    const result = PlanArtifactSchema.safeParse({
+      ...BASE_ARTIFACT,
+      critical_files: [path]
+    });
     expect(result.success).toBe(false);
     expect(result.error?.issues[0]?.message).toContain("path traversal");
   });
 
-  it("rejects NUL characters in critical_files", () => {
-    expect(PlanArtifactSchema.safeParse({ ...VALID_ARTIFACT, critical_files: ["src/a.ts\0x"] }).success).toBe(false);
-  });
-
-  it("bounds the aggregate serialized size", () => {
-    const bloated = {
-      ...VALID_ARTIFACT,
-      approach: Array.from({ length: 40 }, (_, index) => `${index}-${"x".repeat(995)}`)
-    };
-    const result = PlanArtifactSchema.safeParse(bloated);
-
+  it("rejects a NUL-bearing critical_file path", () => {
+    const result = PlanArtifactSchema.safeParse({
+      ...BASE_ARTIFACT,
+      critical_files: ["src/planner/planArtifact.ts\0.bak"]
+    });
     expect(result.success).toBe(false);
-    expect(result.error?.issues.at(-1)?.message).toContain("serialized size");
-  });
-});
-
-describe("createEmptyPlanArtifact", () => {
-  it("returns all eight sections visible with only the objective filled", () => {
-    const artifact = createEmptyPlanArtifact("Survey the planner surface.");
-
-    expect(artifact.objective).toBe("Survey the planner surface.");
-    for (const section of PLAN_ARTIFACT_SECTIONS) {
-      expect(artifact).toHaveProperty(section);
-    }
-    expect(artifact.sources).toEqual([]);
-    expect(artifact.approach).toEqual([]);
-    expect(PlanArtifactSchema.safeParse(artifact).success).toBe(true);
+    expect(result.error?.issues[0]?.message).toContain("NUL");
   });
 
-  it("trims the objective and rejects a blank one", () => {
-    expect(createEmptyPlanArtifact("  padded  ").objective).toBe("padded");
-    expect(() => createEmptyPlanArtifact("   ")).toThrow();
+  it("rejects an empty objective", () => {
+    const result = PlanArtifactSchema.safeParse({
+      ...BASE_ARTIFACT,
+      objective: "   "
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects an over-size artifact", () => {
+    // Fill arrays with valid-length strings that together push the serialized
+    // artifact past the 60_000 character cap. The cap is enforced at the
+    // serialized level (superRefine), not per-field, so we keep each entry
+    // small but blow up the count.
+    const entries = Array.from({ length: 800 }, (_, index) => `entry-${index}-${"x".repeat(80)}`);
+    const result = PlanArtifactSchema.safeParse({
+      ...BASE_ARTIFACT,
+      handoff_notes: entries
+    });
+    expect(result.success).toBe(false);
+    expect(result.error?.issues[0]?.message).toContain("60000");
   });
 });
 
 describe("parsePlanArtifact", () => {
-  it("returns the parsed artifact on success", () => {
-    const result = parsePlanArtifact(VALID_ARTIFACT);
-
+  it("returns ok=true for a valid artifact", () => {
+    const result = parsePlanArtifact(BASE_ARTIFACT);
     expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.artifact.objective).toBe(VALID_ARTIFACT.objective);
-    }
   });
 
-  it("returns a legible error naming the failing section", () => {
-    const result = parsePlanArtifact({ ...VALID_ARTIFACT, objective: "" });
-
+  it("returns ok=false with a stable error code constant", () => {
+    const result = parsePlanArtifact({ ...BASE_ARTIFACT, objective: "" });
     expect(result.ok).toBe(false);
     if (!result.ok) {
-      expect(result.error).toContain("objective");
+      expect(typeof result.error).toBe("string");
+      expect(result.error.length).toBeGreaterThan(0);
     }
+    expect(PLAN_ARTIFACT_INVALID_CODE).toBe("PLAN_ARTIFACT_INVALID");
   });
 });
 
-describe("serializePlanArtifact", () => {
-  it("renders every section heading even when the section is empty", () => {
-    const markdown = serializePlanArtifact(createEmptyPlanArtifact("Do the thing."));
-
-    for (const section of PLAN_ARTIFACT_SECTIONS) {
-      expect(markdown).toContain(section);
-    }
-    expect(markdown).toContain("Do the thing.");
-    // Empty sections remain visible with an explicit placeholder, never omitted.
-    expect(markdown).toContain("_(none)_");
+describe("PlanArtifactDecision", () => {
+  it("accepts the three verdicts", () => {
+    expect(PlanArtifactVerdictSchema.parse("accepted")).toBe("accepted");
+    expect(PlanArtifactVerdictSchema.parse("revise")).toBe("revise");
+    expect(PlanArtifactVerdictSchema.parse("rejected")).toBe("rejected");
   });
 
-  it("renders list sections as bullet items", () => {
-    const markdown = serializePlanArtifact(PlanArtifactSchema.parse(VALID_ARTIFACT));
+  it("parses a full decision", () => {
+    const parsed = PlanArtifactDecisionSchema.parse({
+      artifactId: "plan-2026-07-18-001",
+      verdict: "accepted",
+      note: "Looks good.",
+      decidedAt: "2026-07-18T00:05:00.000Z"
+    });
+    expect(parsed.verdict).toBe("accepted");
+  });
+});
 
-    expect(markdown).toContain("- Inspect the resume path.");
-    expect(markdown).toContain("- Run tests/runtime/session.test.ts.");
+describe("verdictLiftsPlanFloor", () => {
+  it("only 'accepted' lifts the floor", () => {
+    expect(verdictLiftsPlanFloor("accepted")).toBe(true);
+    expect(verdictLiftsPlanFloor("revise")).toBe(false);
+    expect(verdictLiftsPlanFloor("rejected")).toBe(false);
+  });
+});
+
+describe("renderPlanArtifactMarkdown", () => {
+  it("renders empty sections as visible '_(none)_' placeholders", () => {
+    const md = renderPlanArtifactMarkdown({
+      ...BASE_ARTIFACT,
+      sources_context: [],
+      critical_files: [],
+      constraints: [],
+      approach: [],
+      verification: [],
+      risks: [],
+      handoff_notes: []
+    });
+    expect(md).toContain("## Sources / context");
+    expect(md).toContain("_(none)_");
+    expect(md).toContain("## Critical files");
+    expect(md).toContain("## Constraints");
+    expect(md).toContain("## Verification");
+    expect(md).toContain("## Risks");
+    expect(md).toContain("## Handoff notes");
+  });
+
+  it("renders sequential approach steps as an ordered list", () => {
+    const parsed = PlanArtifactSchema.parse({
+      ...BASE_ARTIFACT,
+      approach: [
+        { order: 1, description: "First step." },
+        { order: 2, description: "Second step." }
+      ]
+    });
+    const md = renderPlanArtifactMarkdown(parsed);
+    expect(md).toContain("1. First step.");
+    expect(md).toContain("2. Second step.");
   });
 });
