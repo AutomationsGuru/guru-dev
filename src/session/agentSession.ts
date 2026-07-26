@@ -1,5 +1,10 @@
 import { directAgentTurn, type AgentToolEvent, type AgentTurnResult } from "../model/agentTurn.js";
 import type { ChatTurnMessage } from "../model/directChat.js";
+import type { ProviderAdapter } from "../providers/types/provider.js";
+import { createProvider } from "../providers/factory.js";
+import type { GuruHarnessConfig, loadProviderConfig } from "../config/providerConfig.js";
+import { mapProviderError } from "../providers/errors/mapper.js";
+import { GuruError } from "../providers/types/errors.js";
 import { runCompaction, type SummarizeRequest, type Summarizer } from "../compaction/engine.js";
 import type { CompactionConfig, CompactionState } from "../compaction/schemas.js";
 import {
@@ -125,6 +130,12 @@ export interface AgentSessionDeps {
   readonly now?: () => Date;
   /** Operator question handler — called by operator.answer RPC to resolve agent questions. */
   readonly answerHandler?: (questionId: string) => Promise<string> | string;
+  /**
+   * Provider configuration for multi-LLM support (T6.5).
+   * When provided, creates a ProviderAdapter for the specified provider.
+   * Falls back to route-based direct chat when not specified.
+   */
+  readonly providerConfig?: GuruHarnessConfig;
 }
 
 interface QueuedSteer {
@@ -179,12 +190,33 @@ export class AgentSession {
   private pendingQuestions = new Map<string, { resolve: (answer: string) => void; reject: (error: Error) => void }>();
   private compactionRunning = false;
   private lastCompaction: CompactionState | null = null;
+  /**
+   * Provider adapter for multi-LLM wire compatibility (T6.5).
+   * Created from providerConfig in deps when provided.
+   * When present, enables provider-agnostic request/response handling.
+   */
+  private providerAdapter: ProviderAdapter | null = null;
 
   constructor(deps: AgentSessionDeps) {
     this.deps = deps;
     this.runTurn = deps.runTurn ?? directAgentTurn;
     this.selectedRoute = deps.route;
     this.selectedModelIdOverride = deps.modelIdOverride ?? null;
+
+    // T6.5: Create provider adapter from config if provided
+    if (deps.providerConfig) {
+      try {
+        this.providerAdapter = createProvider(deps.providerConfig.provider, {
+          apiKey: deps.providerConfig.apiKey,
+          baseUrl: deps.providerConfig.baseUrl,
+          model: deps.providerConfig.model,
+        });
+      } catch (error) {
+        // Log but don't fail - fall back to route-based direct chat
+        console.warn("[AgentSession] Failed to create provider adapter:", error);
+      }
+    }
+
     if (deps.systemPrompt && deps.systemPrompt.length > 0) {
       this.history.push({ role: "system", content: deps.systemPrompt });
     }
@@ -192,6 +224,48 @@ export class AgentSession {
 
   get activeRoute(): ProviderRouteDescriptor {
     return this.selectedRoute;
+  }
+
+  /**
+   * Get the active provider adapter if configured (T6.5).
+   * Returns null when using route-based direct chat (legacy path).
+   */
+  get activeProvider(): ProviderAdapter | null {
+    return this.providerAdapter;
+  }
+
+  /**
+   * Switch to a different provider at runtime (T6.5).
+   * Creates a new adapter for the specified provider configuration.
+   */
+  switchProvider(config: GuruHarnessConfig): {
+    readonly previous: { readonly provider: string; readonly model: string } | null;
+    readonly current: { readonly provider: string; readonly model: string };
+  } {
+    if (this.currentAbort) {
+      throw new Error("AgentSession: session is busy; cannot switch providers while a turn is running.");
+    }
+
+    const previous = this.providerAdapter
+      ? { provider: this.deps.providerConfig?.provider ?? "unknown", model: this.deps.providerConfig?.model ?? "unknown" }
+      : null;
+
+    try {
+      this.providerAdapter = createProvider(config.provider, {
+        apiKey: config.apiKey,
+        baseUrl: config.baseUrl,
+        model: config.model,
+      });
+      // Update deps reference for introspection
+      (this.deps as { providerConfig?: GuruHarnessConfig }).providerConfig = config;
+    } catch (error) {
+      throw new Error(`Failed to switch provider to ${config.provider}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    return {
+      previous,
+      current: { provider: config.provider, model: config.model },
+    };
   }
 
   switchRoute(route: ProviderRouteDescriptor): {
@@ -745,3 +819,11 @@ export class AgentSession {
     };
   }
 }
+
+/**
+ * Error handling utilities exposed via agent session
+ *
+ * These utilities allow callers to normalize provider errors
+ * using the centralized error mapper.
+ */
+export { mapProviderError, GuruError } from '../providers/errors/mapper';
