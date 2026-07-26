@@ -1,108 +1,164 @@
 import {
   MessagingConnectorConfigSchema,
-  type MessagingConnectorConfigInput,
+  MessagingConnectorIdSchema,
+  MessagingConnectorMessageSchema,
+  MessagingConnectorSendResultSchema,
+  MessagingConnectorStatusSchema,
+  type MessagingConnectorConfig,
+  type MessagingConnectorId,
+  type MessagingConnectorMessage,
+  type MessagingConnectorMessageInput,
+  type MessagingConnectorParityGapId,
   type MessagingConnectorSendResult,
-  type MessagingConnectorStatus
+  type MessagingConnectorStatus,
+  type MessagingConnectorState
 } from "./messagingConnectorSchema.js";
 
 /**
- * IDEA-F73 ATTACH stub: interface-only registry for external messaging
- * connectors (Slack, Teams, Discord, generic). Mirrors the src/mcp/attach.ts
- * posture — honest default-disabled status, never a surprise network call.
- *
- * A connector may only be enabled when a parity gap id (e.g. "R-CL-CONNECT")
- * is attached, so enablement is always traceable to a tracked gap. The noop
- * implementation performs zero I/O and reports itself as a stub.
+ * Small ATTACH seam for external messaging. Implementations remain optional and
+ * replaceable; the default connector performs no network or provider I/O.
  */
-
-export const MESSAGING_CONNECTOR_PARITY_GAP_PREFIX = "MessagingConnectorParityGapRequired";
-
-export class MessagingConnectorParityGapError extends Error {
-  public readonly connectorId: string;
-
-  constructor(connectorId: string) {
-    super(
-      `${MESSAGING_CONNECTOR_PARITY_GAP_PREFIX}: connector "${connectorId}" cannot be enabled without a parityGapId (e.g. "R-CL-CONNECT").`
-    );
-    this.name = "MessagingConnectorParityGapError";
-    this.connectorId = connectorId;
-  }
-}
-
 export interface MessagingConnector {
-  readonly id: string;
-  readonly status: MessagingConnectorStatus;
+  readonly id: MessagingConnectorId;
   connect(): Promise<void>;
   disconnect(): Promise<void>;
-  send(message: string): Promise<MessagingConnectorSendResult>;
+  send(message: MessagingConnectorMessageInput): Promise<MessagingConnectorSendResult>;
 }
 
-function parseConfig(config: MessagingConnectorConfigInput) {
-  const result = MessagingConnectorConfigSchema.safeParse(config);
-  if (!result.success) {
-    const gapIssue = result.error.issues.find((issue) => issue.path.includes("parityGapId"));
-    if (gapIssue) {
-      const id = typeof config === "object" && config && "id" in config ? String(config.id) : "unknown";
-      throw new MessagingConnectorParityGapError(id);
-    }
-    throw result.error;
+export class NoopMessagingConnector implements MessagingConnector {
+  readonly id: MessagingConnectorId;
+
+  constructor(id: string) {
+    this.id = MessagingConnectorIdSchema.parse(id);
   }
-  // Defense-in-depth: the schema's superRefine already enforces this invariant.
-  if (result.data.enabled && !result.data.parityGapId) {
-    throw new MessagingConnectorParityGapError(result.data.id);
+
+  async connect(): Promise<void> {
+    // Deliberately empty: ATTACH is disabled/no-op until an explicit adapter is supplied.
   }
-  return result.data;
+
+  async disconnect(): Promise<void> {
+    // Deliberately empty: there is no external resource to release.
+  }
+
+  async send(message: MessagingConnectorMessage): Promise<MessagingConnectorSendResult> {
+    const parsedMessage = MessagingConnectorMessageSchema.parse(message);
+    return MessagingConnectorSendResultSchema.parse({
+      connectorId: this.id,
+      status: "noop",
+      message: parsedMessage,
+      summary: `${this.id} messaging connector is a no-op; nothing was sent.`
+    });
+  }
 }
 
-export function createNoopMessagingConnector(config: MessagingConnectorConfigInput): MessagingConnector {
-  const parsed = parseConfig(config);
-  let status: MessagingConnectorStatus = parsed.enabled ? "ready" : "disabled";
+export interface MessagingConnectorRegistryOptions {
+  readonly connector: MessagingConnector;
+  readonly config?: Partial<MessagingConnectorConfig> & { readonly id?: string };
+}
 
-  return {
-    id: parsed.id,
-    get status() {
-      return status;
-    },
-    async connect() {
-      if (!parsed.enabled) {
-        status = "disabled";
-        return;
-      }
-      // Stub wave: no real provider session exists; enabling surfaces the
-      // connector as "enabled" without performing any network I/O.
-      status = "enabled";
-    },
-    async disconnect() {
-      status = parsed.enabled ? "ready" : "disabled";
-    },
-    async send(_message: string): Promise<MessagingConnectorSendResult> {
-      // Noop stub: never throws, never delivers, never performs network I/O.
-      return {
-        delivered: false,
-        reason: "noop-stub",
-        connectorId: parsed.id
-      };
+/**
+ * Registry for one attached messaging connector. A connector is disabled by
+ * default, and enablement is structurally tied to a recorded parity gap.
+ */
+export class MessagingConnectorRegistry {
+  private readonly connector: MessagingConnector;
+  private config: MessagingConnectorConfig;
+  private state: MessagingConnectorState;
+
+  constructor(options: MessagingConnectorRegistryOptions) {
+    this.connector = options.connector;
+    this.config = MessagingConnectorConfigSchema.parse({ id: options.connector.id, ...options.config });
+    this.state = this.config.enabled ? "disconnected" : "disabled";
+  }
+
+  status(id: string = this.connector.id): MessagingConnectorStatus {
+    if (id !== this.connector.id) {
+      throw new Error(`Messaging connector ${id} is not registered.`);
     }
-  };
+    return MessagingConnectorStatusSchema.parse({
+      id: this.config.id,
+      enabled: this.config.enabled,
+      ...(this.config.parityGapId ? { parityGapId: this.config.parityGapId } : {}),
+      state: this.state,
+      summary: this.summary()
+    });
+  }
+
+  enable(id: string = this.connector.id, parityGapId?: string): MessagingConnectorStatus {
+    this.assertId(id);
+    const parsedGapId = parityGapId ?? this.config.parityGapId;
+    if (!parsedGapId) {
+      throw new Error(`Cannot enable ${this.config.id}: an ATTACH parity-gap id is required.`);
+    }
+    this.config = MessagingConnectorConfigSchema.parse({ ...this.config, enabled: true, parityGapId: parsedGapId });
+    this.state = "disconnected";
+    return this.status();
+  }
+
+  disable(id: string = this.connector.id): MessagingConnectorStatus {
+    this.assertId(id);
+    this.config = MessagingConnectorConfigSchema.parse({ ...this.config, enabled: false });
+    this.state = "disabled";
+    return this.status();
+  }
+
+  async connect(id: string = this.connector.id): Promise<MessagingConnectorStatus> {
+    this.assertId(id);
+    this.assertEnabled();
+    try {
+      await this.connector.connect();
+      this.state = "connected";
+    } catch (error) {
+      this.state = "error";
+      throw error;
+    }
+    return this.status();
+  }
+
+  async disconnect(id: string = this.connector.id): Promise<MessagingConnectorStatus> {
+    this.assertId(id);
+    if (this.state === "connected") {
+      await this.connector.disconnect();
+    }
+    if (this.config.enabled) {
+      this.state = "disconnected";
+    }
+    return this.status();
+  }
+
+  async send(id: string, message: MessagingConnectorMessage): Promise<MessagingConnectorSendResult> {
+    this.assertId(id);
+    this.assertEnabled();
+    if (this.state !== "connected") {
+      throw new Error(`Messaging connector ${this.config.id} is not connected.`);
+    }
+    return MessagingConnectorSendResultSchema.parse(await this.connector.send(MessagingConnectorMessageSchema.parse(message)));
+  }
+
+  private assertId(id: string): void {
+    if (id !== this.connector.id) {
+      throw new Error(`Messaging connector ${id} is not registered.`);
+    }
+  }
+
+  private assertEnabled(): void {
+    if (!this.config.enabled) {
+      throw new Error(`Messaging connector ${this.config.id} is disabled.`);
+    }
+    // The config schema enforces this too; keep the runtime guard at the lifecycle edge.
+    if (!this.config.parityGapId) {
+      throw new Error(`Messaging connector ${this.config.id} cannot run without an ATTACH parity-gap id.`);
+    }
+  }
+
+  private summary(): string {
+    if (!this.config.enabled) return `${this.config.id} messaging connector is disabled.`;
+    return `${this.config.id} messaging connector is ${this.state}; ATTACH parity gap ${this.config.parityGapId} remains tracked.`;
+  }
 }
 
-/** Small in-memory registry; connectors default to disabled. */
-const connectors = new Map<string, MessagingConnector>();
-
-export function registerConnector(config: MessagingConnectorConfigInput): MessagingConnector {
-  const connector = createNoopMessagingConnector(config);
-  connectors.set(connector.id, connector);
-  return connector;
+export function createMessagingConnectorRegistry(options: MessagingConnectorRegistryOptions): MessagingConnectorRegistry {
+  return new MessagingConnectorRegistry(options);
 }
 
-export function getConnector(id: string): MessagingConnector | undefined {
-  return connectors.get(id);
-}
-
-export function listConnectors(): readonly MessagingConnector[] {
-  return [...connectors.values()];
-}
-
-export function removeConnector(id: string): boolean {
-  return connectors.delete(id);
-}
+export type { MessagingConnectorConfig, MessagingConnectorId, MessagingConnectorMessage, MessagingConnectorParityGapId, MessagingConnectorSendResult, MessagingConnectorStatus } from "./messagingConnectorSchema.js";

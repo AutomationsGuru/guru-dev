@@ -1,40 +1,41 @@
 import { z } from "zod";
 
-/**
- * IDEA-F73 ATTACH stub: schemas for external messaging connector config/state.
- *
- * Interface-only wave — no real provider traffic exists behind these shapes.
- * Secrets are referenced by presence-over-value (env var names), never stored;
- * the config map enforces env-var-NAME-shaped values at the schema level.
- * Enablement is schema-gated: enabled=true without parityGapId fails to parse.
- */
-
-export const MessagingConnectorKindSchema = z.enum(["slack", "teams", "discord", "generic"]);
-export type MessagingConnectorKind = z.infer<typeof MessagingConnectorKindSchema>;
-
-export const MessagingConnectorStatusSchema = z.enum(["disabled", "ready", "enabled", "error"]);
-export type MessagingConnectorStatus = z.infer<typeof MessagingConnectorStatusSchema>;
-
-const EnvVarNameSchema = z
+/** External messaging is an ATTACH-class extension, never a core dependency. */
+export const MessagingConnectorIdSchema = z
   .string()
   .trim()
-  .regex(/^[A-Z][A-Z0-9_]*$/u, "Expected an environment variable name, not a value.");
+  .regex(/^[a-z][a-z0-9._-]{0,63}$/u, "Connector id must be a lowercase slug (max 64 characters).");
+export type MessagingConnectorId = z.infer<typeof MessagingConnectorIdSchema>;
 
-/**
- * Presence-over-value config map: values are env var NAMES only (e.g. a
- * tokenEnvVar-style entry maps to GURU_SLACK_TOKEN). Raw secret values and any
- * non-env-name-shaped string are rejected by the schema.
- */
-export const MessagingConnectorConfigMapSchema = z.record(z.string(), EnvVarNameSchema);
-export type MessagingConnectorConfigMap = z.infer<typeof MessagingConnectorConfigMapSchema>;
+export const MessagingConnectorParityGapIdSchema = z.string().trim().min(1, "A parity-gap id is required for an enabled connector.");
+export type MessagingConnectorParityGapId = z.infer<typeof MessagingConnectorParityGapIdSchema>;
+
+export const MessagingConnectorMessageSchema = z
+  .object({
+    recipient: z.string().trim().min(1),
+    text: z.string().min(1),
+    threadId: z.string().trim().min(1).optional(),
+    metadata: z.record(z.string(), z.unknown()).default({})
+  })
+  .strict();
+export type MessagingConnectorMessage = z.infer<typeof MessagingConnectorMessageSchema>;
+export type MessagingConnectorMessageInput = z.input<typeof MessagingConnectorMessageSchema>;
+
+export const MessagingConnectorSendResultSchema = z
+  .object({
+    connectorId: MessagingConnectorIdSchema,
+    status: z.enum(["sent", "noop", "failed"]),
+    message: MessagingConnectorMessageSchema,
+    summary: z.string().trim().min(1)
+  })
+  .strict();
+export type MessagingConnectorSendResult = z.infer<typeof MessagingConnectorSendResultSchema>;
 
 export const MessagingConnectorConfigSchema = z
   .object({
-    id: z.string().trim().min(1),
-    kind: MessagingConnectorKindSchema,
+    id: MessagingConnectorIdSchema,
     enabled: z.boolean().default(false),
-    parityGapId: z.string().trim().min(1).optional(),
-    config: MessagingConnectorConfigMapSchema.default({})
+    parityGapId: MessagingConnectorParityGapIdSchema.optional()
   })
   .strict()
   .superRefine((value, ctx) => {
@@ -42,29 +43,22 @@ export const MessagingConnectorConfigSchema = z
       ctx.addIssue({
         code: "custom",
         path: ["parityGapId"],
-        message: `parityGapId (e.g. "R-CL-CONNECT") is required to enable connector "${value.id}".`
+        message: "Enabled messaging connectors require a parity-gap id."
       });
     }
   });
 export type MessagingConnectorConfig = z.infer<typeof MessagingConnectorConfigSchema>;
-/** Input shape: fields with schema defaults (enabled, config) may be omitted. */
-export type MessagingConnectorConfigInput = z.input<typeof MessagingConnectorConfigSchema>;
 
-export const MessagingConnectorStateSchema = z
+export const MessagingConnectorStateSchema = z.enum(["disabled", "disconnected", "connected", "error"]);
+export type MessagingConnectorState = z.infer<typeof MessagingConnectorStateSchema>;
+
+export const MessagingConnectorStatusSchema = z
   .object({
-    connectorId: z.string().trim().min(1),
-    status: MessagingConnectorStatusSchema,
-    parityGapId: z.string().trim().min(1).optional(),
+    id: MessagingConnectorIdSchema,
+    enabled: z.boolean(),
+    parityGapId: MessagingConnectorParityGapIdSchema.optional(),
+    state: MessagingConnectorStateSchema,
     summary: z.string().trim().min(1)
   })
   .strict();
-export type MessagingConnectorState = z.infer<typeof MessagingConnectorStateSchema>;
-
-export const MessagingConnectorSendResultSchema = z
-  .object({
-    delivered: z.boolean(),
-    reason: z.string().trim().min(1),
-    connectorId: z.string().trim().min(1)
-  })
-  .strict();
-export type MessagingConnectorSendResult = z.infer<typeof MessagingConnectorSendResultSchema>;
+export type MessagingConnectorStatus = z.infer<typeof MessagingConnectorStatusSchema>;
