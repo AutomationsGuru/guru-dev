@@ -44,13 +44,6 @@ import {
   type ApiEventStreamHub,
   type ApiEventStreamHubOptions
 } from "./apiEventStream.js";
-import {
-  createWorkspaceBus,
-  type WorkspaceBus,
-  type WorkspaceBusEvent,
-  type WorkspaceBusOptions,
-  type WorkspaceSummary
-} from "./workspaceBus.js";
 
 export interface ApiHealthReport {
   runtime: string;
@@ -128,17 +121,6 @@ export interface ApiSessionListRequest {
   limit?: number;
 }
 
-export interface ApiWorkspaceListRequest {
-  cwd?: string;
-}
-
-/** IDEA-D2 live workspace bus snapshot: attached client counts + busy signal per workspace. */
-export interface ApiWorkspaceListReport {
-  readonly route: "workspace-list";
-  readonly workspaces: readonly WorkspaceSummary[];
-  readonly count: number;
-}
-
 export interface ApiSessionListReport {
   readonly route: "session-list";
   readonly sessions: readonly PersistedSessionListItem[];
@@ -155,13 +137,7 @@ export interface ApiSessionInspectionSummary {
 }
 
 export interface ApiSessionTimelineEvent {
-  /**
-   * A persisted session event type, or "workspace.event" for IDEA-D2 workspace-bus
-   * frames (attach/detach/flags/busy signals). Workspace frames are live-only —
-   * they are streamed over the workspace SSE hub and never written to session
-   * persistence.
-   */
-  readonly type: PersistedSessionEventType | "workspace.event";
+  readonly type: PersistedSessionEventType;
   readonly sessionId: string;
   readonly createdAt: string;
   readonly summary: string;
@@ -201,6 +177,7 @@ export interface ApiRunRequest {
   resumeSessionId?: string;
   includeReviewGate?: boolean;
   git?: ApiRunGitOptions;
+  mandate?: MandateState;
 }
 
 export interface ApiToolRunRequest {
@@ -225,7 +202,6 @@ export interface ApiHandlers {
   readonly sessionList?: (request: ApiSessionListRequest) => Promise<unknown>;
   readonly toolRun?: (request: ApiToolRunRequest) => Promise<unknown>;
   readonly run?: (request: ApiRunRequest) => Promise<unknown>;
-  readonly workspaceList?: (request: ApiWorkspaceListRequest) => Promise<ApiWorkspaceListReport>;
   readonly health?: () => Promise<ApiHealthReport>;
 }
 
@@ -263,11 +239,6 @@ export interface ApiServerOptions {
    * `heartbeatIntervalMs` (comment heartbeats) through the hub seam.
    */
   readonly eventStream?: ApiEventStreamHubOptions;
-  /**
-   * IDEA-D2 workspace bus tuning (busy event-type set, client id seam). The bus
-   * cwd is always the API process cwd; omit for production defaults.
-   */
-  readonly workspaceBus?: Omit<WorkspaceBusOptions, "cwd">;
 }
 
 /** The secure headless default: no grants, no YOLO → mutations are denied. */
@@ -315,26 +286,12 @@ export async function startHarnessApiServer(options: ApiServerOptions = {}): Pro
   // G853: one bounded SSE hub per server. Always created so the stream endpoints
   // exist; only the default session lifecycle publishes into it.
   const eventStream = createApiEventStreamHub(options.eventStream);
-  // IDEA-D2: one workspace bus per server, keyed by resolved cwd = the API
-  // process cwd. Session lifecycle notes feed isBusy; SSE attach feeds counts.
-  const workspaceBus = createWorkspaceBus({ cwd: process.cwd(), ...options.workspaceBus });
-  const workspaceEventStream = createApiEventStreamHub(options.eventStream);
-  const unsubscribeWorkspaceBus = workspaceBus.subscribe((event) => {
-    workspaceEventStream.publish({
-      type: "workspace.event",
-      sessionId: "",
-      createdAt: new Date().toISOString(),
-      summary: summarizeWorkspaceBusEvent(event),
-      metadata: workspaceBusEventMetadata(event)
-    });
-  });
   const defaultContext = createDefaultApiHandlers(
     runtime,
     mandatePolicy,
     options.runExecutor ?? runSelfBuildExecutor,
     options.runCycle ?? runDevCycle,
-    eventStream,
-    workspaceBus
+    eventStream
   );
   const selectedHealth = options.handlers?.health ?? defaultContext.handlers.health;
   const handlers: Required<ApiHandlers> = {
@@ -348,7 +305,6 @@ export async function startHarnessApiServer(options: ApiServerOptions = {}): Pro
     sessionList: options.handlers?.sessionList ?? defaultContext.handlers.sessionList,
     toolRun: options.handlers?.toolRun ?? defaultContext.handlers.toolRun,
     run: options.handlers?.run ?? defaultContext.handlers.run,
-    workspaceList: options.handlers?.workspaceList ?? defaultContext.handlers.workspaceList,
     health: async () => ({
       ...await selectedHealth(),
       boot: bootReport
@@ -357,8 +313,6 @@ export async function startHarnessApiServer(options: ApiServerOptions = {}): Pro
   const routeOptions = {
     allowRunSafetyOverrides: options.allowRunSafetyOverrides ?? false,
     eventStream,
-    workspaceBus,
-    workspaceEventStream,
     hasSession: defaultContext.hasSession
   };
 
@@ -398,10 +352,6 @@ export async function startHarnessApiServer(options: ApiServerOptions = {}): Pro
         // G853: stop heartbeats and end SSE subscribers first so open event-stream
         // clients never keep server.close() (and this handle) pending.
         eventStream.close();
-        // IDEA-D2: same teardown for the workspace bus + its event hub.
-        unsubscribeWorkspaceBus();
-        workspaceEventStream.close();
-        workspaceBus.close();
         await new Promise<void>((resolve, reject) => {
         // Drop keep-alive clients so close() does not hang the next test.
           server.closeAllConnections?.();
@@ -472,20 +422,10 @@ function createDefaultApiHandlers(
   mandatePolicy: ApiRunMandatePolicy,
   runExecutor: ApiRunExecutor,
   runCycle: ApiRunCycle,
-  eventStream: ApiEventStreamHub,
-  workspaceBus: WorkspaceBus
+  eventStream: ApiEventStreamHub
 ): DefaultApiContext {
   const sessions = new Map<string, HarnessSession>();
   const sessionEvents = new Map<string, ApiSessionTimelineEvent[]>();
-  const noteSessionEvent = (event: ApiSessionTimelineEvent, cwd?: string): void => {
-    appendSessionEvent(sessionEvents, event, eventStream);
-    // IDEA-D2: the same lifecycle event feeds the workspace busy signal.
-    if (event.type === "session.started") {
-      workspaceBus.noteSessionStarted({ sessionId: event.sessionId, ...(cwd !== undefined ? { cwd } : {}) });
-    } else if (event.type !== "session.resumed" && event.type !== "workspace.event") {
-      workspaceBus.noteTimelineEvent({ sessionId: event.sessionId, type: event.type, ...(cwd !== undefined ? { cwd } : {}) });
-    }
-  };
 
   return {
     handlers: {
@@ -494,7 +434,7 @@ function createDefaultApiHandlers(
       startSession: async (request) => {
         const session = await runtime.startSession(request);
         sessions.set(session.id, session);
-        noteSessionEvent(createSessionStartedEvent(session), request.cwd);
+        appendSessionEvent(sessionEvents, createSessionStartedEvent(session), eventStream);
 
         return session;
       },
@@ -503,24 +443,12 @@ function createDefaultApiHandlers(
       sessionInspect: async (request) => defaultSessionInspection(runtime, sessions, sessionEvents, eventStream, request),
       sessionContinue: async (request) => defaultSessionContinuation(runtime, sessions, sessionEvents, eventStream, request),
       sessionList: async (request) => defaultSessionList(runtime, request),
-      toolRun: async (request) => defaultToolRun(runtime, sessions, noteSessionEvent, request),
+      toolRun: async (request) => defaultToolRun(runtime, sessions, sessionEvents, eventStream, request),
       run: async (request) => defaultRun(request, mandatePolicy, runExecutor, runCycle),
-      workspaceList: async (request) => defaultWorkspaceList(workspaceBus, request),
       health: defaultHealth
     },
     hasSession: (sessionId) => sessionEvents.has(sessionId)
   };
-}
-
-function defaultWorkspaceList(workspaceBus: WorkspaceBus, request: ApiWorkspaceListRequest): ApiWorkspaceListReport {
-  if (request.cwd !== undefined) {
-    const workspace = workspaceBus.workspace(request.cwd);
-    const workspaces = workspace ? [{ workspaceKey: workspace.workspaceKey, attachedClients: workspace.attachedClients, isBusy: workspace.isBusy }] : [];
-    return { route: "workspace-list", workspaces, count: workspaces.length };
-  }
-
-  const workspaces = workspaceBus.snapshot();
-  return { route: "workspace-list", workspaces, count: workspaces.length };
 }
 
 async function defaultSessionStatus(
@@ -664,7 +592,8 @@ async function defaultSessionContinuation(
 async function defaultToolRun(
   runtime: HarnessRuntime,
   sessions: Map<string, HarnessSession>,
-  noteSessionEvent: (event: ApiSessionTimelineEvent, cwd?: string) => void,
+  sessionEvents: Map<string, ApiSessionTimelineEvent[]>,
+  eventStream: ApiEventStreamHub,
   request: ApiToolRunRequest
 ): Promise<unknown> {
   if (!request.toolId) {
@@ -689,13 +618,13 @@ async function defaultToolRun(
 
   sessions.set(session.id, session);
   if (request.sessionId && !localSession) {
-    noteSessionEvent(createSessionResumedEvent(session, request.sessionId), request.cwd);
+    appendSessionEvent(sessionEvents, createSessionResumedEvent(session, request.sessionId), eventStream);
   } else if (!request.sessionId) {
-    noteSessionEvent(createSessionStartedEvent(session), request.cwd);
+    appendSessionEvent(sessionEvents, createSessionStartedEvent(session), eventStream);
   }
 
   const observation = await runtime.executeTool(session.id, request.toolId, request.input ?? {});
-  noteSessionEvent(createToolObservationEvent(session.id, request.toolId, observation.status, observation.error), request.cwd);
+  appendSessionEvent(sessionEvents, createToolObservationEvent(session.id, request.toolId, observation.status, observation.error), eventStream);
 
   return { session, observation };
 }
@@ -749,15 +678,13 @@ const RUNTIME_NAME = "GuruHarness";
 async function defaultHealth(): Promise<ApiHealthReport> {
   return {
     runtime: RUNTIME_NAME,
-    endpoints: ["GET /", "GET /health", "GET /self-build-plan", "GET /direction-check", "POST /session-start", "GET /sessions", "GET /events", "GET /workspaces", "GET /workspace/events", "GET /sessions/:sessionId", "GET /sessions/:sessionId/events", "GET /sessions/:sessionId/events/stream", "GET /sessions/:sessionId/inspect", "GET /sessions/:sessionId/continue", "POST /tool-run", "POST /run"]
+    endpoints: ["GET /", "GET /health", "GET /self-build-plan", "GET /direction-check", "POST /session-start", "GET /sessions", "GET /events", "GET /sessions/:sessionId", "GET /sessions/:sessionId/events", "GET /sessions/:sessionId/events/stream", "GET /sessions/:sessionId/inspect", "GET /sessions/:sessionId/continue", "POST /tool-run", "POST /run"]
   };
 }
 
 interface RouteRequestOptions {
   readonly allowRunSafetyOverrides: boolean;
   readonly eventStream: ApiEventStreamHub;
-  readonly workspaceBus: WorkspaceBus;
-  readonly workspaceEventStream: ApiEventStreamHub;
   readonly hasSession: (sessionId: string) => boolean;
 }
 
@@ -795,25 +722,8 @@ async function routeRequest(
 
     if (method === "GET" && route === "/events") {
       // Global SSE stream: every default-API session event in publication order.
-      // IDEA-D2: connecting here attaches a client to the process-cwd workspace.
       const lastEventId = readLastEventId(request);
-      attachEventStream(request, response, options.eventStream, {
-        ...(lastEventId !== undefined ? { lastEventId } : {}),
-        workspaceBus: options.workspaceBus
-      });
-      return;
-    }
-
-    if (method === "GET" && route === "/workspaces") {
-      return writeJson(response, 200, await handlers.workspaceList(normalizeWorkspaceListRequest(requestUrl.searchParams)));
-    }
-
-    if (method === "GET" && route === "/workspace/events") {
-      // IDEA-D2 workspace bus SSE stream: attach/detach/flags/busy signals.
-      const lastEventId = readLastEventId(request);
-      attachEventStream(request, response, options.workspaceEventStream, {
-        ...(lastEventId !== undefined ? { lastEventId } : {})
-      });
+      attachEventStream(request, response, options.eventStream, { ...(lastEventId !== undefined ? { lastEventId } : {}) });
       return;
     }
 
@@ -829,11 +739,7 @@ async function routeRequest(
         throw new ApiHttpError(404, `Harness session not found: ${sessionId}`);
       }
       const lastEventId = readLastEventId(request);
-      attachEventStream(request, response, options.eventStream, {
-        sessionId,
-        ...(lastEventId !== undefined ? { lastEventId } : {}),
-        workspaceBus: options.workspaceBus
-      });
+      attachEventStream(request, response, options.eventStream, { sessionId, ...(lastEventId !== undefined ? { lastEventId } : {}) });
       return;
     }
 
@@ -926,49 +832,6 @@ function normalizeSessionListRequest(params: URLSearchParams): ApiSessionListReq
   return Number.isInteger(parsedLimit) && parsedLimit > 0 ? { limit: parsedLimit } : {};
 }
 
-function normalizeWorkspaceListRequest(params: URLSearchParams): ApiWorkspaceListRequest {
-  const cwd = params.get("cwd");
-
-  return cwd !== null && cwd.length > 0 ? normalizeKnownPathFields({ cwd }) : {};
-}
-
-function summarizeWorkspaceBusEvent(event: WorkspaceBusEvent): string {
-  const { attachedClients, isBusy } = event.workspace;
-  const state = `${attachedClients} attached client(s), ${isBusy ? "busy" : "idle"}`;
-
-  switch (event.type) {
-    case "workspace.attach":
-      return `Client ${event.clientId} attached to workspace ${event.workspaceKey} (${state}).`;
-    case "workspace.detach":
-      return `Client ${event.clientId} detached from workspace ${event.workspaceKey} (${state}).`;
-    case "workspace.flags":
-      return `Workspace ${event.workspaceKey} flags claimed by ${event.clientId} (first-wins): yolo=${event.flags.yolo}, debug=${event.flags.debug}.`;
-    case "session.started":
-      return `Session ${event.sessionId} started in workspace ${event.workspaceKey} (${state}).`;
-    case "session.busy":
-      return `Session ${event.sessionId} marked workspace ${event.workspaceKey} busy (${state}).`;
-    case "session.idle":
-      return `Session ${event.sessionId} released workspace ${event.workspaceKey} (${state}).`;
-  }
-}
-
-function workspaceBusEventMetadata(event: WorkspaceBusEvent): Record<string, unknown> {
-  const base: Record<string, unknown> = {
-    workspaceEventType: event.type,
-    workspaceKey: event.workspaceKey,
-    attachedClients: event.workspace.attachedClients,
-    isBusy: event.workspace.isBusy
-  };
-
-  if (event.type === "workspace.attach" || event.type === "workspace.detach") {
-    return { ...base, clientId: event.clientId };
-  }
-  if (event.type === "workspace.flags") {
-    return { ...base, clientId: event.clientId, flags: event.flags, precedence: event.precedence };
-  }
-  return { ...base, sessionId: event.sessionId };
-}
-
 function normalizeSessionEventsRequest(route: string, params: URLSearchParams): ApiSessionEventsRequest {
   const sessionId = route.slice("/sessions/".length, -"/events".length);
   const request: ApiSessionEventsRequest = sessionId.length > 0 ? { sessionId: decodeURIComponent(sessionId) } : {};
@@ -1044,16 +907,12 @@ function attachEventStream(
   request: IncomingMessage,
   response: ServerResponse,
   hub: ApiEventStreamHub,
-  options: { readonly sessionId?: string; readonly lastEventId?: string; readonly workspaceBus?: WorkspaceBus }
+  options: { readonly sessionId?: string; readonly lastEventId?: string }
 ): void {
   response.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
     "cache-control": "no-cache"
   });
-  // IDEA-D2: a session/global event-stream connection is an explicit workspace
-  // attachment. Attachment is status-reported (workspace.attach workspaceBus
-  // event + /workspaces counts) and released exactly once on disconnect.
-  const workspaceAttachment = options.workspaceBus?.attach({});
   let subscription: { unsubscribe(): void; closed: boolean; close(): void } | undefined;
   let cleanedUp = false;
   const cleanup = (): void => {
@@ -1066,7 +925,6 @@ function attachEventStream(
     response.off("close", cleanup);
     response.off("error", cleanup);
     subscription?.unsubscribe();
-    workspaceAttachment?.detach();
   };
 
   request.on("aborted", cleanup);
@@ -1239,6 +1097,12 @@ function normalizeRunRequest(value: unknown, options: { readonly allowRunSafetyO
       ...(git.baseBranch && typeof git.baseBranch === "string" && git.baseBranch.length > 0 ? { baseBranch: git.baseBranch } : {}),
       ...(Array.isArray(git.paths) ? { paths: git.paths.filter((path: unknown): path is string => typeof path === "string") } : {})
     };
+  }
+  if (isPlainObject(value.mandate)) {
+    const parsed = MandateStateSchema.safeParse(value.mandate);
+    if (parsed.success) {
+      request.mandate = parsed.data;
+    }
   }
 
   return normalizeKnownPathFields(request);
