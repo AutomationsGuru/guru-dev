@@ -1,151 +1,192 @@
-import { existsSync, readFileSync, statSync } from "node:fs";
-import { dirname, join, resolve, isAbsolute, relative } from "node:path";
-import { processImports } from "./contextImportProcessor.js";
-
-export interface ContextRoots {
-  readonly home: string;
-  readonly project: string;
-  readonly trusted?: boolean;
-}
-
-export interface MergedContext {
-  readonly text: string;
-  readonly loadedPaths: readonly string[];
-}
-
 /**
- * Resolves the hierarchical chain of context files from home up to ancestors and the accessed JIT path.
- * Ordered: home -> ancestors -> jit.
+ * Hierarchical JIT context resolver.
+ *
+ * Plan reference: IDEA-F99-JIT-CONTEXT-01.
+ *
+ * Owned path: src/context/hierarchicalJitContext.ts.
+ *
+ * Composes three ordered sources, evaluated lazily on each tool access:
+ *
+ *   1. **Home baseline** — operator-owned `~/.guruharness/AGENTS.md` content
+ *      (or whatever names are configured). Always first so operator
+ *      instructions outrank project content.
+ *   2. **Ancestor chain** — walk from the access path's directory up to the
+ *      trusted project root, collecting each directory's instructional
+ *      context file in root-to-leaf order. Files outside the access path's
+ *      lineage are NOT eagerly scanned (the JIT property).
+ *   3. **Import expansion** — every loaded file is passed through
+ *      {@link contextImportProcessor} so `@./relative.md` directives inline
+ *      additional instructions under the same guards (containment, cycle,
+ *      depth).
+ *
+ * When the workspace is marked `untrusted` (compose F94), project-level
+ * files are skipped entirely; only the home baseline contributes. The
+ * caller must surface that fact (recorded in `skipped`) so the operator
+ * understands the gap is intentional rather than missing.
+ *
+ * The resolver is registered as an extension/tool seam candidate; it does
+ * NOT edit core. Future wiring lives in `src/session/*` and
+ * `src/tools/builtins/*` (not in this file).
  */
-export function resolveChain(
-  accessPath: string,
-  roots: ContextRoots,
-  fileNames: readonly string[] = ["AGENTS.md"]
-): readonly string[] {
-  const chain: string[] = [];
 
-  // 1. Resolve Home Context
-  const home = resolve(roots.home);
-  for (const name of fileNames) {
-    const homeFile = join(home, name);
-    if (existsSync(homeFile) && statSync(homeFile).isFile()) {
-      chain.push(homeFile);
+import { dirname, relative, resolve } from "node:path";
+import { existsSync, readFileSync, statSync } from "node:fs";
+
+import {
+  contextImportProcessor,
+  type ContextImportProcessorOptions,
+  type ContextImportProcessorResult
+} from "./contextImportProcessor.js";
+
+export interface HierarchicalJitHomeFile {
+  readonly path: string;
+  readonly contents: string;
+}
+
+export type WorkspaceTrust = "trusted" | "untrusted";
+
+export interface HierarchicalJitOptions {
+  /** Optional home baseline content (already read by caller). */
+  readonly homeBaselineFiles?: readonly HierarchicalJitHomeFile[];
+  /** Configurable file names searched in each directory. Default: ["AGENTS.md"]. */
+  readonly fileNames?: readonly string[];
+  /** Workspace trust gate; default "trusted". Compose F94. */
+  readonly trust?: WorkspaceTrust;
+  /** Filesystem adapter forwarded to the import processor. */
+  readonly fileSystem?: ContextImportProcessorOptions["fileSystem"];
+  /** Depth cap forwarded to the import processor. */
+  readonly maxImportDepth?: number;
+}
+
+export interface HierarchicalJitInput {
+  readonly accessPath: string;
+  readonly projectRoot: string;
+  readonly options?: HierarchicalJitOptions;
+}
+
+export interface JitContextResult {
+  /** Concatenated instructional text, home → ancestors → imports, joined with `\n\n`. */
+  readonly mergedContents: string;
+  /** Absolute paths loaded, in load order. */
+  readonly loadedPaths: readonly string[];
+  /** Records of skipped contributions (e.g. untrusted workspace). */
+  readonly skipped: readonly string[];
+  /** Distinct files discovered on the ancestor walk. */
+  readonly ancestorFiles: readonly { readonly path: string; readonly relativePath: string }[];
+}
+
+const DEFAULT_FILE_NAMES: readonly string[] = ["AGENTS.md"];
+
+function readIfFile(absolutePath: string): string | undefined {
+  if (!existsSync(absolutePath)) {
+    return undefined;
+  }
+  try {
+    const stats = statSync(absolutePath);
+    if (!stats.isFile()) {
+      return undefined;
     }
+  } catch {
+    return undefined;
+  }
+  return readFileSync(absolutePath, "utf8");
+}
+
+function directoryOf(filePath: string): string {
+  try {
+    const stats = statSync(filePath);
+    if (stats.isFile()) {
+      return dirname(filePath);
+    }
+    if (stats.isDirectory()) {
+      return filePath;
+    }
+  } catch {
+    // Fall through to dirname.
+  }
+  return dirname(filePath);
+}
+
+function isInside(child: string, parent: string): boolean {
+  const rel = relative(parent, child);
+  return rel === "" || (!rel.startsWith("..") && !/^[\\/]/u.test(rel));
+}
+
+export function hierarchicalJitContext(input: HierarchicalJitInput): JitContextResult {
+  const projectRoot = resolve(input.projectRoot);
+  const accessPath = resolve(input.accessPath);
+  const opts = input.options ?? {};
+  const trust: WorkspaceTrust = opts.trust ?? "trusted";
+  const fileNames = opts.fileNames && opts.fileNames.length > 0 ? opts.fileNames : DEFAULT_FILE_NAMES;
+
+  const loadedPaths: string[] = [];
+  const textChunks: string[] = [];
+  const skipped: string[] = [];
+
+  // 1. Home baseline — always first, never gated by trust.
+  for (const home of opts.homeBaselineFiles ?? []) {
+    textChunks.push(home.contents);
+    loadedPaths.push(home.path);
   }
 
-  // 2. Resolve Project Context (only if trusted is not explicitly false)
-  if (roots.trusted !== false) {
-    const project = resolve(roots.project);
-    const targetDir = resolveTargetDirectory(accessPath);
+  // 2. Ancestor chain — root → ... → directory-of-accessPath.
+  const ancestorFiles: { readonly path: string; readonly relativePath: string }[] = [];
 
-    // Get the directories from project root to target directory
-    const dirChain = getDirectoryChain(project, targetDir);
+  if (trust === "untrusted") {
+    skipped.push("workspace-untrusted");
+  } else if (!isInside(accessPath, projectRoot)) {
+    // Access path lives outside the trusted project root; treat as no project
+    // contribution. Home baseline already contributed above.
+    skipped.push("access-path-outside-project-root");
+  } else {
+    const accessDirectory = directoryOf(accessPath);
+    const chain: string[] = [projectRoot];
+    const rel = relative(projectRoot, accessDirectory);
+    if (rel && rel !== "" && !rel.startsWith("..")) {
+      const segments = rel.split(/[\\/]/u).filter(Boolean);
+      let cursor = projectRoot;
+      for (const segment of segments) {
+        cursor = resolve(cursor, segment);
+        chain.push(cursor);
+      }
+    }
 
-    if (dirChain.length > 0) {
-      // dirChain starts at project root and ends at targetDir.
-      // - JIT is the last directory (targetDir)
-      // - Ancestors are all directories before targetDir (from project root down to parent of targetDir)
-      for (const dir of dirChain) {
-        for (const name of fileNames) {
-          const file = join(dir, name);
-          if (existsSync(file) && statSync(file).isFile()) {
-            chain.push(file);
-          }
+    for (const directory of chain) {
+      for (const fileName of fileNames) {
+        const candidate = resolve(directory, fileName);
+        const contents = readIfFile(candidate);
+        if (contents !== undefined) {
+          ancestorFiles.push({ path: candidate, relativePath: relative(projectRoot, candidate) || fileName });
+          textChunks.push(contents);
+          loadedPaths.push(candidate);
         }
       }
     }
   }
 
-  return chain;
-}
+  // 3. Import expansion over the assembled chunks (home + ancestors).
+  const preImports = textChunks.join("\n\n");
 
-/**
- * Helper to get directory chain from project root to target directory.
- * Returns empty array if target directory escapes the project root.
- */
-function getDirectoryChain(projectRoot: string, targetDir: string): string[] {
-  const root = resolve(projectRoot);
-  const target = resolve(targetDir);
-
-  if (root === target) {
-    return [root];
-  }
-
-  const relativePath = relative(root, target);
-  if (relativePath.startsWith("..") || isAbsolute(relativePath)) {
-    return []; // Target escapes project root
-  }
-
-  const segments = relativePath ? relativePath.split(/[\\/]+/u) : [];
-  const chain: string[] = [root];
-  let current = root;
-  for (const segment of segments) {
-    if (segment) {
-      current = join(current, segment);
-      chain.push(current);
+  let mergedContents = preImports;
+  if (preImports.length > 0) {
+    const importResult: ContextImportProcessorResult = contextImportProcessor(preImports, {
+      baseDirectory: projectRoot,
+      workspaceRoot: projectRoot,
+      ...(opts.fileSystem ? { fileSystem: opts.fileSystem } : {}),
+      ...(opts.maxImportDepth !== undefined ? { maxDepth: opts.maxImportDepth } : {})
+    });
+    mergedContents = importResult.contents;
+    for (const loadedPath of importResult.loadedPaths) {
+      if (!loadedPaths.includes(loadedPath)) {
+        loadedPaths.push(loadedPath);
+      }
     }
-  }
-  return chain;
-}
-
-/**
- * Helper to resolve target directory of accessPath.
- * If path is a file or does not exist, returns its parent directory.
- */
-function resolveTargetDirectory(accessPath: string): string {
-  const absolutePath = resolve(accessPath);
-  try {
-    const stats = statSync(absolutePath);
-    return stats.isDirectory() ? absolutePath : dirname(absolutePath);
-  } catch {
-    return dirname(absolutePath);
-  }
-}
-
-/**
- * Resolves the appropriate workspace containment root for a given file.
- * Home files use home directory as root, project files use project directory.
- */
-function getWorkspaceRootForFile(filePath: string, roots: ContextRoots): string {
-  const fileAbs = resolve(filePath);
-  const homeAbs = resolve(roots.home);
-
-  const relativeToHome = relative(homeAbs, fileAbs);
-  if (!relativeToHome.startsWith("..") && !isAbsolute(relativeToHome)) {
-    return homeAbs;
-  }
-  return resolve(roots.project);
-}
-
-/**
- * Merges the hierarchical JIT context for a tool access by resolving context files,
- * processing their modular imports, and merging them.
- */
-export function mergeForToolAccess(
-  accessPath: string,
-  roots: ContextRoots,
-  fileNames: readonly string[] = ["AGENTS.md"]
-): MergedContext {
-  const resolvedPaths = resolveChain(accessPath, roots, fileNames);
-  const loadedPaths = new Set<string>();
-  const texts: string[] = [];
-
-  for (const filePath of resolvedPaths) {
-    loadedPaths.add(filePath);
-    const fileContent = readFileSync(filePath, "utf8");
-    const workspaceRoot = getWorkspaceRootForFile(filePath, roots);
-
-    const processedText = processImports(
-      fileContent,
-      dirname(filePath),
-      workspaceRoot,
-      { loadedPaths }
-    );
-    texts.push(processedText);
   }
 
   return {
-    text: texts.join("\n\n"),
-    loadedPaths: Array.from(loadedPaths)
+    mergedContents,
+    loadedPaths,
+    skipped,
+    ancestorFiles
   };
 }
