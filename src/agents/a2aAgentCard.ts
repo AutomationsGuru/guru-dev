@@ -1,85 +1,55 @@
+import { z } from "zod";
+
 /**
- * A2A Agent Card
+ * A2A agent card — a pure, self-describing {id, name, capabilities[]} descriptor.
  *
- * Structured agent card with {id, name, capabilities[]} for A2A protocol.
- * Provides serialize/parse with validation.
+ * This module is parse/serialize only. It owns no network, discovery, protocol,
+ * provider authority, or external dependency: it turns a structured agent card
+ * into a stable JSON string and back. An A2A mesh (if ever introduced) is an
+ * opt-in ATTACH at the interop layer (F271), never a hidden foundation here.
  */
 
-export interface A2AAgentCard {
-  id: string;
-  name: string;
-  capabilities: string[];
-}
+/** Capability identifier — non-empty trimmed string. */
+export const A2ACapabilitySchema = z.string().trim().min(1);
 
-export class A2AAgentCardError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'A2AAgentCardError';
-  }
+/**
+ * The structured A2A agent card.
+ *
+ * `strict()` makes the roundtrip well-defined: unknown keys are rejected on
+ * parse, so serialize → parse is an identity for any card that round-trips.
+ */
+export const A2AAgentCardSchema = z
+  .object({
+    id: z.string().trim().min(1),
+    name: z.string().trim().min(1),
+    capabilities: z.array(A2ACapabilitySchema).default([])
+  })
+  .strict();
+export type A2AAgentCard = z.infer<typeof A2AAgentCardSchema>;
+/** Input type — `capabilities` is optional (defaults to `[]`). */
+export type A2AAgentCardInput = z.input<typeof A2AAgentCardSchema>;
+
+/** Type guard: true when `value` parses as a valid A2A agent card. */
+export function isA2AAgentCard(value: unknown): value is A2AAgentCard {
+  return A2AAgentCardSchema.safeParse(value).success;
 }
 
 /**
- * Serializes an A2AAgentCard to a JSON string.
+ * Serialize a card to a canonical JSON string. Keys are emitted in declaration
+ * order; `capabilities` defaults to `[]` when omitted so output is stable.
+ * Throws if the card is invalid (callers that need to handle bad input should
+ * use {@link isA2AAgentCard} first, or catch the thrown {@link ZodError}).
  */
-export function serializeAgentCard(card: A2AAgentCard): string {
-  if (!card || typeof card !== 'object') {
-    throw new A2AAgentCardError('Agent card must be an object');
-  }
-  if (typeof card.id !== 'string' || card.id.length === 0) {
-    throw new A2AAgentCardError('Agent card id must be a non-empty string');
-  }
-  if (typeof card.name !== 'string' || card.name.length === 0) {
-    throw new A2AAgentCardError('Agent card name must be a non-empty string');
-  }
-  if (!Array.isArray(card.capabilities)) {
-    throw new A2AAgentCardError('Agent card capabilities must be an array');
-  }
-  if (!card.capabilities.every((c: unknown) => typeof c === 'string')) {
-    throw new A2AAgentCardError('All capabilities must be strings');
-  }
-  return JSON.stringify(card);
+export function serializeA2AAgentCard(card: A2AAgentCardInput): string {
+  const parsed = A2AAgentCardSchema.parse(card);
+  return JSON.stringify(parsed);
 }
 
 /**
- * Parses a JSON string into an A2AAgentCard.
- * Throws A2AAgentCardError on invalid input.
+ * Parse a JSON string (or an already-decoded object) into a validated card.
+ * Throws a {@link ZodError} on malformed JSON or schema mismatch.
  */
-export function parseAgentCard(json: string): A2AAgentCard {
-  if (typeof json !== 'string') {
-    throw new A2AAgentCardError('Input must be a string');
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(json);
-  } catch (e) {
-    throw new A2AAgentCardError('Invalid JSON');
-  }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new A2AAgentCardError('Parsed value must be an object');
-  }
-  const obj = parsed as Record<string, unknown>;
-  if (typeof obj.id !== 'string' || obj.id.length === 0) {
-    throw new A2AAgentCardError('Agent card id must be a non-empty string');
-  }
-  if (typeof obj.name !== 'string' || obj.name.length === 0) {
-    throw new A2AAgentCardError('Agent card name must be a non-empty string');
-  }
-  if (!Array.isArray(obj.capabilities)) {
-    throw new A2AAgentCardError('Agent card capabilities must be an array');
-  }
-  if (!obj.capabilities.every((c: unknown) => typeof c === 'string')) {
-    throw new A2AAgentCardError('All capabilities must be strings');
-  }
-  return {
-    id: obj.id,
-    name: obj.name,
-    capabilities: obj.capabilities as string[],
-  };
-}
-
-/**
- * Roundtrip helper: serialize then parse.
- */
-export function roundtripAgentCard(card: A2AAgentCard): A2AAgentCard {
-  return parseAgentCard(serializeAgentCard(card));
+export function parseA2AAgentCard(input: string | Readonly<Record<string, unknown>>): A2AAgentCard {
+  const decoded: unknown = typeof input === "string" ? JSON.parse(input) : input;
+  return A2AAgentCardSchema.parse(decoded);
 }
