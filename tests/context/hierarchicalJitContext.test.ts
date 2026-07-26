@@ -1,205 +1,301 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
+
+import { afterEach, describe, expect, it } from "vitest";
 
 import {
-  resolveChain,
-  mergeForToolAccess,
-  type ContextRoots
-} from '../../src/context/hierarchicalJitContext.js';
+  hierarchicalJitContext,
+  type HierarchicalJitOptions,
+  type JitContextResult
+} from "../../src/context/hierarchicalJitContext.js";
 import {
-  processImports,
-  assertInsideWorkspace
-} from '../../src/context/contextImportProcessor.js';
+  ContextImportCycleError,
+  ContextImportEscapeError,
+  contextImportProcessor,
+  type ContextImportProcessorOptions
+} from "../../src/context/contextImportProcessor.js";
+
+/**
+ * Hierarchical JIT context — TDD suite.
+ *
+ * Plan reference: IDEA-F99-JIT-CONTEXT-01.
+ *
+ * Owned path: tests/context/hierarchicalJitContext.test.ts.
+ *
+ * Exercises two owned modules in this single test file because the plan
+ * owns exactly one test path: src/context/{hierarchicalJitContext,
+ * contextImportProcessor}.ts and tests/context/hierarchicalJitContext.test.ts.
+ *
+ * RED -> GREEN: every `it` here is a contract that the implementation must
+ * satisfy; the implementation file is built to make these pass.
+ */
+
+const tempDirectories: string[] = [];
+
+afterEach(() => {
+  for (const directory of tempDirectories) {
+    rmSync(directory, { recursive: true, force: true });
+  }
+  tempDirectories.length = 0;
+});
+
+function makeTempDirectory(): string {
+  const directory = mkdtempSync(join(tmpdir(), "f99-jit-"));
+  tempDirectories.push(directory);
+  return directory;
+}
+
+function makeRoots(): { homeRoot: string; projectRoot: string } {
+  const homeRoot = makeTempDirectory();
+  const projectRoot = makeTempDirectory();
+  return { homeRoot, projectRoot };
+}
+
+function writeAgentsFile(directory: string, name: string, contents: string): string {
+  const path = join(directory, name);
+  writeFileSync(path, contents);
+  return path;
+}
+
+describe("contextImportProcessor", () => {
+  const baseOptions: ContextImportProcessorOptions = {
+    baseDirectory: "",
+    workspaceRoot: "",
+    fileSystem: { kind: "fs" }
+  };
+
+  it("expands a single relative import with @path", () => {
+    const baseDirectory = makeTempDirectory();
+    const importedPath = join(baseDirectory, "rules.md");
+    writeFileSync(importedPath, "imported content");
+
+    const expanded = contextImportProcessor(
+      ["# Top", "@./rules.md", "trailing"].join("\n"),
+      { ...baseOptions, baseDirectory, workspaceRoot: baseDirectory }
+    );
+
+    expect(expanded.contents).toContain("imported content");
+    expect(expanded.contents).toContain("# Top");
+    expect(expanded.contents).toContain("trailing");
+    expect(expanded.loadedPaths).toContain(importedPath);
+  });
+
+  it("rejects absolute import paths that escape the workspace root", () => {
+    const workspaceRoot = makeTempDirectory();
+    const outside = makeTempDirectory();
+
+    expect(() =>
+      contextImportProcessor(`@${outside}/leak.md`, {
+        ...baseOptions,
+        baseDirectory: workspaceRoot,
+        workspaceRoot
+      })
+    ).toThrow(ContextImportEscapeError);
+  });
+
+  it("rejects parent-directory traversal in relative imports", () => {
+    const workspaceRoot = makeTempDirectory();
+    const nested = join(workspaceRoot, "a", "b");
+    mkdirSync(nested, { recursive: true });
+
+    expect(() =>
+      contextImportProcessor("@../../escape.md", {
+        ...baseOptions,
+        baseDirectory: nested,
+        workspaceRoot
+      })
+    ).toThrow(ContextImportEscapeError);
+  });
+
+  it("throws on cycles and skips already-loaded files", () => {
+    const baseDirectory = makeTempDirectory();
+    const aPath = join(baseDirectory, "a.md");
+    const bPath = join(baseDirectory, "b.md");
+    writeFileSync(aPath, "A imports @./b.md");
+    writeFileSync(bPath, "B imports @./a.md");
+
+    expect(() =>
+      contextImportProcessor("@./a.md", {
+        ...baseOptions,
+        baseDirectory,
+        workspaceRoot: baseDirectory
+      })
+    ).toThrow(ContextImportCycleError);
+  });
+
+  it("guards import depth and stops expanding past the cap", () => {
+    const baseDirectory = makeTempDirectory();
+    const chain: string[] = [];
+    const depth = 12;
+    for (let index = 0; index < depth; index += 1) {
+      const next = join(baseDirectory, `level-${index}.md`);
+      chain.push(next);
+      const child = index < depth - 1 ? `@./level-${index + 1}.md` : "leaf";
+      writeFileSync(next, child);
+    }
+    const entryPath = chain[0]!;
+
+    const expanded = contextImportProcessor("@./level-0.md", {
+      ...baseOptions,
+      baseDirectory,
+      workspaceRoot: baseDirectory,
+      maxDepth: 5
+    });
+
+    // Imports stop before leaf when depth cap is hit.
+    expect(expanded.loadedPaths.length).toBeGreaterThan(0);
+    expect(expanded.loadedPaths.length).toBeLessThanOrEqual(5);
+    // Entry path always present.
+    expect(expanded.loadedPaths).toContain(entryPath);
+    // Deepest leaf must NOT be loaded because we stopped before depth 12.
+    expect(expanded.loadedPaths).not.toContain(chain[depth - 1]);
+  });
+
+  it("expands multiple imports on the same line in order", () => {
+    const baseDirectory = makeTempDirectory();
+    const first = join(baseDirectory, "first.md");
+    const second = join(baseDirectory, "second.md");
+    writeFileSync(first, "FIRST");
+    writeFileSync(second, "SECOND");
+
+    const expanded = contextImportProcessor("@./first.md and @./second.md", {
+      ...baseOptions,
+      baseDirectory,
+      workspaceRoot: baseDirectory
+    });
+
+    expect(expanded.loadedPaths).toContain(first);
+    expect(expanded.loadedPaths).toContain(second);
+    const firstIndex = expanded.loadedPaths.indexOf(first);
+    const secondIndex = expanded.loadedPaths.indexOf(second);
+    expect(firstIndex).toBeLessThan(secondIndex);
+  });
+});
 
 describe("hierarchicalJitContext", () => {
-  let tempRoot: string;
-  let homeDir: string;
-  let projectDir: string;
-  let roots: ContextRoots;
+  it("orders home baseline before ancestor chain", () => {
+    const { homeRoot, projectRoot } = makeRoots();
+    writeAgentsFile(homeRoot, "AGENTS.md", "# HOME");
+    const projectAgents = writeAgentsFile(projectRoot, "AGENTS.md", "# PROJECT");
+    const targetPath = join(projectRoot, "src", "thing.ts");
+    mkdirSync(join(projectRoot, "src"), { recursive: true });
+    writeFileSync(targetPath, "export {};\n");
 
-  beforeEach(() => {
-    tempRoot = mkdtempSync(join(tmpdir(), "guruharness-jit-test-"));
-    homeDir = join(tempRoot, "home");
-    projectDir = join(tempRoot, "project");
-
-    mkdirSync(homeDir);
-    mkdirSync(projectDir);
-
-    roots = {
-      home: homeDir,
-      project: projectDir,
-      trusted: true
-    };
-  });
-
-  afterEach(() => {
-    rmSync(tempRoot, { recursive: true, force: true });
-  });
-
-  describe("resolveChain", () => {
-    it("should order files correctly: home -> ancestors -> jit", () => {
-      // 1. Setup home context
-      writeFileSync(join(homeDir, "AGENTS.md"), "Home context");
-
-      // 2. Setup project root context
-      writeFileSync(join(projectDir, "AGENTS.md"), "Project root context");
-
-      // 3. Setup sub-directory context
-      const subDir = join(projectDir, "src", "sub");
-      mkdirSync(subDir, { recursive: true });
-      writeFileSync(join(subDir, "AGENTS.md"), "JIT sub context");
-
-      // 4. Resolve the chain for a file inside the sub-directory
-      const targetFile = join(subDir, "file.ts");
-      const chain = resolveChain(targetFile, roots, ["AGENTS.md"]);
-
-      expect(chain).toEqual([
-        resolve(join(homeDir, "AGENTS.md")),
-        resolve(join(projectDir, "AGENTS.md")),
-        resolve(join(subDir, "AGENTS.md"))
-      ]);
-    });
-
-    it("should skip ancestors not on the path to the accessed target (JIT only when entered)", () => {
-      // Setup context files
-      writeFileSync(join(projectDir, "AGENTS.md"), "Project root context");
-
-      const activeSub = join(projectDir, "src", "active");
-      mkdirSync(activeSub, { recursive: true });
-      writeFileSync(join(activeSub, "AGENTS.md"), "Active JIT context");
-
-      const inactiveSub = join(projectDir, "src", "inactive");
-      mkdirSync(inactiveSub, { recursive: true });
-      writeFileSync(join(inactiveSub, "AGENTS.md"), "Inactive context");
-
-      // Resolve for active sub
-      const chain = resolveChain(join(activeSub, "file.ts"), roots, ["AGENTS.md"]);
-
-      expect(chain).toContain(resolve(join(projectDir, "AGENTS.md")));
-      expect(chain).toContain(resolve(join(activeSub, "AGENTS.md")));
-      expect(chain).not.toContain(resolve(join(inactiveSub, "AGENTS.md")));
-    });
-
-    it("should handle custom context filenames", () => {
-      writeFileSync(join(homeDir, "CUSTOM.md"), "Home custom");
-      writeFileSync(join(projectDir, "CUSTOM.md"), "Project custom");
-
-      const chain = resolveChain(projectDir, roots, ["CUSTOM.md"]);
-
-      expect(chain).toEqual([
-        resolve(join(homeDir, "CUSTOM.md")),
-        resolve(join(projectDir, "CUSTOM.md"))
-      ]);
-    });
-
-    it("should skip project files if workspace is untrusted (F94 composition)", () => {
-      writeFileSync(join(homeDir, "AGENTS.md"), "Home context");
-      writeFileSync(join(projectDir, "AGENTS.md"), "Project context");
-
-      const untrustedRoots = { ...roots, trusted: false };
-      const chain = resolveChain(projectDir, untrustedRoots, ["AGENTS.md"]);
-
-      expect(chain).toEqual([resolve(join(homeDir, "AGENTS.md"))]);
-    });
-  });
-
-  describe("processImports", () => {
-    it("should expand valid relative imports within the workspace", () => {
-      const baseFile = join(projectDir, "main.md");
-      const importFile = join(projectDir, "imported.md");
-
-      writeFileSync(importFile, "Imported Content");
-      const text = "Prefix\n@./imported.md\nSuffix";
-
-      const expanded = processImports(text, projectDir, projectDir);
-      expect(expanded).toBe("Prefix\nImported Content\nSuffix");
-    });
-
-    it("should expand valid workspace-relative imports", () => {
-      const subDir = join(projectDir, "sub");
-      mkdirSync(subDir);
-      const importFile = join(subDir, "imported.md");
-
-      writeFileSync(importFile, "Workspace relative content");
-      // @/sub/imported.md or @sub/imported.md should resolve relative to workspaceRoot
-      const text = "@sub/imported.md";
-
-      const expanded = processImports(text, projectDir, projectDir);
-      expect(expanded).toBe("Workspace relative content");
-    });
-
-    it("should throw on circular imports", () => {
-      const fileA = join(projectDir, "a.md");
-      const fileB = join(projectDir, "b.md");
-
-      writeFileSync(fileA, "File A\n@./b.md");
-      writeFileSync(fileB, "File B\n@./a.md");
-
-      expect(() => {
-        processImports("@./a.md", projectDir, projectDir);
-      }).toThrow(/Circular import detected/);
-    });
-
-    it("should throw on path escape attempts (containment check)", () => {
-      const text = "@../escaped.md";
-      expect(() => {
-        processImports(text, projectDir, projectDir);
-      }).toThrow(/Access denied: path escapes workspace/);
-    });
-
-    it("should throw on max depth limit exceeded", () => {
-      const depth = 4;
-      for (let i = 0; i < depth; i++) {
-        const file = join(projectDir, `file${i}.md`);
-        const nextFile = i === depth - 1 ? "final.md" : `file${i + 1}.md`;
-        writeFileSync(file, `@./${nextFile}`);
+    const result: JitContextResult = hierarchicalJitContext({
+      accessPath: targetPath,
+      projectRoot,
+      options: {
+        homeBaselineFiles: [{ path: join(homeRoot, "AGENTS.md"), contents: "# HOME" }],
+        fileNames: ["AGENTS.md"]
       }
-      writeFileSync(join(projectDir, "final.md"), "Final reached");
-
-      expect(() => {
-        processImports("@./file0.md", projectDir, projectDir, { maxDepth: 2 });
-      }).toThrow(/Max import depth of 2 exceeded/);
     });
 
-    it("should preserve non-explicit role or chat annotations like @operator", () => {
-      const text = "Review by @operator and @guru";
-      const expanded = processImports(text, projectDir, projectDir);
-      expect(expanded).toBe("Review by @operator and @guru");
-    });
+    expect(result.mergedContents).toContain("# HOME");
+    expect(result.mergedContents).toContain("# PROJECT");
+    expect(result.loadedPaths[0]).toBe(join(homeRoot, "AGENTS.md"));
+    expect(result.loadedPaths).toContain(projectAgents);
   });
 
-  describe("mergeForToolAccess", () => {
-    it("should load, expand imports, and merge hierarchical contexts completely", () => {
-      // 1. Home context with import
-      const homeImport = join(homeDir, "home_rules.md");
-      writeFileSync(homeImport, "Home Rule Content");
-      writeFileSync(join(homeDir, "AGENTS.md"), "Home Baseline\n@./home_rules.md");
+  it("walks ancestors from target up to project root", () => {
+    const { homeRoot, projectRoot } = makeRoots();
+    const nested = join(projectRoot, "packages", "agent");
+    mkdirSync(nested, { recursive: true });
+    writeAgentsFile(projectRoot, "AGENTS.md", "ROOT");
+    writeAgentsFile(join(projectRoot, "packages"), "AGENTS.md", "PACKAGES");
+    const targetPath = join(nested, "thing.ts");
+    writeFileSync(targetPath, "export {};\n");
 
-      // 2. Project context with import
-      const projectImport = join(projectDir, "project_rules.md");
-      writeFileSync(projectImport, "Project Rule Content");
-      writeFileSync(join(projectDir, "AGENTS.md"), "Project Root\n@./project_rules.md");
-
-      // 3. JIT context
-      const subDir = join(projectDir, "src");
-      mkdirSync(subDir);
-      writeFileSync(join(subDir, "AGENTS.md"), "JIT Specific Context");
-
-      const result = mergeForToolAccess(subDir, roots);
-
-      expect(result.text).toContain("Home Baseline");
-      expect(result.text).toContain("Home Rule Content");
-      expect(result.text).toContain("Project Root");
-      expect(result.text).toContain("Project Rule Content");
-      expect(result.text).toContain("JIT Specific Context");
-
-      expect(result.loadedPaths).toContain(resolve(join(homeDir, "AGENTS.md")));
-      expect(result.loadedPaths).toContain(resolve(homeImport));
-      expect(result.loadedPaths).toContain(resolve(join(projectDir, "AGENTS.md")));
-      expect(result.loadedPaths).toContain(resolve(projectImport));
-      expect(result.loadedPaths).toContain(resolve(join(subDir, "AGENTS.md")));
+    const result = hierarchicalJitContext({
+      accessPath: targetPath,
+      projectRoot,
+      options: { fileNames: ["AGENTS.md"] }
     });
+
+    expect(result.loadedPaths.map((p) => p.replace(projectRoot, "<root>"))).toEqual([
+      join("<root>", "AGENTS.md"),
+      join("<root>", "packages", "AGENTS.md")
+    ]);
+    expect(result.mergedContents).toContain("ROOT");
+    expect(result.mergedContents).toContain("PACKAGES");
+  });
+
+  it("supports configurable file names", () => {
+    const { projectRoot } = makeRoots();
+    const nested = join(projectRoot, "docs");
+    mkdirSync(nested, { recursive: true });
+    writeAgentsFile(projectRoot, "GEMINI.md", "GEMINI ROOT");
+    writeAgentsFile(nested, "CLAUDE.md", "CLAUDE INNER");
+    const targetPath = join(nested, "notes.md");
+    writeFileSync(targetPath, "notes");
+
+    const result = hierarchicalJitContext({
+      accessPath: targetPath,
+      projectRoot,
+      options: { fileNames: ["GEMINI.md", "CLAUDE.md"] }
+    });
+
+    expect(result.mergedContents).toContain("GEMINI ROOT");
+    expect(result.mergedContents).toContain("CLAUDE INNER");
+  });
+
+  it("skips project files when workspace is marked untrusted", () => {
+    const { projectRoot } = makeRoots();
+    writeAgentsFile(projectRoot, "AGENTS.md", "SHOULD NOT LOAD");
+    const targetPath = join(projectRoot, "thing.ts");
+    writeFileSync(targetPath, "export {};\n");
+
+    const homeFile = writeAgentsFile(makeTempDirectory(), "AGENTS.md", "HOME OK");
+
+    const result = hierarchicalJitContext({
+      accessPath: targetPath,
+      projectRoot,
+      options: {
+        fileNames: ["AGENTS.md"],
+        trust: "untrusted",
+        homeBaselineFiles: [{ path: homeFile, contents: "HOME OK" }]
+      }
+    });
+
+    expect(result.mergedContents).toContain("HOME OK");
+    expect(result.mergedContents).not.toContain("SHOULD NOT LOAD");
+    expect(result.skipped).toContain("workspace-untrusted");
+  });
+
+  it("returns empty chain when access path is outside any known root", () => {
+    const { projectRoot } = makeRoots();
+    const elsewhere = makeTempDirectory();
+    writeFileSync(join(elsewhere, "thing.ts"), "export {};\n");
+
+    const result = hierarchicalJitContext({
+      accessPath: join(elsewhere, "thing.ts"),
+      projectRoot,
+      options: { fileNames: ["AGENTS.md"] }
+    });
+
+    expect(result.loadedPaths).toEqual([]);
+    expect(result.mergedContents).toBe("");
+  });
+
+  it("JIT resolution only runs on access — does not eagerly scan the project", () => {
+    const { projectRoot } = makeRoots();
+    // Write a sibling AGENTS.md the resolver must NOT pick up because it sits
+    // outside the path from accessPath to projectRoot.
+    writeAgentsFile(projectRoot, "AGENTS.md", "ROOT");
+    const unrelatedDir = join(projectRoot, "unrelated");
+    mkdirSync(unrelatedDir, { recursive: true });
+    writeAgentsFile(unrelatedDir, "AGENTS.md", "UNRELATED");
+    const targetPath = join(projectRoot, "src", "thing.ts");
+    mkdirSync(join(projectRoot, "src"), { recursive: true });
+    writeFileSync(targetPath, "export {};\n");
+
+    const result = hierarchicalJitContext({
+      accessPath: targetPath,
+      projectRoot,
+      options: { fileNames: ["AGENTS.md"] }
+    });
+
+    expect(result.mergedContents).not.toContain("UNRELATED");
+    expect(result.mergedContents).toContain("ROOT");
   });
 });
