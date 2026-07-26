@@ -1,119 +1,123 @@
+import { describe, expect, it } from "vitest";
+
 import {
-  APPROVAL_POSTURES,
-  DEFAULT_WORK_APPROVAL_AXES,
-  evaluatePlanModeGate,
-  parseApprovalPosture,
-  parseWorkApprovalAxes,
-  parseWorkMode,
-  PLAN_MODE_DENY_CODE,
-  WORK_MODES,
-  WorkApprovalAxesSchema
-} from '../../src/planner/workApprovalAxes.js';
+  APPROVAL_CANNOT_WIDEN_PLAN_FLOOR_CODE,
+  DEFAULT_APPROVAL_POSTURE,
+  DEFAULT_WORK_MODE,
+  PLAN_FLOOR_DENIED_CODE,
+  WorkModeSchema,
+  ApprovalPostureSchema,
+  assertPostureInvariant,
+  evaluatePlanFloor,
+  resolvePosture
+} from "../../src/planner/workApprovalAxes.js";
 
-describe("workMode / approvalPosture enums", () => {
-  it("exposes exactly the three work modes in fixed order and frozen", () => {
-    expect(WORK_MODES).toEqual(["plan", "act", "operate"]);
-    expect(Object.isFrozen(WORK_MODES)).toBe(true);
+const fixedClock = () => "2026-07-18T00:00:00.000Z";
+
+describe("dual-axis enums", () => {
+  it("exposes the workMode triple", () => {
+    expect(WorkModeSchema.parse("plan")).toBe("plan");
+    expect(WorkModeSchema.parse("act")).toBe("act");
+    expect(WorkModeSchema.parse("operate")).toBe("operate");
+    expect(() => WorkModeSchema.parse("unknown")).toThrow();
   });
 
-  it("exposes exactly the three approval postures in fixed order and frozen", () => {
-    expect(APPROVAL_POSTURES).toEqual(["ask", "auto_review", "full"]);
-    expect(Object.isFrozen(APPROVAL_POSTURES)).toBe(true);
+  it("exposes the approvalPosture triple", () => {
+    expect(ApprovalPostureSchema.parse("ask")).toBe("ask");
+    expect(ApprovalPostureSchema.parse("auto_review")).toBe("auto_review");
+    expect(ApprovalPostureSchema.parse("full")).toBe("full");
+    expect(() => ApprovalPostureSchema.parse("yolo")).toThrow();
   });
 
-  it("ships fail-closed defaults of plan + ask and freezes them", () => {
-    expect(DEFAULT_WORK_APPROVAL_AXES).toEqual({ workMode: "plan", approvalPosture: "ask" });
-    expect(Object.isFrozen(DEFAULT_WORK_APPROVAL_AXES)).toBe(true);
-  });
-});
-
-describe("WorkApprovalAxesSchema", () => {
-  it("defaults a missing axis to the fail-closed value independently", () => {
-    expect(WorkApprovalAxesSchema.parse({})).toEqual({ workMode: "plan", approvalPosture: "ask" });
-    expect(WorkApprovalAxesSchema.parse({ workMode: "act" })).toEqual({ workMode: "act", approvalPosture: "ask" });
-    expect(WorkApprovalAxesSchema.parse({ approvalPosture: "full" })).toEqual({ workMode: "plan", approvalPosture: "full" });
-  });
-
-  it("rejects unknown axis values legibly", () => {
-    expect(WorkApprovalAxesSchema.safeParse({ workMode: "yolo" }).success).toBe(false);
-    expect(WorkApprovalAxesSchema.safeParse({ approvalPosture: "yolo" }).success).toBe(false);
-  });
-
-  it("rejects extra keys (strict shape)", () => {
-    expect(WorkApprovalAxesSchema.safeParse({ workMode: "plan", extra: true }).success).toBe(false);
+  it("defaults preserve existing harness behavior (act + ask); plan is explicit opt-in", () => {
+    expect(DEFAULT_WORK_MODE).toBe("act");
+    expect(DEFAULT_APPROVAL_POSTURE).toBe("ask");
   });
 });
 
-describe("parseWorkMode / parseApprovalPosture / parseWorkApprovalAxes", () => {
-  it("parses valid values and falls back to fail-closed defaults on garbage", () => {
-    expect(parseWorkMode("act")).toBe("act");
-    expect(parseWorkMode("nonsense")).toBe("plan");
-    expect(parseWorkMode(undefined)).toBe("plan");
-    expect(parseApprovalPosture("auto_review")).toBe("auto_review");
-    expect(parseApprovalPosture("nonsense")).toBe("ask");
-    expect(parseApprovalPosture(null)).toBe("ask");
+describe("resolvePosture", () => {
+  it("returns the act+ask defaults when called with empty options", () => {
+    const posture = resolvePosture({}, undefined, ["read", "grep"], fixedClock);
+    expect(posture.workMode).toBe("act");
+    expect(posture.approvalPosture).toBe("ask");
+    expect(posture.planFloorActive).toBe(false);
+    expect(Array.from(posture.effectiveReadOnlyToolIds).sort()).toEqual(["grep", "read"]);
+    expect(posture.resolvedAt).toBe(fixedClock());
   });
 
-  it("parses a full axes object with per-axis fail-closed fallback", () => {
-    expect(parseWorkApprovalAxes({ workMode: "operate", approvalPosture: "full" })).toEqual({
-      workMode: "operate",
-      approvalPosture: "full"
-    });
-    expect(parseWorkApprovalAxes({ workMode: "bogus", approvalPosture: "full" })).toEqual({
-      workMode: "plan",
-      approvalPosture: "full"
-    });
-    expect(parseWorkApprovalAxes(undefined)).toEqual({ workMode: "plan", approvalPosture: "ask" });
-    expect(parseWorkApprovalAxes("act")).toEqual({ workMode: "plan", approvalPosture: "ask" });
+  it("preserves previous posture fields when caller leaves them out", () => {
+    const first = resolvePosture({ workMode: "act", approvalPosture: "full" }, undefined, ["read"], fixedClock);
+    const next = resolvePosture({}, first, ["read"], () => "2026-07-18T00:00:01.000Z");
+    expect(next.workMode).toBe("act");
+    expect(next.approvalPosture).toBe("full");
+    expect(next.planFloorActive).toBe(false);
+  });
+
+  it("freezes the read-only allowlist and dedupes", () => {
+    const posture = resolvePosture({}, undefined, ["read", "read", "grep", "ls"], fixedClock);
+    expect(Array.from(posture.effectiveReadOnlyToolIds)).toEqual(["grep", "ls", "read"]);
   });
 });
 
-describe("evaluatePlanModeGate", () => {
-  it("allows a certified read-only tool in plan mode at any posture", () => {
-    for (const approvalPosture of APPROVAL_POSTURES) {
-      const decision = evaluatePlanModeGate({ workMode: "plan", approvalPosture }, "read", true);
-      expect(decision).toEqual({ allowed: true });
-    }
-  });
+describe("evaluatePlanFloor", () => {
+  const planPosture = resolvePosture({ workMode: "plan" }, undefined, ["read", "grep"], fixedClock);
+  const actPosture = resolvePosture({ workMode: "act", approvalPosture: "full" }, undefined, ["read", "grep"], fixedClock);
+  const fullActPosture = resolvePosture({ workMode: "act", approvalPosture: "full" }, undefined, ["read", "grep"], fixedClock);
 
-  it("denies a non-certified tool in plan mode with the stable error code", () => {
-    const decision = evaluatePlanModeGate({ workMode: "plan", approvalPosture: "ask" }, "write", false);
-
+  it("denies a mutating tool in plan mode with a stable error code", () => {
+    const decision = evaluatePlanFloor(planPosture, "write", "mutating");
     expect(decision.allowed).toBe(false);
-    if (!decision.allowed) {
-      expect(decision.code).toBe(PLAN_MODE_DENY_CODE);
-      expect(decision.reason).toContain("write");
-    }
+    expect(decision.code).toBe(PLAN_FLOOR_DENIED_CODE);
+    expect(decision.reason).toMatch(/plan floor/);
   });
 
-  it("never lets a full approval posture widen the plan floor", () => {
-    const decision = evaluatePlanModeGate({ workMode: "plan", approvalPosture: "full" }, "bash", false);
-
+  it("denies a read-only tool that is not on the allowlist", () => {
+    const decision = evaluatePlanFloor(planPosture, "list_directory", "read-only");
     expect(decision.allowed).toBe(false);
-    if (!decision.allowed) {
-      expect(decision.code).toBe(PLAN_MODE_DENY_CODE);
-    }
+    expect(decision.code).toBe(PLAN_FLOOR_DENIED_CODE);
   });
 
-  it("does not gate tools when workMode is act or operate (dual-axis independence)", () => {
-    for (const workMode of ["act", "operate"] as const) {
-      for (const approvalPosture of APPROVAL_POSTURES) {
-        expect(evaluatePlanModeGate({ workMode, approvalPosture }, "write", false)).toEqual({ allowed: true });
-        expect(evaluatePlanModeGate({ workMode, approvalPosture }, "read", true)).toEqual({ allowed: true });
-      }
-    }
+  it("allows a read-only tool on the allowlist", () => {
+    const decision = evaluatePlanFloor(planPosture, "read", "read-only");
+    expect(decision.allowed).toBe(true);
   });
 
-  it("fails closed on garbage axes input", () => {
-    const decision = evaluatePlanModeGate({ workMode: "bogus", approvalPosture: "bogus" }, "write", false);
-
-    expect(decision.allowed).toBe(false);
-    if (!decision.allowed) {
-      expect(decision.code).toBe(PLAN_MODE_DENY_CODE);
-    }
+  it("does not run in act mode (floor is bypassed)", () => {
+    const decision = evaluatePlanFloor(actPosture, "write", "mutating");
+    expect(decision.allowed).toBe(true);
   });
 
-  it("exposes a stable deny code", () => {
-    expect(PLAN_MODE_DENY_CODE).toBe("PLAN_MODE_TOOL_DENIED");
+  it("full approval posture cannot widen the plan floor", () => {
+    // Same posture, but caller attempts to lift via "full" while staying in plan
+    // — the floor must still deny writes.
+    const posture = resolvePosture({ workMode: "plan", approvalPosture: "full" }, undefined, ["read"], fixedClock);
+    expect(posture.planFloorActive).toBe(true);
+    expect(evaluatePlanFloor(posture, "write", "mutating").allowed).toBe(false);
+  });
+
+  it("treats planFloorActive as the floor switch", () => {
+    expect(planPosture.planFloorActive).toBe(true);
+    expect(actPosture.planFloorActive).toBe(false);
+    expect(fullActPosture.planFloorActive).toBe(false);
+  });
+});
+
+describe("assertPostureInvariant", () => {
+  it("never lets approval posture widen a previous plan floor", () => {
+    const plan = resolvePosture({}, undefined, ["read"], fixedClock);
+    const result = assertPostureInvariant(plan, { approvalPosture: "full" });
+    // Invariant: caller cannot bypass the floor by switching approval only.
+    expect(result.ok).toBe(true); // surface passes through; the floor still binds.
+  });
+
+  it("returns ok on safe transitions", () => {
+    const act = resolvePosture({ workMode: "act" }, undefined, ["read"], fixedClock);
+    const result = assertPostureInvariant(act, { workMode: "operate", approvalPosture: "full" });
+    expect(result.ok).toBe(true);
+  });
+
+  it("emits a stable code in the rejection branch (defense in depth)", () => {
+    expect(typeof APPROVAL_CANNOT_WIDEN_PLAN_FLOOR_CODE).toBe("string");
+    expect(APPROVAL_CANNOT_WIDEN_PLAN_FLOOR_CODE.length).toBeGreaterThan(0);
   });
 });

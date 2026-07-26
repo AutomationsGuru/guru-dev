@@ -13,8 +13,27 @@ import { createMcpMetaDispatchTools } from "../mcp/metaDispatch.js";
 import type { McpServerConfig, McpServerStatus } from "../mcp/schemas.js";
 import { createInMemoryOperationalStore, type OperationalStore } from "../operational/store.js";
 import { createBlockedPlannerRunReport, runPlannerExecution, type PlannerModel } from "../planner/runtime.js";
-import { createCertifiedPlanModePolicy, executePlanModeTool as runPlanModeTool, type PlanModePolicy } from "../planner/planMode.js";
-import { evaluatePlanModeGate, type WorkApprovalAxes } from "../planner/workApprovalAxes.js";
+import { createCertifiedPlanModePolicy, executePlanModeTool as runPlanModeTool, PLAN_MODE_DEFAULT_TOOL_IDS, type PlanModePolicy } from "../planner/planMode.js";
+import {
+  DEFAULT_APPROVAL_POSTURE,
+  DEFAULT_WORK_MODE,
+  PLAN_FLOOR_DENIED_CODE,
+  evaluatePlanFloor,
+  resolvePosture,
+  type ApprovalPosture,
+  type ResolvedPosture,
+  type ToolEffectCategory,
+  type WorkMode
+} from "../planner/workApprovalAxes.js";
+import {
+  PLAN_ARTIFACT_INVALID_CODE,
+  parsePlanArtifact,
+  verdictLiftsPlanFloor,
+  type PlanArtifact,
+  type PlanArtifactDecision,
+  type PlanArtifactVerdict
+} from "../planner/planArtifact.js";
+import { RuntimePlanPostureSummarySchema, type RuntimePlanPostureSummary } from "./schemas.js";
 import {
   createOperationalSessionPersistenceStore,
   type PersistedSessionEvent,
@@ -103,20 +122,8 @@ export interface HarnessRuntime {
    * turn abort like {@link executeTool}. Refusals (non-certified tool ids)
    * return a failed observation WITHOUT invoking the underlying tool, general
    * extension execution hooks, or a planner/provider call.
-   *
-   * The optional `axes` carry the dual work/approval posture (IDEA-A1). When
-   * omitted they fail closed to `{ workMode: "plan", approvalPosture: "ask" }`.
-   * In plan mode a non-certified tool is denied with the stable
-   * PLAN_MODE_TOOL_DENIED code; the `approvalPosture` axis can NEVER widen the
-   * plan floor, so `full` posture still refuses a non-certified tool.
    */
-  executePlanModeTool(
-    sessionId: string,
-    toolId: string,
-    input: unknown,
-    signal?: AbortSignal,
-    axes?: WorkApprovalAxes | { readonly workMode?: unknown; readonly approvalPosture?: unknown }
-  ): Promise<ToolObservation>;
+  executePlanModeTool(sessionId: string, toolId: string, input: unknown, signal?: AbortSignal): Promise<ToolObservation>;
   /** MCP readiness/discovery results for a live session. Unknown or closed sessions return an empty list. */
   getSessionMcpStatuses(sessionId: string): readonly McpServerStatus[];
   /** Close retained MCP clients and forget one live session. Returns false when the id is not live. */
@@ -124,6 +131,24 @@ export interface HarnessRuntime {
   /** Close every live session and make this runtime reject future start/resume calls. Idempotent. */
   close(): Promise<void>;
   runPlanner(sessionId: string, options: PlannerRunOptions): Promise<PlannerRunReport>;
+  /** Resolved plan-posture summary (IDEA-A1) for a live session. */
+  getSessionPosture(sessionId: string): RuntimePlanPostureSummary | undefined;
+  /**
+   * Update the plan posture for a live session. Either axis may be omitted
+   * to preserve its current value. The approval posture can never widen the
+   * plan floor; when workMode is set to plan and approvalPosture is set to
+   * "full", the floor still binds.
+   */
+  setSessionPosture(sessionId: string, options: { workMode?: WorkMode; approvalPosture?: ApprovalPosture }): RuntimePlanPostureSummary | undefined;
+  /**
+   * Record the operator's accept/revise/reject verdict on a plan artifact.
+   * "accepted" lifts the plan floor and auto-promotes workMode to "act" so
+   * the harness can execute the artifact's approach; "revise" and "rejected"
+   * keep the floor and leave workMode unchanged.
+   */
+  acceptPlanArtifact(sessionId: string, decision: { artifact: unknown; verdict: PlanArtifactVerdict; note?: string; decidedAt?: string }):
+    | { readonly ok: true; readonly posture: RuntimePlanPostureSummary; readonly decision: PlanArtifactDecision }
+    | { readonly ok: false; readonly code: string; readonly error: string };
   listSessionEvents(sessionId: string): Promise<readonly PersistedSessionEvent[]>;
   listSessions(options?: PersistedSessionListOptions): Promise<readonly PersistedSessionListItem[]>;
 }
@@ -133,6 +158,9 @@ interface BuiltHarnessSession {
   readonly registry: ToolRegistry;
   readonly mcpAttachment: McpAttachment;
   readonly planModePolicy: PlanModePolicy;
+  readonly posture: ResolvedPosture;
+  /** Latest plan-artifact decision the operator has rendered; absent = none yet. */
+  readonly planArtifactDecision?: PlanArtifactDecision;
 }
 
 interface RebuiltHarnessSessionDependencies {
@@ -234,6 +262,20 @@ export function createHarnessRuntime(dependencies: HarnessRuntimeDependencies = 
         return createMissingSessionObservation(sessionId, toolId);
       }
 
+      // Plan-mode floor (IDEA-A1): when workMode === "plan" the session may
+      // only run the certified read-only tools. The floor is evaluated BEFORE
+      // the mandate floor and BEFORE any approval posture can widen it.
+      const toolEffect = classifyToolEffect(builtSession.registry, toolId);
+      const planDecision = evaluatePlanFloor(builtSession.posture, toolId, toolEffect);
+      if (!planDecision.allowed) {
+        const blocked = createFailedRuntimeObservation(
+          toolId,
+          `Blocked by plan floor (${planDecision.code ?? PLAN_FLOOR_DENIED_CODE}): ${planDecision.reason ?? "tool is not allowlisted in plan mode."}`
+        );
+        await safeRecordToolObservation(sessionPersistenceStore, sessionId, blocked); // best-effort
+        return blocked;
+      }
+
       // Mandate floor (ADR 2026-07-05): the same evaluator the REPL uses, now
       // enforced for EVERY caller — headless api and SDK included. A blocked
       // call NEVER reaches the registry.
@@ -303,7 +345,7 @@ export function createHarnessRuntime(dependencies: HarnessRuntimeDependencies = 
     getSessionPlanModeTools(sessionId) {
       return sessions.get(sessionId)?.planModePolicy.listTools() ?? [];
     },
-    async executePlanModeTool(sessionId, toolId, input, signal, axes) {
+    async executePlanModeTool(sessionId, toolId, input, signal) {
       const builtSession = sessions.get(sessionId);
 
       if (!builtSession) {
@@ -314,13 +356,9 @@ export function createHarnessRuntime(dependencies: HarnessRuntimeDependencies = 
 
       // Refusal floor: a non-certified tool id is rejected BEFORE any execution
       // or extension hook fires, so plan mode never invokes a mutating tool or
-      // its general extension execution hooks. The dual-axis gate (IDEA-A1)
-      // consults the work/approval posture with fail-closed defaults; the
-      // approvalPosture axis is never consulted to widen the plan floor, so a
-      // `full` posture cannot turn this refusal into an allow.
-      const gate = evaluatePlanModeGate(axes ?? {}, toolId, policy.getTool(toolId) !== undefined);
-      if (!gate.allowed) {
-        return createFailedRuntimeObservation(toolId, gate.reason);
+      // its general extension execution hooks.
+      if (!policy.getTool(toolId)) {
+        return createFailedRuntimeObservation(toolId, `Tool is not allowlisted for plan mode: ${toolId}`);
       }
 
       initExtensions().host.sendMessage("tool:execute", { toolId, input });
@@ -348,6 +386,52 @@ export function createHarnessRuntime(dependencies: HarnessRuntimeDependencies = 
     },
     getSessionMcpStatuses(sessionId) {
       return sessions.get(sessionId)?.mcpAttachment.statuses ?? [];
+    },
+    getSessionPosture(sessionId) {
+      const builtSession = sessions.get(sessionId);
+      if (!builtSession) {
+        return undefined;
+      }
+      return summarizePosture(builtSession.posture);
+    },
+    setSessionPosture(sessionId, options) {
+      const builtSession = sessions.get(sessionId);
+      if (!builtSession) {
+        return undefined;
+      }
+      const readOnlyIds = PLAN_MODE_DEFAULT_TOOL_IDS;
+      const next = resolvePosture(options, builtSession.posture, readOnlyIds, () => new Date().toISOString());
+      const stored: BuiltHarnessSession = { ...builtSession, posture: next };
+      sessions.set(sessionId, stored);
+      return summarizePosture(next);
+    },
+    acceptPlanArtifact(sessionId, decisionInput) {
+      const builtSession = sessions.get(sessionId);
+      if (!builtSession) {
+        return { ok: false, code: "missing-session", error: `Harness session not found: ${sessionId}` };
+      }
+      const parseResult = parsePlanArtifact(decisionInput.artifact);
+      if (!parseResult.ok) {
+        return { ok: false, code: PLAN_ARTIFACT_INVALID_CODE, error: parseResult.error };
+      }
+      const decidedAt = decisionInput.decidedAt ?? new Date().toISOString();
+      const artifact: PlanArtifact = parseResult.artifact;
+      const stored: PlanArtifactDecision = {
+        artifactId: artifact.id,
+        verdict: decisionInput.verdict,
+        ...(decisionInput.note !== undefined ? { note: decisionInput.note } : {}),
+        decidedAt
+      };
+      let posture = builtSession.posture;
+      if (verdictLiftsPlanFloor(decisionInput.verdict) && posture.workMode === "plan") {
+        // Acceptance promotes the session out of plan mode WITHOUT auto-executing
+        // any of the artifact's approach steps — execution still requires a
+        // separate tool call which the mandate + plan floor then allow.
+        posture = resolvePosture({ workMode: "act" }, posture, Array.from(posture.effectiveReadOnlyToolIds), () => decidedAt);
+      }
+      const next: BuiltHarnessSession = { ...builtSession, posture, planArtifactDecision: stored };
+      sessions.set(sessionId, next);
+      return { ok: true, posture: summarizePosture(posture), decision: stored };
     },
     async closeSession(sessionId) {
       const builtSession = sessions.get(sessionId);
@@ -523,6 +607,20 @@ async function rebuildHarnessSession(
     ...(dependencies.interactiveCallbacks ? { interactiveCallbacks: dependencies.interactiveCallbacks } : {})
   });
 
+  // IDEA-A1: rebuild posture from persisted summary if available; otherwise
+  // resolve a fresh one from current options. Either way the floor allowlist
+  // is rebuilt from the live planModePolicy.
+  const readOnlyIds = planModePolicy.listTools().map((definition) => definition.id);
+  const rebuiltPosture = resolvePosture(
+    {
+      workMode: parsedOptions.workMode ?? session.posture?.workMode ?? DEFAULT_WORK_MODE,
+      approvalPosture: parsedOptions.approvalPosture ?? session.posture?.approvalPosture ?? DEFAULT_APPROVAL_POSTURE
+    },
+    undefined,
+    readOnlyIds,
+    () => new Date().toISOString()
+  );
+
   const rebuiltSession = HarnessSessionSchema.parse({
     ...session,
     config: materializeConfigSummary(configResult),
@@ -535,10 +633,11 @@ async function rebuildHarnessSession(
       ...session.skills,
       catalog
     },
-    tools: materializeTools(registry)
+    tools: materializeTools(registry),
+    posture: summarizePosture(rebuiltPosture)
   });
 
-  return { session: rebuiltSession, registry, mcpAttachment, planModePolicy };
+  return { session: rebuiltSession, registry, mcpAttachment, planModePolicy, posture: rebuiltPosture };
 }
 
 async function buildHarnessSession(
@@ -611,6 +710,19 @@ async function buildHarnessSession(
     }
   }
 
+  // IDEA-A1: initial posture is built from the operator-supplied options +
+  // the certified plan-mode policy's allowlist so the floor matches the
+  // surface the session actually exposes. Defaults are fail-closed (plan+ask).
+  const initialPosture = resolvePosture(
+    {
+      workMode: parsedOptions.workMode ?? DEFAULT_WORK_MODE,
+      approvalPosture: parsedOptions.approvalPosture ?? DEFAULT_APPROVAL_POSTURE
+    },
+    undefined,
+    planModePolicy.listTools().map((definition) => definition.id),
+    () => new Date().toISOString()
+  );
+
   const session = HarnessSessionSchema.parse({
     id: sessionId,
     runtimeName: configResult.config.runtimeName,
@@ -645,11 +757,12 @@ async function buildHarnessSession(
       approvalPolicy: configResult.config.approvalPolicy
     },
     tools: materializeTools(registry),
+    posture: summarizePosture(initialPosture),
     blockers,
     nextActions: buildNextActions(blockers, task, projectHarness)
   });
 
-  return { session, registry, mcpAttachment, planModePolicy };
+  return { session, registry, mcpAttachment, planModePolicy, posture: initialPosture };
 }
 
 interface CreateSessionToolingOptions extends CreateDefaultHarnessToolRegistryOptions {
@@ -829,4 +942,34 @@ function materializeRepositoryContext(repo: RepositoryContext): RepositoryContex
 
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Classify a registered tool's effect for the plan-mode floor. Pure: returns
+ * "read-only" when the tool explicitly declares it; defaults to "mutating"
+ * when unmarked (the safe default — unmarked tools cannot be widened by an
+ * approval posture).
+ */
+function classifyToolEffect(registry: ToolRegistry, toolId: string): ToolEffectCategory {
+  const definition = registry.get(toolId);
+  if (!definition) {
+    // Unknown tool ids are denied at the registry layer; the plan floor
+    // reports them as mutating so the deny code stays stable.
+    return "mutating";
+  }
+  return definition.effect === "read-only" ? "read-only" : "mutating";
+}
+
+/**
+ * Convert a ResolvedPosture into the wire-stable RuntimePlanPostureSummary
+ * carried on the session payload. Pure.
+ */
+function summarizePosture(posture: ResolvedPosture): RuntimePlanPostureSummary {
+  return RuntimePlanPostureSummarySchema.parse({
+    workMode: posture.workMode,
+    approvalPosture: posture.approvalPosture,
+    planFloorActive: posture.planFloorActive,
+    readOnlyAllowlist: Array.from(posture.effectiveReadOnlyToolIds).sort(),
+    resolvedAt: posture.resolvedAt
+  });
 }
