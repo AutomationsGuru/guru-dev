@@ -1,5 +1,10 @@
 import { z } from "zod";
 
+// G1055 LHT runtime lifecycle: types + session context for config-driven init
+import type { GuruHarnessConfig, LHTProfileMinima } from "../types.js";
+import { createSessionContext } from "../session/context.js";
+import { DEFAULT_PROFILE_MINIMA } from "../lht/profile-minima.js";
+
 /**
  * The enforced boot ritual (Boot Ritual wave, ADR 2026-07-05-boot-ritual, THERE
  * v2 §4 + Article 4). Five ORDERED, NON-SKIPPABLE phases run as deterministic
@@ -76,11 +81,48 @@ export const BootReportSchema = z
   });
 export type BootReport = z.infer<typeof BootReportSchema>;
 
+// === G1055 LHT runtime lifecycle vars (module-scoped, non-intrusive when disabled) ===
+let lhtPollInterval: NodeJS.Timeout | null = null;
+let lhtEnabled = false;
+let lhtPollIntervalMs = 5000;
+let profileMinima: LHTProfileMinima | undefined;
+
+/**
+ * Initialize LHT from optional GuruHarnessConfig.lht.
+ * Defaults pollIntervalMs to 5000, wires profileMinima from config or default.
+ * All subsequent LHT behavior is gated on lhtEnabled.
+ */
+function initializeLhtFromConfig(config?: GuruHarnessConfig): void {
+  const lht = config?.lht;
+  lhtEnabled = !!lht?.enabled;
+  if (lhtEnabled) {
+    lhtPollIntervalMs = lht?.pollIntervalMs ?? 5000;
+    profileMinima = lht?.profileMinima ?? DEFAULT_PROFILE_MINIMA;
+  }
+}
+
+export function getLhtPollInterval(): number {
+  return lhtPollIntervalMs;
+}
+
+export function shutdownLht(): void {
+  if (lhtPollInterval) {
+    clearInterval(lhtPollInterval);
+    lhtPollInterval = null;
+  }
+  lhtEnabled = false;
+}
+
 /**
  * Run the five phases IN ORDER. Non-skippable: a hook that throws degrades to a
  * `warn` phase and the ritual still completes all five. Returns the typed report.
  */
-export function runBootRitual(hooks: BootRitualHooks, sessionNumber: number): BootReport {
+export function runBootRitual(hooks: BootRitualHooks, sessionNumber: number, config?: GuruHarnessConfig): BootReport {
+  // G1055: Wire LHT initialization in PHASE 1 when enabled (guarded, non-intrusive when disabled)
+  if (config?.lht?.enabled) {
+    initializeLhtFromConfig(config);
+  }
+
   const phases: BootPhaseResult[] = [];
   PHASE_SEQUENCE.forEach((step, index) => {
     let output: PhaseOutput;
@@ -96,6 +138,21 @@ export function runBootRitual(hooks: BootRitualHooks, sessionNumber: number): Bo
       status: output.status,
       lines: [...output.lines]
     });
+
+    // G1055: PHASE 1 (kernel) already initialized above when enabled
+    // G1055: Add LHT state to session context in PHASE 2 (garage)
+    if (lhtEnabled && index === 1) {
+      createSessionContext(config); // populates SessionContext.lht from config
+    }
+
+    // G1055: Add graceful shutdown via shutdownLht in PHASE 4 (work declaration)
+    if (lhtEnabled && index === 3) {
+      shutdownLht();
+    }
   });
+
   return BootReportSchema.parse({ sessionNumber, phases });
 }
+
+// G1055: Graceful LHT shutdown is wired in PHASE 4 via shutdownLht() when enabled.
+// No top-level process handlers here to keep ritual pure and testable.

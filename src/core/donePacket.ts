@@ -1,9 +1,12 @@
 import {
   DonePacketSchema,
+  LhtStatusSchema,
   ToolResultSchema,
   VerdictSchema,
   type DonePacket,
   type DonePacketInput,
+  type LhtStatus,
+  type LhtStatusType,
   type ToolResult,
   type Verdict
 } from "./types.js";

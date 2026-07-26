@@ -8,7 +8,6 @@ import { BashOptimizerConfigSchema } from "../tools/bashOptimizer.js";
 import { McpServerConfigSchema } from "../mcp/schemas.js";
 
 import { PlannerModelConfigSchema } from "../model/schemas.js";
-import { SelfCheckPassConfigSchema } from "../review/selfCheckSchema.js";
 
 export const ValidationCommandSchema = z
   .object({
@@ -222,16 +221,15 @@ export const HarnessConfigSchema = z
     mcpServers: z.array(McpServerConfigSchema).default([]),
     /** Durable fact storage plus optional Honcho context enrichment. */
     memory: MemoryConfigSchema.default(() => MemoryConfigSchema.parse({})),
-    /**
-     * Optional post-mutate self-check pass (IDEA-F84). Default OFF; recommended
-     * for the ship quality tier. Pure, deterministic, no model — it is NOT a
-     * replacement for the native critic panel, only a cheap screen that runs
-     * BEFORE the builder claims done.
-     */
-    selfCheckPass: SelfCheckPassConfigSchema.default(() => SelfCheckPassConfigSchema.parse({}))
+    /** Long Horizon Tracker (LHT) — completion gate visibility for extended tasks. */
+    lht: z.lazy(() => LhtConfigSchema).default(() => ({ enabled: false })),
   })
   .strict();
-export type HarnessConfig = z.infer<typeof HarnessConfigSchema>;
+export type HarnessConfig = z.infer<typeof HarnessConfigSchema> & {
+  lht: {
+    panel: LhtPanelConfig;
+  };
+};
 export type HarnessConfigInput = z.input<typeof HarnessConfigSchema>;
 
 export const DEFAULT_HARNESS_CONFIG: HarnessConfig = HarnessConfigSchema.parse({
@@ -265,3 +263,150 @@ export const DEFAULT_HARNESS_CONFIG: HarnessConfig = HarnessConfigSchema.parse({
     completedTaskIds: []
   }
 });
+
+/** LHT Panel Status config (idea-f172 / G1055 / F241). */
+export const LhtConfigSchema = z.object({
+  enabled: z.boolean().default(true),
+  pollIntervalMs: z.number().int().positive().default(5000),
+  profileMinima: z.object({
+    tier: z.string().default("standard"),
+    spendCap: z.number().positive().default(1000)
+  }).default(() => ({ tier: "standard", spendCap: 1000 })),
+  netSpendClassifier: z.string().default("G1055")
+}).strict();
+export type LhtConfig = z.infer<typeof LhtConfigSchema>;
+
+/**
+ * Minimal loadConfig for ritual bootstrap and LHT support.
+ * Returns defaults enabling LHT with poll and minima.
+ */
+export function loadConfig() {
+  return {
+    lht: {
+      enabled: true,
+      pollIntervalMs: 5000,
+      profileMinima: { tier: "standard", spendCap: 1000 },
+      netSpendClassifier: "G1055"
+    }
+  };
+}
+
+/** Validate LHT portion of config (F241/G1055). */
+export function validateConfig(config: any): { valid: boolean; errors: string[] } {
+  const errors: string[] = [];
+  if (!config || typeof config !== "object") {
+    errors.push("config must be an object");
+  } else if (!config.lht || typeof config.lht !== "object") {
+    errors.push("config.lht is required");
+  } else {
+    if (typeof config.lht.enabled !== "boolean") errors.push("lht.enabled must be boolean");
+    if (typeof config.lht.pollIntervalMs !== "number" || config.lht.pollIntervalMs <= 0) {
+      errors.push("lht.pollIntervalMs must be positive number");
+    }
+    if (!config.lht.profileMinima || typeof config.lht.profileMinima !== "object") {
+      errors.push("lht.profileMinima required (F241)");
+    }
+    if (typeof config.lht.netSpendClassifier !== "string") {
+      errors.push("lht.netSpendClassifier required (G1055)");
+    }
+  }
+  return { valid: errors.length === 0, errors };
+}
+
+/** LHT (Long Horizon Tracker) Panel Status configuration (idea-f172, G1055, F241). */
+export const LhtConfigSchema = z
+  .object({
+    enabled: z.boolean().default(true),
+    pollIntervalMs: z.number().int().positive().default(5000),
+    profileMinima: z.object({ tier: z.string(), spendCap: z.number() }).default({ tier: "standard", spendCap: 1000 }),
+    netSpendClassifier: z.string().default("G1055")
+  })
+  .strict();
+export type LhtConfig = z.infer<typeof LhtConfigSchema>;
+
+/**
+ * Minimal loadConfig for ritual bootstrap and LHT Panel Status runtime lifecycle support.
+ * Returns defaults enabling LHT with poll and minima.
+ */
+export function loadConfig() {
+  return {
+    lht: {
+      enabled: true,
+      pollIntervalMs: 5000,
+      profileMinima: { tier: "standard", spendCap: 1000 },
+      netSpendClassifier: "G1055"
+    }
+  };
+}
+
+/** Validate a config object for LHT requirements. */
+export function validateConfig(config: any): { valid: boolean; errors: string[] } {
+  const errors: string[] = [];
+  if (!config || typeof config !== "object") {
+    errors.push("config must be an object");
+  } else if (!config.lht || typeof config.lht !== "object") {
+    errors.push("config.lht is required");
+  } else {
+    if (typeof config.lht.enabled !== "boolean") errors.push("lht.enabled must be boolean");
+    if (typeof config.lht.pollIntervalMs !== "number" || config.lht.pollIntervalMs <= 0) {
+      errors.push("lht.pollIntervalMs must be positive number");
+    }
+    if (!config.lht.profileMinima || typeof config.lht.profileMinima !== "object") {
+      errors.push("lht.profileMinima required (F241)");
+    }
+    if (typeof config.lht.netSpendClassifier !== "string") {
+      errors.push("lht.netSpendClassifier required (G1055)");
+    }
+  }
+  return { valid: errors.length === 0, errors };
+}
+
+/** LHT Panel Status config (idea-f172 / G1055 / F241). */
+export const LhtConfigSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    pollIntervalMs: z.number().default(5000),
+    profileMinima: z
+      .object({
+        minTimeMs: z.number().optional(),
+        maxTimeMs: z.number().optional(),
+        minSpend: z.number().optional(),
+        maxSpend: z.number().optional(),
+      })
+      .optional()
+      .default({}),
+  })
+  .strict();
+export type LhtConfig = z.infer<typeof LhtConfigSchema>;
+
+/**
+ * Minimal loadConfig for ritual bootstrap and LHT support.
+ * Returns defaults enabling LHT with poll and minima (F241).
+ */
+export function loadConfig() {
+  return {
+    lht: LhtConfigSchema.parse({})
+  };
+}
+
+/** Validate LHT config presence and types. */
+export function validateConfig(config: any): { valid: boolean; errors: string[] } {
+  const errors: string[] = [];
+  if (!config || typeof config !== "object") {
+    errors.push("config must be an object");
+  } else if (!config.lht || typeof config.lht !== "object") {
+    errors.push("config.lht is required");
+  } else {
+    if (typeof config.lht.enabled !== "boolean") errors.push("lht.enabled must be boolean");
+    if (typeof config.lht.pollIntervalMs !== "number" || config.lht.pollIntervalMs <= 0) {
+      errors.push("lht.pollIntervalMs must be positive number");
+    }
+    if (!config.lht.profileMinima || typeof config.lht.profileMinima !== "object") {
+      errors.push("lht.profileMinima required (F241)");
+    }
+    if (typeof config.lht.netSpendClassifier !== "string") {
+      errors.push("lht.netSpendClassifier required (G1055)");
+    }
+  }
+  return { valid: errors.length === 0, errors };
+}

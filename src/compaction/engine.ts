@@ -1,6 +1,6 @@
 import { scrubSecretValues } from "../safety/secretSafety.js";
 
-import { findCutPoint, type CutPlan } from "./cutPoint.js";
+import { findCutPoint, type CutPlan, type CutPoint } from "./cutPoint.js";
 import { estimateTokens, type TokenEstimator } from "./estimate.js";
 import {
   CompactionStateSchema,
@@ -9,6 +9,7 @@ import {
   type CompactionState,
   type TranscriptEntry
 } from "./schemas.js";
+import type { LhtState } from "../core/donePacket.js";
 
 /**
  * The compaction engine (ADR 2026-07-04-compaction-engine): plan a tool-pair-safe
@@ -55,6 +56,8 @@ export interface CompactionRunOptions {
   readonly sessionFiles?: CompactionDetails;
   readonly beforeCompact?: BeforeCompactHook;
   readonly onCompact?: CompactHook;
+  /** LHT state snapshot from beforeLhtCompact hook for persistence across folds (idea-f172) */
+  readonly previousLhtSnapshot?: { state: unknown; compactionCount: number };
 }
 
 export interface CompactionRunResult {
@@ -212,7 +215,8 @@ export async function runCompaction(
     tokensBefore: plan.tokensBefore,
     compactedAt: options.now().toISOString(),
     count: (options.previousCount ?? 0) + 1,
-    details
+    details,
+    ...(options.previousLhtSnapshot !== undefined ? { lhtSnapshot: options.previousLhtSnapshot } : {}),
   });
 
   const summaryEntry: TranscriptEntry = {
