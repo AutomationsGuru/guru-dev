@@ -36,6 +36,12 @@ import { runInteractiveTui, runTuiCommand } from "./surfaces/tui.js";
 import { runCapabilitySmoke } from "./readiness/capabilitySmoke.js";
 import { probeCatalog, renderProbeMarkdown } from "./probes/capabilityProbe.js";
 import { createDirectProviderCatalog } from "./providers/catalog.js";
+import { getLhtService } from "./lht/service.js";
+import { getLhtService } from "./lht/service.js";
+import { getLhtService } from "./lht/service.js";
+import { getLhtService } from "./lht/service.js";
+import { getLhtService } from "./lht/service.js";
+import { getLhtService } from "./lht/service.js";
 
 const args = process.argv.slice(2);
 const [command] = args;

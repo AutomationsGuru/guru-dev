@@ -74,7 +74,6 @@ import { listManifests, loadManifest, parkManifest } from "./garage/store.js";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { AgentSession, type TurnDriver} from "./session/agentSession.js";
 import { runRpcMode } from "./surfaces/rpc.js";
-import { runBootMode } from "./surfaces/bootMode.js";
 import { runBootRitual, type BootRitualHooks, type PhaseOutput } from "./boot/ritual.js";
 import { incrementSessionCounter } from "./boot/sessionCounter.js";
 import { evaluateAndClose, loadGapRecords, makeGapRecord, saveGapRecords, upsertGapRecords } from "./garage/gapRecords.js";
@@ -122,6 +121,14 @@ import { basename, dirname, join, resolve as resolvePath } from "node:path";
 import { createPainter, loadTheme, type Painter } from "./tui/theme.js";
 import { renderSplash } from "./tui/splash.js";
 import { badge, clipVisible, compactMark, GLYPHS, renderTable, roundedBox, spinnerFrame, visibleWidth } from "./tui/components.js";
+import { renderLhtPanel, formatElapsed } from "./lht/panel.js";
+import type { LhtPanelConfig } from "./config/schema.js";
+import { renderLhtPanel } from "./lht/panel.js";
+import type { LhtPanelConfig } from "./config/schema.js";
+import { renderLhtPanel, type LhtPanelConfig } from "./lht/panel.js";
+import { renderLhtPanel } from "./lht/panel.js";
+import { renderLhtPanel, type LhtPanelConfig } from "./lht/panel.js";
+import { renderLhtPanel } from "./lht/panel.js";
 import { createMenuState, enterDrill, menuReduce, refilter, selectedItem, type MenuItem, type MenuKey, type MenuState } from "./tui/menu.js";
 import { composerTopRule, composerHintLine } from "./tui/composer.js";
 import {
@@ -5083,22 +5090,11 @@ export async function runGuru(): Promise<void> {
     await runKeysCli(process.argv.slice(keysIndex + 1));
     return;
   }
-  // Headless surfaces: --mode rpc / --mode boot → JSON(L) over stdio on the
-  // unified AgentSession engine (no banner, no TUI). rpc drives the same
-  // driveTurn the REPL drives; boot streams NDJSON boot events.
+  // Headless RPC surface (§14): guru --mode rpc → JSONL over stdio on the unified
+  // AgentSession engine (no banner, no TUI). The same driveTurn the REPL drives.
   const modeIndex = process.argv.indexOf("--mode");
-  const mode = modeIndex >= 0 ? process.argv[modeIndex + 1] : undefined;
-  if (mode === "rpc") {
+  if (modeIndex >= 0 && process.argv[modeIndex + 1] === "rpc") {
     await runRpcMode();
-    return;
-  }
-  if (mode === "boot") {
-    const cwdIndex = process.argv.indexOf("--cwd");
-    const cwd = cwdIndex >= 0 ? process.argv[cwdIndex + 1] : undefined;
-    await runBootMode({
-      dryRun: process.argv.includes("--dry-run"),
-      ...(cwd !== undefined ? { cwd } : {}),
-    });
     return;
   }
 
