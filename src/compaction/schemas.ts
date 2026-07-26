@@ -59,3 +59,12 @@ export const CompactionStateSchema = z
   })
   .strict();
 export type CompactionState = z.infer<typeof CompactionStateSchema>;
+
+/** Condenser strategy contract (G1055 net-spend aware selection; non-breaking default path). */
+export interface CondenserStrategy {
+  readonly id: string;
+  readonly label: string;
+  /** Optional seam to wire G1055 spend classifier without altering legacy behavior. */
+  readonly shouldUseG1055?: (context: { hasSpendSignal: boolean }) => boolean;
+}
+export type CondenserStrategyId = "legacy" | "g1055-net-spend";
