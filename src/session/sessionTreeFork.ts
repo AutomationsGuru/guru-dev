@@ -46,9 +46,6 @@ export interface ForkFromLeafOptions {
  * Fork from a leaf node. This is the common primary-operator-path case where the
  * current conversation end becomes the start of a new branch. If `leafId` is
  * omitted, forks from the first leaf.
- *
- * Isolation: the input `tree` is not mutated. A new tree is returned that
- * shares structure only by value (nodes are rebuilt into a fresh builder).
  */
 export function forkFromLeaf(options: ForkFromLeafOptions): SessionTreeForkResult {
   const leafId = options.leafId ?? findLeaves(options.tree)[0]?.id;
@@ -102,7 +99,6 @@ export function buildSessionTreeFromForks(options: BuildSessionTreeFromForksOpti
 
 export interface NavigateResult {
   readonly current: SessionTreeNode;
-  /** Ancestors from root toward the parent of `current` (root first). */
   readonly path: readonly SessionTreeNode[];
   readonly siblings: readonly SessionTreeNode[];
   readonly children: readonly SessionTreeNode[];
@@ -113,8 +109,8 @@ export interface NavigateResult {
 
 /**
  * Return everything a UI or RPC needs to render navigation around a node:
- * the node itself, its path to root (ancestors only, root first), its siblings,
- * its children, and booleans describing what moves are available.
+ * the node itself, its path to root, its siblings, its children, and booleans
+ * describing what moves are available.
  */
 export function navigateToNode(tree: SessionTree, nodeId: string): NavigateResult {
   const current = tree.nodes.get(nodeId);
@@ -122,8 +118,7 @@ export function navigateToNode(tree: SessionTree, nodeId: string): NavigateResul
     throw new Error(`Cannot navigate: node ${nodeId} not found`);
   }
 
-  // getAncestors is root-first excluding self — that is the path for navigation.
-  const path = getAncestors(tree, nodeId);
+  const path = [...getAncestors(tree, nodeId)].reverse();
   const parent = current.parentId !== null ? tree.nodes.get(current.parentId) ?? null : null;
   const siblings = parent !== null
     ? parent.children
@@ -146,19 +141,14 @@ export function navigateToNode(tree: SessionTree, nodeId: string): NavigateResul
   };
 }
 
-/** Reconstruct a mutable builder from an existing tree (deep copy by value). */
+/** Reconstruct a mutable builder from an existing tree. */
 function treeToBuilder(tree: SessionTree): ReturnType<typeof createSessionTreeBuilder> {
   const builder = createSessionTreeBuilder();
   const root = tree.nodes.get(tree.rootId);
   if (root === undefined) {
     throw new Error("SessionTree root missing");
   }
-  const rootOptions = {
-    id: root.id,
-    label: root.label,
-    createdAt: root.createdAt,
-    checkpoint: root.checkpoint
-  };
+  const rootOptions = { id: root.id, label: root.label, createdAt: root.createdAt, checkpoint: root.checkpoint };
   builder.createRoot(rootOptions);
 
   // BFS from root to recreate nodes in parent-first order.
