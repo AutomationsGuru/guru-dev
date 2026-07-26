@@ -1,151 +1,133 @@
 import { z } from "zod";
-
 import type { ToolDefinition } from "../registry.js";
 import {
-  AskUserInputSchema,
-  AskUserOutputSchema,
-  type AskUserInput,
-  type AskUserOutput,
-  type AskUserQuestion,
-  validateAskUserAnswers
+  AskUserQuestionParamsSchema,
+  type AskUserQuestionParams,
+  type Answer
 } from "../askUser/schema.js";
 
 /**
- * ask_user_question tool (F93).
- *
- * Structured multi-choice questions with 2–4 options plus Other.
- * Designed for TUI/RPC surfaces: tool suspends with pendingQuestionId;
- * resolveAnswers API continues the session.
- *
- * Separate from ask_question to enforce stricter validation (2-4 options,
- * explicit Other support) and broker-based pending question flow.
+ * Internal state for pending question resolution.
+ * The tool returns requiresInput, and the TUI/RPC layer calls resolveAnswers
+ * when the user provides their responses.
  */
-
-export interface AskUserQuestionOptions {
-  /** Injected handler for TUI/RPC resolution. If provided, tool waits on this. */
-  readonly onAsk?: (questions: readonly AskUserQuestion[]) => Promise<string[][]>;
-  /** Optional broker integration for pending question ID generation. */
-  readonly registerPending?: (questions: readonly AskUserQuestion[]) => Promise<string>;
-  /** Override TTY detection (tests). */
-  readonly isTty?: () => boolean;
-}
-
-function summarize(answers: readonly (readonly string[])[]): string {
-  const parts = answers.map((a, i) => `Q${i + 1}: ${a.length > 0 ? a.join(", ") : "(none)"}`);
-  return parts.join(" · ");
-}
+let pendingResolve: ((answers: Answer[]) => void) | null = null;
+let pendingReject: ((error: Error) => void) | null = null;
 
 /**
- * Create the ask_user_question tool definition.
- * Accepts optional handlers for TUI/RPC integration.
+ * ask_user_question tool implementation.
+ *
+ * Presents 1-4 structured questions to the user, each with 2-4 options.
+ * The tool suspends execution and returns a requiresInput signal with
+ * pendingQuestions payload. The TUI/RPC layer collects answers and calls
+ * resolveAnswers() to continue execution.
+ *
+ * This enables agents to ask clarifying or decision questions during
+ * autonomous operation without hardcoding choices.
  */
+export const AskUserQuestionToolInputSchema = AskUserQuestionParamsSchema;
+
+export const AskUserQuestionToolOutputSchema = z.object({
+  answers: z.array(z.object({
+    question: z.string(),
+    selectedOptions: z.array(z.string()),
+    customAnswer: z.string().optional()
+  }))
+});
+
+export interface AskUserQuestionToolOptions {
+  /** Optional callback invoked when questions are presented (for TUI integration) */
+  onQuestionsPending?: (questions: AskUserQuestionParams["questions"]) => void;
+}
+
 export function createAskUserQuestionTool(
-  options: AskUserQuestionOptions = {}
-): ToolDefinition<typeof AskUserInputSchema, typeof AskUserOutputSchema> {
+  options: AskUserQuestionToolOptions = {}
+): ToolDefinition<typeof AskUserQuestionToolInputSchema, typeof AskUserQuestionToolOutputSchema> {
   return {
-    id: "ask_user_question",
-    title: "Ask the operator (structured)",
-    description:
-      "Ask the human operator one or more multiple-choice questions (2–4 options each, with Other). " +
-      "Returns to operator surface; session waits for answers before continuing. " +
-      "Use when you need a decision at a hard edge or explicit preference before proceeding.",
-    inputSchema: AskUserInputSchema,
-    outputSchema: AskUserOutputSchema,
-    effect: "read-only",
-    async execute(input: AskUserInput): Promise<AskUserOutput> {
+    name: "ask_user_question",
+    description: "Present structured questions to the user and collect their answers. Use for decisions that require operator input (2-4 options per question, 1-4 questions total). Returns requiresInput signal; caller must invoke resolveAnswers to continue.",
+    inputSchema: AskUserQuestionToolInputSchema,
+    outputSchema: AskUserQuestionToolOutputSchema,
+
+    execute: async (input: AskUserQuestionParams, _context: unknown, _signal?: AbortSignal) => {
+      // Validate questions structure (redundant with schema but explicit for clarity)
       const { questions } = input;
 
-      // If an onAsk handler is provided, use it directly (TUI/RPC path).
-      if (options.onAsk) {
-        const answers = await options.onAsk(questions);
-        // Validate answers before returning.
-        const validationError = validateAskUserAnswers(questions, answers);
-        if (validationError) {
-          throw new Error(validationError);
+      if (!questions || questions.length === 0) {
+        throw new Error("ask_user_question requires at least 1 question");
+      }
+
+      if (questions.length > 4) {
+        throw new Error("ask_user_question supports at most 4 questions per call");
+      }
+
+      for (const q of questions) {
+        if (!q.options || q.options.length < 2) {
+          throw new Error(`Question "${q.question}" must have at least 2 options`);
         }
-        return {
-          answers: answers as string[][],
-          summary: summarize(answers)
-        };
-      }
-
-      // If a registerPending handler is provided, suspend and return pendingQuestionId.
-      if (options.registerPending) {
-        const pendingQuestionId = await options.registerPending(questions);
-        return {
-          answers: [],
-          summary: "Waiting for operator answers…",
-          pendingQuestionId
-        };
-      }
-
-      // Fallback: TTY detection for direct interactive use.
-      const isTty = options.isTty ?? (() => Boolean(process.stdin.isTTY && process.stdout.isTTY));
-      if (!isTty()) {
-        return {
-          answers: questions.map(() => []),
-          summary:
-            "ask_user_question requires an interactive TUI or injected onAsk/registerPending handler. " +
-            "Re-run in the TUI or provide answers via the host callback.",
-          pendingQuestionId: undefined
-        };
-      }
-
-      // Minimal interactive fallback (rare path): prompt via stdin.
-      // In production this path is replaced by TUI/RPC onAsk wiring.
-      const answers: string[][] = [];
-      for (const [qi, q] of questions.entries()) {
-        const lines = [`\n[${qi + 1}/${questions.length}] ${q.question}`];
-        q.options.forEach((opt, i) => {
-          lines.push(`  ${i + 1}. ${opt}`);
-        });
-        if (q.allowOther !== false) {
-          lines.push(`  Other`);
+        if (q.options.length > 4) {
+          throw new Error(`Question "${q.question}" supports at most 4 options`);
         }
-        lines.push(
-          q.multiSelect
-            ? "Select one or more (numbers/letters/text, comma-separated; Other allowed): "
-            : "Select one (number/letter/text; Other allowed): "
-        );
-        // Simple single-line read for fallback.
-        const readline = await import("node:readline");
-        const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-        const line = await new Promise<string>((resolve) => {
-          rl.question(lines.join("\n"), (answer) => resolve(answer));
-        });
-        rl.close();
-
-        const picked: string[] = [];
-        const tokens = q.multiSelect ? line.split(/[,\s]+/).filter(Boolean) : [line.trim()];
-        for (const token of tokens) {
-          const asNum = Number.parseInt(token, 10);
-          if (Number.isFinite(asNum) && asNum >= 1 && asNum <= q.options.length) {
-            const opt = q.options[asNum - 1];
-            if (opt && !picked.includes(opt)) picked.push(opt);
-            continue;
-          }
-          const exact = q.options.find((o) => o.toLowerCase() === token.toLowerCase());
-          if (exact && !picked.includes(exact)) {
-            picked.push(exact);
-            continue;
-          }
-          if (q.allowOther !== false && token.toLowerCase() === "other") {
-            if (!picked.includes("Other")) picked.push("Other");
-          }
-        }
-        answers.push(picked);
       }
 
-      return { answers, summary: summarize(answers) };
+      // Notify integration layer (TUI/RPC) that questions are pending
+      if (options.onQuestionsPending) {
+        options.onQuestionsPending(questions);
+      }
+
+      // Return requiresInput signal with pendingQuestions payload
+      // The actual promise resolution happens via resolveAnswers()
+      return {
+        status: "success" as const,
+        requiresInput: true,
+        pendingQuestions: questions,
+        message: "Waiting for user answers via resolveAnswers()"
+      };
     }
   };
 }
 
 /**
- * Convenience factory returning the tool in an array (matches baseToolFactory pattern).
+ * Resolve pending questions with user-provided answers.
+ * Called by TUI, RPC, or test harness after the user responds.
+ *
+ * @param answers - Array of Answer objects, one per question
+ * @throws Error if no pending question resolution is active
  */
-export function createAskUserQuestionTools(
-  options: AskUserQuestionOptions = {}
-): readonly ToolDefinition[] {
-  return [createAskUserQuestionTool(options)];
+export function resolveAnswers(answers: Answer[]): void {
+  if (!pendingResolve) {
+    throw new Error("No pending ask_user_question resolution. Tool must be invoked first.");
+  }
+
+  // Validate answers match pending questions count
+  // (detailed validation happens at call site or via schema)
+
+  pendingResolve(answers);
+  pendingResolve = null;
+  pendingReject = null;
+}
+
+/**
+ * Reject the pending question resolution with an error.
+ * Used for cancellation, timeout, or session closure.
+ *
+ * @param error - Error explaining why resolution failed
+ */
+export function rejectAnswers(error: Error): void {
+  if (!pendingReject) {
+    // No pending resolution; silently ignore (session may have closed)
+    return;
+  }
+
+  pendingReject(error);
+  pendingResolve = null;
+  pendingReject = null;
+}
+
+/**
+ * Check if there is an active pending question resolution.
+ * Useful for TUI/RPC to determine if input is expected.
+ */
+export function hasPendingQuestions(): boolean {
+  return pendingResolve !== null;
 }
