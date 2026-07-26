@@ -1,135 +1,137 @@
 /**
- * MidTaskWorkspaceMove — pure state machine for workspace relocation during a
- * running session. Marks a session as relocating, preserves worktreePath in a
- * snapshot, and transitions through idle → relocating → completed.
+ * Mid-task workspace move — pure relocation state machine.
  *
- * No actual worktree, branch, session, or filesystem operations — this is the
- * state layer only. The executor/coordinator layers own the physical move.
+ * Marks a session as relocating, preserves the worktreePath in a snapshot,
+ * and gates completion so callers cannot resume work at the old path.
+ * No actual filesystem moves; this is state logic only.
+ *
+ * IDEA-F476-MOVE-01 — owned by the Linux builder lane.
  */
 
-/** The relocation lifecycle. */
-export type MoveStatus = "idle" | "relocating" | "completed";
+/** Discriminated phases of a workspace relocation. */
+export type MovePhase = "active" | "relocating" | "relocated";
 
-/** Immutable snapshot captured when a move begins. */
-export interface MoveSnapshot {
-  readonly sourcePath: string;
-  readonly targetPath: string;
-  readonly startedAt: string; // ISO-8601
+/** Immutable snapshot of a workspace relocation in progress or completed. */
+export interface WorkspaceMoveState {
+  readonly phase: MovePhase;
+  /** The current workspace path (pre-move or post-move, depending on phase). */
+  readonly worktreePath: string;
+  /** Snapshot of the original path, captured when beginMove was called. */
+  readonly originalPath: string | null;
+  /** The target path supplied to beginMove. */
+  readonly targetPath: string | null;
+  /** ISO-8601 timestamp recorded when completeMove finishes. */
+  readonly relocatedAt: string | null;
 }
-
-/** Full relocation state, valid in any lifecycle phase. */
-export interface MidTaskWorkspaceMoveState {
-  readonly status: MoveStatus;
-  /** The snapshot captured at beginMove; undefined only when idle. */
-  readonly snapshot: MoveSnapshot | null;
-}
-
-/** Parameters to initiate a mid-task workspace relocation. */
-export interface BeginMoveParams {
-  /** The current (source) workspace/working directory path. */
-  readonly sourcePath: string;
-  /** The target workspace path to relocate into. */
-  readonly targetPath: string;
-  /** ISO-8601 timestamp (caller-provided for deterministic testability). */
-  readonly now: string;
-}
-
-// -- initial state -----------------------------------------------------------
-
-/** The idle state — no relocation active or completed yet. */
-export const IDLE_STATE: MidTaskWorkspaceMoveState = Object.freeze({
-  status: "idle",
-  snapshot: null
-});
-
-// -- guards ------------------------------------------------------------------
-
-/** Returns true when a move has not yet been initiated. */
-export function canBeginMove(state: MidTaskWorkspaceMoveState): boolean {
-  return state.status === "idle";
-}
-
-/** Returns true when a move is actively in progress (between begin and complete). */
-export function isRelocating(state: MidTaskWorkspaceMoveState): boolean {
-  return state.status === "relocating";
-}
-
-/** Returns true when a move has been successfully completed. */
-export function isMoveCompleted(state: MidTaskWorkspaceMoveState): boolean {
-  return state.status === "completed";
-}
-
-// -- transitions -------------------------------------------------------------
 
 /**
- * Begin a workspace relocation. Transitions idle → relocating and captures a
- * snapshot of the source workspace.
+ * Create a fresh move state for a session that has never been relocated.
+ * The session starts active at its initial worktree path.
+ */
+export function createMoveState(worktreePath: string): WorkspaceMoveState {
+  return {
+    phase: "active",
+    worktreePath,
+    originalPath: null,
+    targetPath: null,
+    relocatedAt: null,
+  };
+}
+
+/** Error thrown when a move transition is attempted from the wrong phase. */
+export class MidTaskMovePhaseError extends Error {
+  constructor(
+    message: string,
+    public readonly currentPhase: MovePhase,
+    public readonly attemptedTransition: string,
+  ) {
+    super(message);
+    this.name = "MidTaskMovePhaseError";
+  }
+}
+
+/**
+ * Begin a workspace move: snapshot the current path and transition to
+ * `relocating`. Callers must not submit work while the session is in this
+ * phase — the harness is paused until `completeMove` finishes.
  *
- * Returns the new state on success, or an error string when the current status
- * forbids beginning a move.
+ * @throws {MidTaskMovePhaseError} if the session is not `active`.
  */
 export function beginMove(
-  state: MidTaskWorkspaceMoveState,
-  params: BeginMoveParams
-): MidTaskWorkspaceMoveState | string {
-  if (state.status !== "idle") {
-    return `Cannot begin workspace move: current status is "${state.status}"`;
+  state: WorkspaceMoveState,
+  targetPath: string,
+  now: () => Date = () => new Date(),
+): WorkspaceMoveState {
+  if (state.phase !== "active") {
+    throw new MidTaskMovePhaseError(
+      `Cannot begin workspace move: session phase is "${state.phase}" (expected "active").`,
+      state.phase,
+      "beginMove",
+    );
   }
-  if (!params.sourcePath || params.sourcePath.trim().length === 0) {
-    return "Cannot begin workspace move: sourcePath is empty";
+  if (!targetPath || targetPath.trim().length === 0) {
+    throw new MidTaskMovePhaseError(
+      "Cannot begin workspace move: targetPath must be a non-empty string.",
+      state.phase,
+      "beginMove",
+    );
   }
-  if (!params.targetPath || params.targetPath.trim().length === 0) {
-    return "Cannot begin workspace move: targetPath is empty";
-  }
-  if (params.sourcePath === params.targetPath) {
-    return "Cannot begin workspace move: sourcePath and targetPath are identical";
-  }
-  return Object.freeze({
-    status: "relocating" as const,
-    snapshot: Object.freeze({
-      sourcePath: params.sourcePath,
-      targetPath: params.targetPath,
-      startedAt: params.now
-    })
-  });
+  return {
+    phase: "relocating",
+    worktreePath: state.worktreePath, // preserved until move completes
+    originalPath: state.worktreePath,
+    targetPath: targetPath.trim(),
+    relocatedAt: null,
+  };
 }
 
 /**
- * Complete a workspace relocation. Transitions relocating → completed.
+ * Complete a workspace move: switch to the new path and transition to
+ * `relocated`. After this call the session's worktreePath reflects the
+ * new location and `originalPath` holds the pre-move snapshot.
  *
- * The snapshot is preserved so callers can inspect what was moved even after
- * the move has finished.
- *
- * Returns the new state on success, or an error string when the current status
- * forbids completion.
+ * @throws {MidTaskMovePhaseError} if the session is not `relocating`.
  */
 export function completeMove(
-  state: MidTaskWorkspaceMoveState
-): MidTaskWorkspaceMoveState | string {
-  if (state.status !== "relocating") {
-    return `Cannot complete workspace move: current status is "${state.status}"`;
+  state: WorkspaceMoveState,
+  newWorktreePath: string,
+  now: () => Date = () => new Date(),
+): WorkspaceMoveState {
+  if (state.phase !== "relocating") {
+    throw new MidTaskMovePhaseError(
+      `Cannot complete workspace move: session phase is "${state.phase}" (expected "relocating").`,
+      state.phase,
+      "completeMove",
+    );
   }
-  if (!state.snapshot) {
-    return "Cannot complete workspace move: no snapshot (state invariant violated)";
+  if (!newWorktreePath || newWorktreePath.trim().length === 0) {
+    throw new MidTaskMovePhaseError(
+      "Cannot complete workspace move: newWorktreePath must be a non-empty string.",
+      state.phase,
+      "completeMove",
+    );
   }
-  return Object.freeze({
-    status: "completed" as const,
-    snapshot: state.snapshot // keep the snapshot for post-move inspection
-  });
+  return {
+    phase: "relocated",
+    worktreePath: newWorktreePath.trim(),
+    originalPath: state.originalPath,
+    targetPath: state.targetPath,
+    relocatedAt: now().toISOString(),
+  };
 }
 
 /**
- * Abort a relocation in progress, returning to idle. Only valid when status is
- * "relocating". The snapshot is discarded.
- *
- * Returns the new state on success, or an error string when the current status
- * forbids abort.
+ * True when a move is in progress — callers should pause work and await
+ * the relocation before submitting new turns, tool calls, or persistence.
  */
-export function abortMove(
-  state: MidTaskWorkspaceMoveState
-): MidTaskWorkspaceMoveState | string {
-  if (state.status !== "relocating") {
-    return `Cannot abort workspace move: current status is "${state.status}"`;
-  }
-  return IDLE_STATE;
+export function isRelocating(state: WorkspaceMoveState): boolean {
+  return state.phase === "relocating";
+}
+
+/**
+ * True when a move has completed — the session now operates at the new
+ * path; the original path is preserved in the snapshot for audit.
+ */
+export function isRelocated(state: WorkspaceMoveState): boolean {
+  return state.phase === "relocated";
 }
