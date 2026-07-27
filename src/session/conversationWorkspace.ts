@@ -1,159 +1,122 @@
-import type { ChatTurnMessage } from "../model/directChat.js";
+/**
+ * ConversationWorkspace — in-memory registry for conversation workspaces.
+ * Supports: create, list, switch, previous toggle, clone, rename.
+ * VISION: lightweight, independent, state-preserving workspace management.
+ */
 
-export interface ConversationWorkspaceConversation {
-  readonly id: string;
-  readonly title: string;
-  readonly messages: readonly ChatTurnMessage[];
-}
-
-export interface ConversationWorkspaceSummary {
-  readonly id: string;
-  readonly title: string;
-  readonly messageCount: number;
-  readonly active: boolean;
-}
-
-export interface CreateConversationWorkspaceInput {
-  readonly id: string;
-  readonly title: string;
-  readonly messages?: readonly ChatTurnMessage[];
-}
-
-export interface CloneConversationWorkspaceInput {
-  readonly id: string;
-  readonly title: string;
-  /** Defaults to the active conversation. */
-  readonly sourceId?: string;
-}
-
-export interface ConversationWorkspace {
-  readonly activeId: string | null;
-  create(input: CreateConversationWorkspaceInput): ConversationWorkspaceConversation;
-  list(): readonly ConversationWorkspaceSummary[];
-  get(id: string): ConversationWorkspaceConversation | undefined;
-  switch(id: string): ConversationWorkspaceConversation;
-  previous(): ConversationWorkspaceConversation;
-  clone(input: CloneConversationWorkspaceInput): ConversationWorkspaceConversation;
-  rename(id: string, title: string): ConversationWorkspaceConversation;
-}
-
-interface StoredConversation {
+export interface Workspace {
   id: string;
   title: string;
-  messages: ChatTurnMessage[];
+  messages: any[]; // opaque message array; deep-cloned on clone
+  createdAt: number;
+  lastActive: number;
 }
 
-/**
- * A lightweight conversation registry for surfaces that need multiple independent
- * transcripts without coupling to persistence or a specific interactive UI.
- */
-export function createConversationWorkspace(): ConversationWorkspace {
-  const conversations = new Map<string, StoredConversation>();
-  let currentId: string | null = null;
-  let previousId: string | null = null;
+export class ConversationWorkspaceManager {
+  private workspaces = new Map<string, Workspace>();
+  private currentWorkspaceId: string | null = null;
+  private previousWorkspaceId: string | null = null;
 
-  const requireId = (id: string): StoredConversation => {
-    const conversation = conversations.get(normalizeId(id));
-    if (!conversation) {
-      throw new Error(`Conversation workspace: unknown conversation "${id}".`);
+  create(id: string, title: string): Workspace {
+    if (this.workspaces.has(id)) {
+      throw new Error(`Workspace ${id} already exists`);
     }
-    return conversation;
-  };
+    const now = Date.now();
+    const ws: Workspace = {
+      id,
+      title,
+      messages: [],
+      createdAt: now,
+      lastActive: now,
+    };
+    this.workspaces.set(id, ws);
+    return ws;
+  }
 
-  const snapshot = (conversation: StoredConversation): ConversationWorkspaceConversation => ({
-    id: conversation.id,
-    title: conversation.title,
-    messages: copyMessages(conversation.messages)
-  });
+  list(): Workspace[] {
+    return Array.from(this.workspaces.values());
+  }
 
-  const workspace: ConversationWorkspace = {
-    get activeId() {
-      return currentId;
-    },
-    create(input) {
-      const id = normalizeId(input.id);
-      if (conversations.has(id)) {
-        throw new Error(`Conversation workspace: conversation "${id}" already exists.`);
-      }
-      const conversation = {
-        id,
-        title: normalizeTitle(input.title),
-        messages: copyMessages(input.messages ?? [])
-      };
-      conversations.set(id, conversation);
-      if (currentId === null) {
-        currentId = id;
-      }
-      return snapshot(conversation);
-    },
-    list() {
-      return [...conversations.values()].map((conversation) => ({
-        id: conversation.id,
-        title: conversation.title,
-        messageCount: conversation.messages.length,
-        active: conversation.id === currentId
-      }));
-    },
-    get(id) {
-      const conversation = conversations.get(normalizeId(id));
-      return conversation ? snapshot(conversation) : undefined;
-    },
-    switch(id) {
-      const conversation = requireId(id);
-      if (conversation.id !== currentId) {
-        previousId = currentId;
-        currentId = conversation.id;
-      }
-      return snapshot(conversation);
-    },
-    previous() {
-      if (previousId === null) {
-        throw new Error("Conversation workspace: no previous conversation.");
-      }
-      return workspace.switch(previousId);
-    },
-    clone(input) {
-      const id = normalizeId(input.id);
-      if (conversations.has(id)) {
-        throw new Error(`Conversation workspace: conversation "${id}" already exists.`);
-      }
-      const source = requireId(input.sourceId ?? currentId ?? "");
-      const clone = {
-        id,
-        title: normalizeTitle(input.title),
-        messages: copyMessages(source.messages)
-      };
-      conversations.set(id, clone);
-      previousId = currentId;
-      currentId = id;
-      return snapshot(clone);
-    },
-    rename(id, title) {
-      const conversation = requireId(id);
-      conversation.title = normalizeTitle(title);
-      return snapshot(conversation);
+  switchWorkspace(id: string): Workspace {
+    if (!this.workspaces.has(id)) {
+      throw new Error(`Workspace ${id} not found`);
     }
-  };
-
-  return workspace;
-}
-
-function normalizeId(value: string): string {
-  const id = value.trim();
-  if (id.length === 0) {
-    throw new Error("Conversation workspace: conversation id is required.");
+    // Track previous for toggle
+    if (this.currentWorkspaceId && this.currentWorkspaceId !== id) {
+      this.previousWorkspaceId = this.currentWorkspaceId;
+    }
+    this.currentWorkspaceId = id;
+    // Update lastActive to track most recent switch (VISION: preserve activity state)
+    this.workspaces.get(id)!.lastActive = Date.now();
+    return this.workspaces.get(id)!;
   }
-  return id;
-}
 
-function normalizeTitle(value: string): string {
-  const title = value.trim();
-  if (title.length === 0) {
-    throw new Error("Conversation workspace: conversation title is required.");
+  getCurrent(): Workspace | null {
+    return this.currentWorkspaceId
+      ? this.workspaces.get(this.currentWorkspaceId) ?? null
+      : null;
   }
-  return title;
-}
 
-function copyMessages(messages: readonly ChatTurnMessage[]): ChatTurnMessage[] {
-  return messages.map((message) => ({ role: message.role, content: message.content }));
+  previous(): Workspace | null {
+    if (!this.previousWorkspaceId) {
+      return null;
+    }
+    const prevId = this.previousWorkspaceId;
+    // Toggle: switch back, update previous to what was current
+    const current = this.currentWorkspaceId;
+    this.currentWorkspaceId = prevId;
+    this.previousWorkspaceId = current;
+    const ws = this.workspaces.get(prevId)!;
+    ws.lastActive = Date.now();
+    return ws;
+  }
+
+  clone(sourceId: string, newId: string, newTitle?: string): Workspace {
+    const source = this.workspaces.get(sourceId);
+    if (!source) {
+      throw new Error(`Workspace ${sourceId} not found`);
+    }
+    if (this.workspaces.has(newId)) {
+      throw new Error(`Workspace ${newId} already exists`);
+    }
+    const now = Date.now();
+    const cloned: Workspace = {
+      id: newId,
+      title: newTitle ?? `${source.title} (clone)`,
+      messages: JSON.parse(JSON.stringify(source.messages)), // deep clone
+      createdAt: now,
+      lastActive: now,
+    };
+    this.workspaces.set(newId, cloned);
+    return cloned;
+  }
+
+  rename(id: string, newTitle: string): Workspace {
+    const ws = this.workspaces.get(id);
+    if (!ws) {
+      throw new Error(`Workspace ${id} not found`);
+    }
+    ws.title = newTitle;
+    return ws;
+  }
+
+  delete(id: string): void {
+    if (!this.workspaces.has(id)) {
+      throw new Error(`Workspace ${id} not found`);
+    }
+    if (this.currentWorkspaceId === id) {
+      this.currentWorkspaceId = null;
+    }
+    if (this.previousWorkspaceId === id) {
+      this.previousWorkspaceId = null;
+    }
+    this.workspaces.delete(id);
+  }
+
+  // For testing / inspection only
+  _resetForTests(): void {
+    this.workspaces.clear();
+    this.currentWorkspaceId = null;
+    this.previousWorkspaceId = null;
+  }
 }
