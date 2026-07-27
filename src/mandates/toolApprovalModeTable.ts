@@ -1,44 +1,63 @@
-/**
- * Tool approval mode table — per-tool-class mode resolution.
- *
- * Maps tool classes (bash, write, web_fetch, …) to one of three modes:
- * - `auto`  — auto-approve (bypass interactive prompt)
- * - `ask`   — ask the operator (default, fail-closed)
- * - `deny`  — deny
- *
- * The default is `ask` — an absent entry never weakens to `auto` or `deny`.
- * This table is a policy layer consulted BEFORE per-call mandate evaluation;
- * `deny` here short-circuits (never reaches the mandate), `auto` skips the
- * interactive prompt, and `ask` falls through to normal mandate evaluation.
- *
- * Hard limits (destructive, spend, secret-edge, auth-edge) are enforced
- * downstream by the mandate evaluator and are NOT weakened by `auto` entries
- * in this table.
- */
+export type ToolApprovalMode = 'always' | 'never' | 'ask';
 
-/** A per-tool-class approval mode. */
-export type ToolApprovalMode = "auto" | "ask" | "deny";
+export interface Mandate {
+  tool?: string;
+  action?: string;
+  mode: ToolApprovalMode;
+}
+
+export interface ApprovalResolution {
+  allowed: boolean;
+  reason: string;
+  mode: ToolApprovalMode;
+}
 
 /**
- * A table mapping tool classes to approval modes.
- * Entries not in the table default to `"ask"` (fail-closed).
+ * Resolves the approval mode for a tool call.
+ * Pure function. Precedence: exact tool+action > tool-specific > action-specific > global default (ask).
+ * Default is always 'ask' (fail-closed). Never auto-approves protected actions.
  */
-export type ToolApprovalModeTable = Readonly<Record<string, ToolApprovalMode>>;
+export function resolveToolApproval(
+  mandates: Mandate[],
+  action: string,
+  toolName: string
+): ApprovalResolution {
+  // Filter applicable mandates: those matching tool (or global) and action (or global)
+  const applicable = mandates.filter(m =>
+    (m.tool === undefined || m.tool === toolName) &&
+    (m.action === undefined || m.action === action)
+  );
 
-/**
- * Resolve the approval mode for a tool class against a table.
- *
- * Resolution order:
- * 1. Exact key match in the table → that mode.
- * 2. No match → `"ask"` (default fail-closed).
- *
- * This is a pure function — it never mutates the table, never performs I/O,
- * and never weakens hard limits. Callers are responsible for ensuring that
- * `auto` does not bypass hard-edge escalation downstream.
- */
-export function resolveToolApprovalMode(
-  toolClass: string,
-  table: ToolApprovalModeTable,
-): ToolApprovalMode {
-  return table[toolClass] ?? "ask";
+  if (applicable.length === 0) {
+    return {
+      allowed: false,
+      reason: 'No matching mandate; default ask (fail-closed)',
+      mode: 'ask'
+    };
+  }
+
+  // Score specificity: 2=tool+action, 1=tool-only or action-only, 0=global
+  const scored = applicable.map(m => {
+    const hasTool = m.tool !== undefined;
+    const hasAction = m.action !== undefined;
+    const score = (hasTool && hasAction) ? 2 : (hasTool || hasAction) ? 1 : 0;
+    return { mandate: m, score };
+  });
+
+  // Pick highest score (most specific); stable first on tie
+  scored.sort((a, b) => b.score - a.score);
+  const best = scored[0].mandate;
+
+  const allowed = best.mode === 'always';
+  const reason = allowed
+    ? `Explicit always for ${toolName} on ${action}`
+    : best.mode === 'never'
+      ? `Explicit never for ${toolName} on ${action}`
+      : `Ask required for ${toolName} on ${action} (fail-closed)`;
+
+  return {
+    allowed,
+    reason,
+    mode: best.mode
+  };
 }
