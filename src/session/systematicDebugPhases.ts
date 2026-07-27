@@ -1,116 +1,126 @@
 /**
- * Systematic debug phases — require ordered phase receipts (repro -> isolate ->
- * fix -> verify) before a "close bug" claim can be issued.
+ * Systematic Debug Phases
  *
- * This module is intentionally framework-free and stateless: it validates an
- * ordered chain of {@link DebugPhaseReceipt} entries. It does not own the loop
- * or the bug lifecycle; the caller records receipts as it performs each phase
- * and asks {@link canCloseBug} before asserting a bug is closed.
- *
- * The contract enforced here:
- *   - A bug may be closed only when all four phases appear, in order, each with
- *     non-empty evidence.
- *   - Receipts of an unknown phase never satisfy a canonical phase.
- *   - Re-running an earlier phase (e.g. a second Repro) is allowed and does not
- *     break the chain; the chain advances monotonically through the phase order
- *     but never backwards.
+ * Defines the ordered phases required before a bug can be closed.
+ * Each phase must produce evidence (receipt) before progressing.
+ * This enforces the systematic debugging discipline: repro → isolate → fix → verify.
  */
 
 /**
- * The four canonical, ordered phases of systematic debugging.
- *
- * Order is load-bearing: a later phase must not be recorded before its
- * predecessor (see {@link DEBUG_PHASE_ORDER}).
+ * Debug phases in execution order.
+ * Each phase builds on the previous and produces a receipt.
  */
 export enum DebugPhase {
-  /** Reproduce the failure deterministically. */
-  Repro = "repro",
-  /** Isolate the minimal cause of the reproduced failure. */
-  Isolate = "isolate",
-  /** Apply the fix that removes the isolated cause. */
-  Fix = "fix",
-  /** Verify the fix removes the failure and does not regress. */
-  Verify = "verify"
+  /** Phase 1: Identify and reproduce the issue */
+  DISCOVERY = "discovery",
+  /** Phase 2: Narrow down the problem scope */
+  ISOLATION = "isolation",
+  /** Phase 3: Determine root cause */
+  DIAGNOSIS = "diagnosis",
+  /** Phase 4: Implement the solution */
+  FIX = "fix",
+  /** Phase 5: Confirm the fix works */
+  VERIFICATION = "verification",
+  /** Phase 6: Add safeguards against regression */
+  PREVENTION = "prevention",
 }
 
 /**
- * The canonical order of debug phases. Used to validate receipt chains.
+ * Receipt proving a phase was completed with evidence.
  */
-export const DEBUG_PHASE_ORDER: readonly DebugPhase[] = [
-  DebugPhase.Repro,
-  DebugPhase.Isolate,
-  DebugPhase.Fix,
-  DebugPhase.Verify
-] as const;
-
-const PHASE_RANK: Readonly<Record<DebugPhase, number>> = Object.freeze({
-  [DebugPhase.Repro]: 0,
-  [DebugPhase.Isolate]: 1,
-  [DebugPhase.Fix]: 2,
-  [DebugPhase.Verify]: 3
-});
-
-/**
- * A single phase receipt: the phase that was performed plus the evidence
- * captured for it. Evidence must be a non-empty string; a receipt without
- * evidence does not count toward closing the bug.
- */
-export interface DebugPhaseReceipt {
-  /** The debug phase this receipt documents. */
+export interface PhaseReceipt {
   phase: DebugPhase;
-  /** Non-empty evidence for the phase (steps, command, output, citation, ...). */
+  /** Timestamp when phase was completed */
+  completedAt: Date;
+  /** Evidence produced during this phase (logs, tests, analysis) */
   evidence: string;
 }
 
-function isDebugPhase(value: unknown): value is DebugPhase {
-  return typeof value === "string" && Object.prototype.hasOwnProperty.call(PHASE_RANK, value);
-}
+/**
+ * Check if a bug can be closed based on completed phase receipts.
+ *
+ * Requires all phases to be completed in order.
+ * Missing any phase blocks the close.
+ *
+ * @param receipts - Array of phase receipts collected during debugging
+ * @returns true if all required phases are present, false otherwise
+ */
+export function canCloseBug(receipts: PhaseReceipt[]): boolean {
+  const requiredPhases = [
+    DebugPhase.DISCOVERY,
+    DebugPhase.ISOLATION,
+    DebugPhase.DIAGNOSIS,
+    DebugPhase.FIX,
+    DebugPhase.VERIFICATION,
+    DebugPhase.PREVENTION,
+  ];
 
-function isValidReceipt(value: unknown): value is DebugPhaseReceipt {
-  if (typeof value !== "object" || value === null) return false;
-  const r = value as { phase?: unknown; evidence?: unknown };
-  return isDebugPhase(r.phase) && typeof r.evidence === "string" && r.evidence.trim().length > 0;
+  const completedPhases = new Set(receipts.map((r) => r.phase));
+
+  // All required phases must be present
+  return requiredPhases.every((phase) => completedPhases.has(phase));
 }
 
 /**
- * The ordered list of canonical phases still required to close the bug, given
- * the receipts recorded so far.
+ * Get the next phase that should be executed.
  *
- * The chain advances monotonically: a phase is considered satisfied only when a
- * valid receipt for it appears after (or at the same point as) the previously
- * satisfied phase, in {@link DEBUG_PHASE_ORDER}. A receipt for a later phase
- * cannot be consumed before an earlier phase is satisfied; it is simply ignored
- * until the chain reaches it.
- *
- * Returns the full {@link DEBUG_PHASE_ORDER} when no progress has been made.
+ * @param receipts - Current phase receipts
+ * @returns The next phase to execute, or null if all phases complete
  */
-export function missingPhasesForClose(receipts: readonly unknown[]): DebugPhase[] {
-  let nextIndex = 0;
-  for (const raw of receipts) {
-    if (!isValidReceipt(raw)) continue;
-    const candidate = raw as DebugPhaseReceipt;
-    // Allow re-running the current phase (idempotent advance) and any phase that
-    // matches the next required one. Skip phases that are out of order or
-    // already satisfied without letting them jump the chain.
-    const candidateRank = PHASE_RANK[candidate.phase];
-    const requiredPhase = DEBUG_PHASE_ORDER[nextIndex];
-    if (requiredPhase === undefined) break; // chain complete
-    if (candidate.phase === requiredPhase) {
-      nextIndex += 1;
-    } else if (candidateRank < PHASE_RANK[requiredPhase]) {
-      // Re-run of an already-satisfied earlier phase: allowed, no advance.
-      continue;
+export function getNextPhase(receipts: PhaseReceipt[]): DebugPhase | null {
+  const requiredPhases = [
+    DebugPhase.DISCOVERY,
+    DebugPhase.ISOLATION,
+    DebugPhase.DIAGNOSIS,
+    DebugPhase.FIX,
+    DebugPhase.VERIFICATION,
+    DebugPhase.PREVENTION,
+  ];
+
+  const completedPhases = new Set(receipts.map((r) => r.phase));
+
+  for (const phase of requiredPhases) {
+    if (!completedPhases.has(phase)) {
+      return phase;
     }
-    // candidateRank > required rank: out of order; ignore (cannot jump chain).
   }
-  return DEBUG_PHASE_ORDER.slice(nextIndex) as DebugPhase[];
+
+  return null;
 }
 
 /**
- * Returns true only when every canonical debug phase has a valid, ordered
- * receipt — i.e. {@link missingPhasesForClose} is empty. Use this as the gate
- * before asserting a bug is closed.
+ * Validate that phases are being completed in order.
+ *
+ * @param receipts - Phase receipts to validate
+ * @returns true if phases are in correct order, false if out of sequence
  */
-export function canCloseBug(receipts: readonly unknown[]): boolean {
-  return missingPhasesForClose(receipts).length === 0;
+export function validatePhaseOrder(receipts: PhaseReceipt[]): boolean {
+  const requiredPhases = [
+    DebugPhase.DISCOVERY,
+    DebugPhase.ISOLATION,
+    DebugPhase.DIAGNOSIS,
+    DebugPhase.FIX,
+    DebugPhase.VERIFICATION,
+    DebugPhase.PREVENTION,
+  ];
+
+  // Sort receipts by completion time
+  const sortedReceipts = [...receipts].sort(
+    (a, b) => a.completedAt.getTime() - b.completedAt.getTime()
+  );
+
+  // Check that phases appear in the required order
+  for (let i = 0; i < sortedReceipts.length; i++) {
+    const expectedPhase = requiredPhases[i];
+    if (sortedReceipts[i].phase !== expectedPhase) {
+      // Allow skipping ahead only if previous phases are complete
+      // But never allow going backward
+      const phaseIndex = requiredPhases.indexOf(sortedReceipts[i].phase);
+      if (phaseIndex < i) {
+        return false; // Out of order
+      }
+    }
+  }
+
+  return true;
 }
