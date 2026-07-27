@@ -1,240 +1,182 @@
+import { executeCommand, type CommandExecutor } from "../../review/gates.js";
+
 /**
- * IDEA-F10-DEBUG-LOOP-01 — bounded debug loop engine.
- *
- * Runs a command, and on failure proposes a fix into a pending trial, applies
- * the trial, and re-runs — up to a structural `maxTries` ceiling. Every terminal
- * state resolves to an explicit receipt; the loop never silently reports success
- * and never runs an unbounded number of attempts.
- *
- * The engine is deliberately free of any model or shell dependency: the command
- * runner, fix proposer, and trial applier are all injected interfaces. That keeps
- * the loop independent (no borrowed framework/CLI runs it) and makes the implicit
- * "spend" of a model call an explicit, gating seam (hard limit #2 — no unapproved
- * spend). A $0/stub proposer is the default in tests; a live model proposer is an
- * explicit, owned adapter wired at the tool layer.
- *
- * Rollback is preservation-first (hard limit #1): a `TrialApplier` may return a
- * closure that reverses its trial, and the engine invokes it whenever the trial
- * did not produce a passing run, so a failed fix is undone before the next
- * attempt instead of accumulating damage.
+ * Bounded outcome debug loop (IDEA-F10): run a command; on failure ask a
+ * model-or-stub fix proposer for one trial fix; apply it under policy; re-run;
+ * stop on success with a receipt, otherwise roll the trial back and continue;
+ * at maxTries emit an explicit fail receipt. The loop never leaves the
+ * workspace mutated by a losing trial — every failed trial is rolled back.
  */
 
-/** A single command execution's captured output. */
-export interface CommandRunResult {
-  /** Process exit code. `0` is success; `null` means the run did not yield one (e.g. killed). */
-  readonly exitCode: number | null;
+/** Hard ceiling on loop iterations regardless of caller input (bound-the-loop). */
+export const DEBUG_LOOP_MAX_TRIES_CEILING = 10;
+/** Plan default when the caller does not specify maxTries. */
+export const DEBUG_LOOP_DEFAULT_MAX_TRIES = 5;
+
+export interface DebugLoopFix {
+  readonly description: string;
+  readonly summary: string;
+}
+
+export interface DebugLoopProposeContext {
+  readonly attempt: number;
+  readonly command: readonly string[];
   readonly stdout: string;
   readonly stderr: string;
+  readonly priorFixes: readonly DebugLoopFix[];
 }
 
-/** Whether a run succeeded. Exit code 0 is success; anything else (incl. null) is failure. */
-export function runSucceeded(result: CommandRunResult): boolean {
-  return result.exitCode === 0;
+/** Model-or-stub seam: given one failure's output, propose exactly one trial fix. */
+export type DebugLoopFixProposer = (context: DebugLoopProposeContext) => Promise<DebugLoopFix>;
+
+export interface DebugLoopTrialResult {
+  readonly applied: boolean;
+  readonly rolledBack: boolean;
+  readonly detail?: string;
 }
 
-/** Runs the target command once and returns its captured output. */
-export type CommandRunner = () => Promise<CommandRunResult>;
+/**
+ * Policy-mediated trial seam. The caller owns how a proposed fix becomes a
+ * workspace change (pending-edit proposal, direct edit under policy, etc.) and
+ * how it is undone. The loop only requires: apply one fix, and roll back the
+ * fix that was under test after its re-run failed.
+ */
+export interface DebugLoopTrialApplier {
+  readonly applyTrial: (fix: DebugLoopFix, attempt: number) => Promise<DebugLoopTrialResult>;
+  readonly rollbackTrial: (fix: DebugLoopFix, attempt: number) => Promise<void>;
+}
 
-/** Context handed to a fix proposer after a failing run. */
-export interface FailureContext {
+export interface DebugLoopAttemptRecord {
   readonly attempt: number;
-  readonly command: string;
-  readonly lastResult: CommandRunResult;
-  /** The fix attempted on the prior iteration, if any (and whether it was rolled back). */
-  readonly priorFix?: DebugFix | null;
+  readonly exitCode: number | null;
+  readonly cancelled: boolean;
+  /** The trial fix this run was testing, when the run was a re-run. */
+  readonly fix?: DebugLoopFix;
+  /** True when that trial fix was rolled back after this run failed. */
+  readonly rolledBack: boolean;
 }
 
-/** A proposed fix. `patch` is opaque to the engine — the applier interprets it. */
-export interface DebugFix {
-  readonly description: string;
-  readonly patch: string;
-}
-
-/**
- * Proposes a fix for the most recent failure, or returns `null` when no fix can
- * be proposed. Returning `null` ends the loop in the unresolved state (a stated
- * outcome, not a dead-end: the receipt records it).
- */
-export type FixProposer = (context: FailureContext) => Promise<DebugFix | null>;
-
-/**
- * Optional closure returned by a {@link TrialApplier} that reverses the trial.
- * Invoked by the engine only when the trial's subsequent run did not succeed.
- */
-export type Rollback = () => Promise<void> | void;
-
-/**
- * Applies a proposed fix as a pending trial. May return a {@link Rollback} to be
- * invoked if the trial does not lead to a passing run.
- *
- * @param fix the fix to apply
- * @param attempt the 1-based attempt number this trial corresponds to
- */
-export type TrialApplier = (fix: DebugFix, attempt: number) => Promise<Rollback | void> | Rollback | void;
-
-/** Input shape accepted by {@link runDebugLoop}. */
-export interface RunDebugLoopInput {
-  /** The command string to run on each attempt. */
-  readonly Command: string;
-  /** Maximum number of run attempts. Clamped to at least 1. */
-  readonly MaxTries: number;
-}
-
-/** Terminal status of a debug loop. */
-export type DebugLoopStatus = "succeeded" | "failed";
-
-/** The explicit receipt every loop run resolves to. */
 export interface DebugLoopReceipt {
-  readonly status: DebugLoopStatus;
-  readonly command: string;
-  /** Number of run attempts actually made. */
+  readonly attempts: number;
+  readonly rollbackPerformed: boolean;
+  readonly fixesTried: DebugLoopFix[];
+}
+
+export interface DebugLoopRunResult {
+  readonly outcome: "succeeded" | "failed";
   readonly tries: number;
-  /** The structural ceiling that bounded the loop. */
   readonly maxTries: number;
-  /** Human-readable summary of the terminal state. */
-  readonly message: string;
-  /** Outputs of the final attempt. */
-  readonly lastExitCode: number | null;
-  readonly lastStdout: string;
-  readonly lastStderr: string;
-  /** The fix attempted on the final iteration, if any. */
-  readonly lastFix: DebugFix | null;
+  readonly attempts: DebugLoopAttemptRecord[];
+  readonly receipt: DebugLoopReceipt;
+  readonly summary: string;
 }
 
 export interface RunDebugLoopOptions {
-  readonly run: CommandRunner;
-  readonly propose: FixProposer;
-  readonly apply: TrialApplier;
-  readonly input: RunDebugLoopInput;
+  readonly command: readonly string[];
+  readonly cwd: string;
+  readonly maxTries: number;
+  readonly executor?: CommandExecutor | undefined;
+  readonly proposeFix: DebugLoopFixProposer;
+  readonly trialApplier: DebugLoopTrialApplier;
+  readonly timeoutMs: number;
+  readonly signal?: AbortSignal | undefined;
 }
 
-/**
- * Execute the bounded debug loop. Returns a receipt for every terminal state.
- *
- * Semantics:
- * - Attempt 1 runs the command as-is. Success → receipt, tries=1.
- * - On failure, the proposer is consulted. `null` → fail-closed receipt.
- * - Otherwise the fix is applied as a trial and the command re-runs.
- * - If the new run fails, any returned rollback is invoked before the next proposal.
- * - The loop stops at the first success or at `maxTries` attempts, whichever first.
- */
-export async function runDebugLoop(options: RunDebugLoopOptions): Promise<DebugLoopReceipt> {
-  const { run, propose, apply, input } = options;
-  const command = input.Command;
-  const maxTries = clampMaxTries(input.MaxTries);
+export async function runDebugLoop(options: RunDebugLoopOptions): Promise<DebugLoopRunResult> {
+  const executor = options.executor ?? executeCommand;
+  const maxTries = clampMaxTries(options.maxTries);
+  const attempts: DebugLoopAttemptRecord[] = [];
+  const fixesTried: DebugLoopFix[] = [];
+  let rollbackPerformed = false;
+  /** The fix currently applied to the workspace and under test, if any. */
+  let fixUnderTest: { readonly fix: DebugLoopFix; readonly appliedAtAttempt: number } | undefined;
 
-  let lastResult: CommandRunResult = { exitCode: null, stdout: "", stderr: "" };
-  let lastFix: DebugFix | null = null;
-  let attempt = 0;
-
-  while (attempt < maxTries) {
-    attempt += 1;
-
-    const pendingRollback =
-      attempt > 1 && lastFix ? await maybeApply(apply, lastFix, attempt) : undefined;
-    lastResult = await run();
-
-    if (runSucceeded(lastResult)) {
-      return receipt({
-        status: "succeeded",
-        command,
-        tries: attempt,
-        maxTries,
-        message: attempt === 1 ? "Command succeeded on the first try." : `Command succeeded on try ${attempt}.`,
-        lastResult,
-        lastFix
-      });
-    }
-
-    // Trial did not pass — undo it before considering the next move.
-    if (pendingRollback) {
-      await pendingRollback();
-    }
-
-    if (attempt >= maxTries) {
-      return receipt({
-        status: "failed",
-        command,
-        tries: attempt,
-        maxTries,
-        message: `Debug loop exhausted: command failed after ${attempt} attempt${attempt === 1 ? "" : "s"}.`,
-        lastResult,
-        lastFix
-      });
-    }
-
-    const proposed = await propose({
-      attempt: attempt + 1,
-      command,
-      lastResult,
-      priorFix: lastFix
+  for (let attempt = 1; attempt <= maxTries; attempt += 1) {
+    const execution = await executor(options.command, {
+      cwd: options.cwd,
+      timeoutMs: options.timeoutMs,
+      gate: {
+        kind: "validation",
+        name: "debug.loop.run",
+        command: options.command,
+        required: true
+      },
+      signal: options.signal
     });
 
-    if (!proposed) {
-      return receipt({
-        status: "failed",
-        command,
+    if (execution.exitCode === 0 && execution.cancelled !== true) {
+      attempts.push({
+        attempt,
+        exitCode: execution.exitCode,
+        cancelled: execution.cancelled === true,
+        ...(fixUnderTest ? { fix: fixUnderTest.fix } : {}),
+        rolledBack: false
+      });
+      const receipt: DebugLoopReceipt = { attempts: attempt, rollbackPerformed, fixesTried };
+      return {
+        outcome: "succeeded",
         tries: attempt,
         maxTries,
-        message: "Debug loop stopped: no fix could be proposed for the failure.",
-        lastResult,
-        lastFix
-      });
+        attempts,
+        receipt,
+        summary: fixUnderTest
+          ? `debug loop succeeded on attempt ${attempt} of ${maxTries} after applying trial fix "${fixUnderTest.fix.summary}".`
+          : `debug loop succeeded on attempt ${attempt} of ${maxTries}.`
+      };
     }
 
-    lastFix = proposed;
+    // The run failed: a fix under test lost — roll it back before proposing the next one.
+    let rolledBack = false;
+    if (fixUnderTest) {
+      await options.trialApplier.rollbackTrial(fixUnderTest.fix, fixUnderTest.appliedAtAttempt);
+      rollbackPerformed = true;
+      rolledBack = true;
+    }
+
+    attempts.push({
+      attempt,
+      exitCode: execution.exitCode,
+      cancelled: execution.cancelled === true,
+      ...(fixUnderTest ? { fix: fixUnderTest.fix } : {}),
+      rolledBack
+    });
+    fixUnderTest = undefined;
+
+    // No proposal after the final try: nothing would re-run it.
+    if (attempt === maxTries) {
+      break;
+    }
+
+    const fix = await options.proposeFix({
+      attempt,
+      command: options.command,
+      stdout: execution.stdout,
+      stderr: execution.stderr,
+      priorFixes: fixesTried
+    });
+
+    await options.trialApplier.applyTrial(fix, attempt);
+    fixesTried.push(fix);
+    fixUnderTest = { fix, appliedAtAttempt: attempt };
   }
 
-  // Defensive: the loop above always returns within maxTries. This is unreachable
-  // for valid input but keeps the function total for the type checker.
-  return receipt({
-    status: "failed",
-    command,
-    tries: attempt,
-    maxTries,
-    message: "Debug loop ended without resolution.",
-    lastResult,
-    lastFix
-  });
-}
-
-async function maybeApply(
-  apply: TrialApplier,
-  fix: DebugFix,
-  attempt: number
-): Promise<Rollback | undefined> {
-  const rollback = await apply(fix, attempt);
-  return rollback ?? undefined;
-}
-
-interface ReceiptArgs {
-  readonly status: DebugLoopStatus;
-  readonly command: string;
-  readonly tries: number;
-  readonly maxTries: number;
-  readonly message: string;
-  readonly lastResult: CommandRunResult;
-  readonly lastFix: DebugFix | null;
-}
-
-function receipt(args: ReceiptArgs): DebugLoopReceipt {
+  const receipt: DebugLoopReceipt = { attempts: maxTries, rollbackPerformed, fixesTried };
   return {
-    status: args.status,
-    command: args.command,
-    tries: args.tries,
-    maxTries: args.maxTries,
-    message: args.message,
-    lastExitCode: args.lastResult.exitCode,
-    lastStdout: args.lastResult.stdout,
-    lastStderr: args.lastResult.stderr,
-    lastFix: args.lastFix
+    outcome: "failed",
+    tries: maxTries,
+    maxTries,
+    attempts,
+    receipt,
+    summary:
+      `fail receipt: debug loop exhausted maxTries=${maxTries} without a passing run; ` +
+      `${fixesTried.length} trial fix(es) proposed and every applied trial rolled back.`
   };
 }
 
-/** Structural ceiling: a loop with maxTries < 1 still gets exactly one attempt. */
-export function clampMaxTries(maxTries: number): number {
+function clampMaxTries(maxTries: number): number {
   if (!Number.isFinite(maxTries) || maxTries < 1) {
-    return 1;
+    return DEBUG_LOOP_DEFAULT_MAX_TRIES;
   }
-  return Math.floor(maxTries);
+
+  return Math.min(Math.trunc(maxTries), DEBUG_LOOP_MAX_TRIES_CEILING);
 }
