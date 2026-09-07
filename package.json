@@ -59,7 +59,7 @@
   "dependencies": {
     "@honcho-ai/sdk": "^2.2.0",
     "pg": "^8.22.0",
-    "zod": "4.4.3"
+    "zod": "4.5.4"
   },
   "devDependencies": {
     "@types/node": "^24.13.2",
